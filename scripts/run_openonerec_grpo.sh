@@ -37,15 +37,11 @@ VLLM_ATTENTION_BACKEND="${VLLM_ATTENTION_BACKEND:-FLASH_ATTN}"
 LEARNING_RATE="${LEARNING_RATE:-2e-6}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.001}"
 FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp2}"
-if [[ "${FSDP_STRATEGY}" == "fsdp2" ]]; then
-  USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-True}"
-  USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-False}"
-  FUSED_KERNEL_IMPL_BACKEND="${FUSED_KERNEL_IMPL_BACKEND:-triton}"
-else
-  USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-False}"
-  USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-False}"
-  FUSED_KERNEL_IMPL_BACKEND="${FUSED_KERNEL_IMPL_BACKEND:-torch}"
-fi
+# Conservative/stable defaults for verl 0.7.1:
+# Triton fused kernels can hit illegal memory access on some stacks.
+USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-False}"
+USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-False}"
+FUSED_KERNEL_IMPL_BACKEND="${FUSED_KERNEL_IMPL_BACKEND:-torch}"
 
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
@@ -72,8 +68,9 @@ EXPERIMENT_NAME="${EXPERIMENT_NAME:-grpo_two_stage}"
 OUTPUT_DIR="${OUTPUT_DIR:-${VERL_GR_ROOT}/outputs/openonerec}"
 WANDB_MODE="${WANDB_MODE:-offline}"
 RAY_TMPDIR="${RAY_TMPDIR:-${OUTPUT_DIR}/ray_tmp}"
+RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
 
-mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}"
+mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 
 export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
 export VLLM_ATTENTION_BACKEND
@@ -96,6 +93,7 @@ echo "FSDP strategy: ${FSDP_STRATEGY}"
 echo "Fused kernel backend: ${FUSED_KERNEL_IMPL_BACKEND}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray temp dir: ${RAY_TMPDIR}"
+echo "Ray spill dir: ${RAY_SPILL_DIR}"
 echo "==================================="
 
 # Guardrail: block accidental fallback to legacy OpenOneRec recipe imports.
@@ -145,6 +143,8 @@ done
   trainer.default_local_dir="${OUTPUT_DIR}/ckpt" \
   trainer.logger='[tensorboard]' \
   trainer.remove_previous_ckpt_in_save=True \
+  ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
+  ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
   global_profiler.tool="${GLOBAL_PROFILER_TOOL:-null}" \
   global_profiler.steps="${GLOBAL_PROFILER_STEPS:-null}" \
   global_profiler.profile_continuous_steps="${GLOBAL_PROFILE_CONTINUOUS_STEPS:-False}" \
