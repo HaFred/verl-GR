@@ -75,4 +75,4 @@ ckpt/
 
 # Ray
 ray_results/
-tensorboard_logs/
+tensorboard_log/
