@@ -4,6 +4,10 @@
 
 set -euo pipefail
 
+ROLLOUT_N=8
+# true: each step runs vanilla GRPO two-stage (all n repeats) plus a feature path for metrics;
+# false: vanilla only (full two-stage on every repeated row).
+COMPARE_VANILLA_ROLLOUT_WITH_STAGE1_REUSE_STAGE2_FORCE_RANDOMNESS="${COMPARE_VANILLA_ROLLOUT_WITH_STAGE1_REUSE_STAGE2_FORCE_RANDOMNESS:-false}"
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
 PROJECT_ROOT="$(dirname "${VERL_GR_ROOT}")"
@@ -78,6 +82,15 @@ RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
 
 mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 
+case "$(echo "${COMPARE_VANILLA_ROLLOUT_WITH_STAGE1_REUSE_STAGE2_FORCE_RANDOMNESS}" | tr '[:upper:]' '[:lower:]')" in
+true | 1 | yes)
+  ROLLOUT_CMP_VANILLA_VS_REUSE="true"
+  ;;
+*)
+  ROLLOUT_CMP_VANILLA_VS_REUSE="false"
+  ;;
+esac
+
 export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
 export VLLM_ATTENTION_BACKEND
 export WANDB_MODE
@@ -90,6 +103,7 @@ echo "==================================="
 echo "Cluster: ${N_NODES} node(s) x ${N_GPUS} GPU(s)"
 echo "Model: ${BASE_MODEL}"
 echo "Rollout N: ${ROLLOUT_N}, Beam: ${STAGE2_BEAM_SIZE}"
+echo "Compare vanilla vs stage1-reuse rollout: ${ROLLOUT_CMP_VANILLA_VS_REUSE} (raw flag=${COMPARE_VANILLA_ROLLOUT_WITH_STAGE1_REUSE_STAGE2_FORCE_RANDOMNESS})"
 echo "Data filter workers: ${FILTER_OVERLONG_PROMPTS_WORKERS}"
 echo "Agent loop workers: ${AGENT_LOOP_NUM_WORKERS}"
 echo "Use fused kernels: ${USE_FUSED_KERNELS}"
@@ -139,6 +153,7 @@ done
   actor_rollout_ref.model.fused_kernel_options.impl_backend="${FUSED_KERNEL_IMPL_BACKEND}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
+  actor_rollout_ref.rollout.compare_vanilla_vs_stage1_reuse="${ROLLOUT_CMP_VANILLA_VS_REUSE}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP_SIZE}" \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
   trainer.n_gpus_per_node="${N_GPUS}" \

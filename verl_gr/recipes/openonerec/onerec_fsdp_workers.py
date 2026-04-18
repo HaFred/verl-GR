@@ -4,12 +4,15 @@ import logging
 from importlib import import_module
 from typing import Any
 
+import numpy as np
 import torch
 from torch.distributed.device_mesh import init_device_mesh
 
+from verl import DataProto
+from verl.single_controller.base.decorator import make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.device import get_device_name
 from verl.utils.fs import copy_to_local
-from verl.utils.profiler import log_gpu_memory_usage
+from verl.utils.profiler import DistProfiler, log_gpu_memory_usage
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 logger = logging.getLogger(__name__)
@@ -106,4 +109,19 @@ class OneRecActorRolloutRefWorker(ActorRolloutRefWorker):
         )
         log_gpu_memory_usage("After building sharding manager", logger=logger)
         return rollout, rollout_sharding_manager
+
+    @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="rollout"))
+    @DistProfiler.annotate(color="red", role="rollout_generate")
+    def generate_sequences(self, prompts: DataProto):
+        """Merge OpenOneRec rollout comparison scalars into ``timing`` for TensorBoard timing metrics."""
+        out = super().generate_sequences(prompts)
+        cmp = out.meta_info.get("openonerec_rollout_cmp")
+        if cmp and isinstance(cmp, dict) and "timing" in out.meta_info:
+            tm = out.meta_info["timing"]
+            for k, v in cmp.items():
+                if isinstance(v, (int, float)):
+                    tm[f"openonerec_cmp_{k}"] = float(v)
+                elif isinstance(v, np.number):
+                    tm[f"openonerec_cmp_{k}"] = float(v)
+        return out
 
