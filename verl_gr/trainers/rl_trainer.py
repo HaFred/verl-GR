@@ -3,6 +3,7 @@
 import torch
 
 from verl import DataProto
+from verl_gr.trainers.rollout_cmp_grpo_hooks import install_rollout_cmp_hooks, set_rollout_cmp_trainer_ref
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
@@ -91,6 +92,15 @@ def compute_advantage(
 
 class RLTrainer(RayPPOTrainerBase):
     """RayPPOTrainer override with different workload helpers."""
+
+    def fit(self):
+        """Install compare-mode hooks once, then run upstream PPO/GRPO fit."""
+        install_rollout_cmp_hooks()
+        set_rollout_cmp_trainer_ref(self)
+        try:
+            return super().fit()
+        finally:
+            set_rollout_cmp_trainer_ref(None)
 
     @staticmethod
     def _ensure_reward_routing_keys(proto: DataProto) -> None:

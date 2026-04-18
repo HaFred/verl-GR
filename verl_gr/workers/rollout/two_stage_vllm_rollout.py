@@ -490,6 +490,7 @@ class TwoStagevLLMRollout(vLLMRollout):
             )
             meta = dict(out_default.meta_info) if out_default.meta_info else {}
             meta["openonerec_rollout_cmp"] = cmp
+            meta["openonerec_cmp_feature_rollout"] = out_feature
             out_default.meta_info = meta
             logger.info(
                 "openonerec_rollout_cmp step=%s default_s=%.4f feature_s=%.4f "
