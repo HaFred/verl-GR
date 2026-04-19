@@ -5,6 +5,7 @@ Randomly selects N samples from multiple parquet files as the test set, with rem
 Both datasets are shuffled before saving.
 """
 
+import os
 import argparse
 import logging
 import sys
@@ -261,7 +262,12 @@ def main():
         )
         
         if len(train_df) > 0:
-            logger.info(f"Saving training set to: {train_path}")
+            if not os.path.isfile(train_path):
+                logger.info(f"Saving training set to: {train_path}")
+            else:
+                logger.info(f"Saving first 1k training set same place")
+                train_df = train_df[:1000]
+                train_path = str(train_path).replace("train", "train_1k")
             train_df.to_parquet(
                 train_path,
                 engine='pyarrow',

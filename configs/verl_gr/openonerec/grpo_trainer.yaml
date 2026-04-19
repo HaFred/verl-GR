@@ -70,6 +70,7 @@ actor_rollout_ref:
       ranks: [0]
 
   rollout:
+    _target_: verl_gr.workers.config.rollout.RolloutConfig
     name: vllm
     n: 1
     # When true (and rollout.name=two_stage + sync), runs full two-stage vanilla then a feature
