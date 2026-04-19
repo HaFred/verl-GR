@@ -50,6 +50,8 @@ MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-$((N_GPUS * N_NODES))}"
 
 ROLLOUT_N="${ROLLOUT_N:-1}"
+ROLLOUT_NAME="${ROLLOUT_NAME:-two_stage}"
+ROLLOUT_MODE="${ROLLOUT_MODE:-sync}"
 STAGE2_BEAM_SIZE="${STAGE2_BEAM_SIZE:-32}"
 RESPONSE_LENGTH="${RESPONSE_LENGTH:-2048}"
 STAGE1_MAX_TOKENS="${STAGE1_MAX_TOKENS:-1024}"
@@ -103,6 +105,7 @@ echo "==================================="
 echo "Cluster: ${N_NODES} node(s) x ${N_GPUS} GPU(s)"
 echo "Model: ${BASE_MODEL}"
 echo "Rollout N: ${ROLLOUT_N}, Beam: ${STAGE2_BEAM_SIZE}"
+echo "Rollout backend: name=${ROLLOUT_NAME}, mode=${ROLLOUT_MODE}"
 echo "Compare vanilla vs stage1-reuse rollout: ${ROLLOUT_CMP_VANILLA_VS_REUSE} (raw flag=${COMPARE_VANILLA_ROLLOUT_WITH_STAGE1_REUSE_STAGE2_FORCE_RANDOMNESS})"
 echo "Data filter workers: ${FILTER_OVERLONG_PROMPTS_WORKERS}"
 echo "Agent loop workers: ${AGENT_LOOP_NUM_WORKERS}"
@@ -152,6 +155,8 @@ done
   actor_rollout_ref.model.use_fused_kernels="${USE_FUSED_KERNELS}" \
   actor_rollout_ref.model.fused_kernel_options.impl_backend="${FUSED_KERNEL_IMPL_BACKEND}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
+  actor_rollout_ref.rollout.name="${ROLLOUT_NAME}" \
+  actor_rollout_ref.rollout.mode="${ROLLOUT_MODE}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.compare_vanilla_vs_stage1_reuse="${ROLLOUT_CMP_VANILLA_VS_REUSE}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TP_SIZE}" \
