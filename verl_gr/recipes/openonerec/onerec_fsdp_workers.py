@@ -6,13 +6,16 @@ from typing import Any
 
 import numpy as np
 import torch
+from omegaconf import OmegaConf
 from torch.distributed.device_mesh import init_device_mesh
 
 from verl import DataProto
 from verl.single_controller.base.decorator import make_nd_compute_dataproto_dispatch_fn, register
 from verl.utils.device import get_device_name
 from verl.utils.fs import copy_to_local
+from verl.utils.config import omega_conf_to_dataclass
 from verl.utils.profiler import DistProfiler, log_gpu_memory_usage
+from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.fsdp_workers import ActorRolloutRefWorker
 
 logger = logging.getLogger(__name__)
@@ -57,14 +60,9 @@ class OneRecActorRolloutRefWorker(ActorRolloutRefWorker):
         if self.config.rollout.name != "two_stage":
             return super()._build_rollout(trust_remote_code)
 
-        if self.config.rollout.mode == "async":
-            logger.warning("OneRec two-stage rollout currently supports sync mode only; using base async rollout.")
-            return super()._build_rollout(trust_remote_code)
-
-        TwoStagevLLMRollout = getattr(
-            import_module("verl_gr.workers.rollout.two_stage_vllm_rollout"),
-            "TwoStagevLLMRollout",
-        )
+        rollout_module = import_module("verl_gr.workers.rollout.two_stage_vllm_rollout")
+        TwoStagevLLMRollout = getattr(rollout_module, "TwoStagevLLMRollout")
+        using_server_adapter_backend = bool(getattr(rollout_module, "_USING_SERVER_ADAPTER_BACKEND", False))
 
         infer_tp = self.config.rollout.tensor_model_parallel_size
         dp = self.world_size // infer_tp
@@ -81,6 +79,25 @@ class OneRecActorRolloutRefWorker(ActorRolloutRefWorker):
             if self._is_lora
             else {}
         )
+
+        if using_server_adapter_backend:
+            rollout_cfg_node = OmegaConf.create(OmegaConf.to_container(self.config.rollout, resolve=True))
+            cmp_flag = bool(rollout_cfg_node.pop("compare_vanilla_vs_stage1_reuse", False))
+            rollout_cfg: RolloutConfig = omega_conf_to_dataclass(rollout_cfg_node)
+            setattr(rollout_cfg, "compare_vanilla_vs_stage1_reuse", cmp_flag)
+            model_cfg: HFModelConfig = omega_conf_to_dataclass(self.config.model, dataclass_type=HFModelConfig)
+            self.model_config = model_cfg
+            rollout = TwoStagevLLMRollout(
+                config=rollout_cfg,
+                model_config=model_cfg,
+                device_mesh=rollout_device_mesh,
+            )
+            self.rollout_device_mesh = rollout_device_mesh
+            self.rollout = rollout
+            self.base_sync_done = "dummy" not in self.config.rollout.load_format
+            self.layered_summon = self.config.rollout.get("layered_summon", False)
+            log_gpu_memory_usage("After building OneRec vllm rollout (async adapter)", logger=logger)
+            return
 
         rollout = TwoStagevLLMRollout(
             model_path=local_path,
