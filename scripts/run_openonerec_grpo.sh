@@ -4,14 +4,21 @@
 
 set -euo pipefail
 
+clear
 ROLLOUT_N=8
+
+export CUDA_VISIBLE_DEVICES=6,7
+
+BASE_MODEL=/scratch/dyvm6xra/dyvm6xrauser45/fred/models--OpenOneRec--OneRec-1.7B-pretrain/snapshots/db455d0bdcf4b5e0b42f30c45d65260a49656a7f
+# DATA_DIR=
+
 # true: each step runs vanilla GRPO two-stage (all n repeats) plus a feature path for metrics;
 # false: vanilla only (full two-stage on every repeated row).
 COMPARE_VANILLA_ROLLOUT_WITH_STAGE1_REUSE_STAGE2_FORCE_RANDOMNESS="${COMPARE_VANILLA_ROLLOUT_WITH_STAGE1_REUSE_STAGE2_FORCE_RANDOMNESS:-false}"
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
 PROJECT_ROOT="$(dirname "${VERL_GR_ROOT}")"
-OPENONEREC_RECIPE_PATH="${PROJECT_ROOT}/verl-GR/verl_gr/recipes/openonerec/onerec_recipe.py"
+OPENONEREC_RECIPE_PATH="${PROJECT_ROOT}/verl-GR-fork/verl_gr/recipes/openonerec/onerec_recipe.py"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
@@ -23,7 +30,7 @@ N_NODES="${N_NODES:-$(echo "${RAY_INFO}" | awk '{print $1}')}"
 N_GPUS="${N_GPUS:-$(echo "${RAY_INFO}" | awk '{print $2}')}"
 if [[ -z "${N_NODES}" || -z "${N_GPUS}" || "${N_NODES}" == "0" ]]; then
   N_NODES=1
-  N_GPUS=8
+  N_GPUS=2
 fi
 
 BASE_MODEL="${BASE_MODEL:-/path/to/your/model}"
@@ -63,7 +70,7 @@ ENABLE_THINK="${ENABLE_THINK:-False}"
 ENABLE_NONTHINK="${ENABLE_NONTHINK:-False}"
 USE_FORCE_PREFIX="${USE_FORCE_PREFIX:-False}"
 DATA_DIR="${VERL_GR_ROOT}/verl_gr/recipes/openonerec/output/rl_data"
-TRAIN_FILES="${TRAIN_FILES:-[${DATA_DIR}/train.parquet]}"
+TRAIN_FILES="${TRAIN_FILES:-[${DATA_DIR}/train_1k.parquet]}"
 VAL_FILES="${VAL_FILES:-[${DATA_DIR}/test.parquet]}"
 
 PROJECT_NAME="${PROJECT_NAME:-OneRec_RL}"
