@@ -362,7 +362,7 @@ def openonerec_validate(trainer):
     prompt_counts = Counter(sample_inputs)
     duplicate_prompts = {p: c for p, c in prompt_counts.items() if c > 1}
     if duplicate_prompts:
-        print(f"[Validation Debug] Found {len(duplicate_prompts)} duplicate prompts!")
+        print(f"[Validation Debug] Found {len(duplicate_prompts)} prompts having duplicates for beam search!")
         for p, c in list(duplicate_prompts.items())[:3]:
             print(f"  Prompt (truncated): '{p[:100]}...' appears {c} times")
     else:
