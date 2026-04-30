@@ -15,7 +15,8 @@ defaults:
 data:
   max_prompt_length: 10240
   prompt_key: prompt
-  shuffle: false
+  shuffle: true
+  val_batch_size: 100
   max_response_length: 2048
   filter_overlong_prompts: true
   filter_overlong_prompts_workers: 16
@@ -84,6 +85,12 @@ actor_rollout_ref:
     enable_chunked_prefill: true
     calculate_log_probs: false
     layered_summon: false
+    val_kwargs:
+      do_sample: true
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      n: 1
     custom:
       beam_width: 32
       two_stage_max_inflight_requests: 8

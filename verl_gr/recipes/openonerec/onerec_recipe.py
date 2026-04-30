@@ -472,11 +472,6 @@ class OneRecTask:
         base_train_n = int(rollout_cfg.get("n", 1))
         rollout_cfg["n"] = base_train_n * beam_size
 
-        val_kwargs = rollout_cfg.get("val_kwargs")
-        if val_kwargs is not None:
-            base_val_n = int(val_kwargs.get("n", 1))
-            val_kwargs["n"] = base_val_n * beam_size
-
     @staticmethod
     def get_reward_model_cfg(config):
         reward_root = config.get("reward")

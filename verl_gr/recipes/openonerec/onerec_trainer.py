@@ -234,8 +234,22 @@ def openonerec_validate(trainer):
         rollout_config = trainer.config.actor_rollout_ref.rollout
         use_beam_search_val = val_kwargs.get("use_beam_search", False)
         is_two_stage_rollout_val = rollout_config.get("name") == "two_stage"
+        rollout_custom = rollout_config.get("custom") or {}
+        beam_width = int(
+            rollout_custom.get(
+                BEAM_WIDTH_KEY,
+                rollout_custom.get("stage2_beam_size", 32),
+            )
+        )
 
-        if not use_beam_search_val:
+        if is_two_stage_rollout_val and trainer.async_rollout_mode:
+            repeat_times = int(val_kwargs.n) * beam_width
+            print(
+                "[Validation Debug] Async two-stage request expansion: "
+                f"repeat_times={repeat_times} (val_n={val_kwargs.n}, beam_width={beam_width})"
+            )
+            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
+        elif not use_beam_search_val:
             test_batch = test_batch.repeat(repeat_times=val_kwargs.n, interleave=True)
 
         if (
@@ -276,8 +290,6 @@ def openonerec_validate(trainer):
             "validate": True,
             "global_steps": trainer.global_steps,
         }
-        rollout_custom = rollout_config.get("custom") or {}
-
         if is_two_stage_rollout_val:
             reasoning_max_tokens = rollout_custom.get(
                 "stage1_max_tokens",
@@ -286,10 +298,6 @@ def openonerec_validate(trainer):
                     (DECODE_CONFIG_KEY, "reasoning", "max_tokens"),
                     trainer.config.data.get("max_response_length", 1024),
                 ),
-            )
-            beam_width = rollout_custom.get(
-                BEAM_WIDTH_KEY,
-                rollout_custom.get("stage2_beam_size", 32),
             )
             item_max_tokens = rollout_custom.get(
                 "stage2_num_tokens",
@@ -305,9 +313,14 @@ def openonerec_validate(trainer):
                     reasoning_max_tokens=int(reasoning_max_tokens),
                     item_max_tokens=int(item_max_tokens),
                     beam_width=int(beam_width),
+                    return_all_beams=True,
                 )
             )
             meta_info["max_tokens"] = trainer.config.data.get("max_response_length", 1024)
+            meta_info["temperature"] = val_kwargs.get("temperature", rollout_config.get("temperature", 1.0))
+            meta_info["top_p"] = val_kwargs.get("top_p", rollout_config.get("top_p", 1.0))
+            meta_info["top_k"] = val_kwargs.get("top_k", rollout_config.get("top_k", -1))
+            meta_info["n"] = val_kwargs.get("n", 1)
             print(f"[OneRecTrainer] Validation Two-Stage Enabled: {meta_info}")
         elif use_beam_search_val:
             meta_info["use_beam_search"] = True
@@ -332,7 +345,16 @@ def openonerec_validate(trainer):
             test_output_gen_batch_padded = trainer.async_rollout_manager.generate_sequences(test_gen_batch_padded)
 
         if is_two_stage_rollout_val:
-            actual_pad_size = pad_size
+            beam_return_mode = test_gen_batch.meta_info.get(BEAM_RETURN_MODE_KEY, "best_only")
+            n_beams = 1 if trainer.async_rollout_mode else (
+                test_gen_batch.meta_info.get(BEAM_WIDTH_KEY, 1) if beam_return_mode == "all_beams" else 1
+            )
+            print(
+                "[Validation Debug] Two-stage unpad: "
+                f"original pad_size={pad_size}, beam_return_mode={beam_return_mode}, "
+                f"n_beams={n_beams}, actual_pad_size={pad_size * n_beams}"
+            )
+            actual_pad_size = pad_size * n_beams
         elif use_beam_search_val:
             n_beams = (
                 val_kwargs.get("n", 1)
