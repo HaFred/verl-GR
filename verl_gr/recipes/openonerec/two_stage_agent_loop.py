@@ -330,46 +330,81 @@ class OpenOneRecAgentLoopWorker(AgentLoopWorker):
             min_concurrent_requests = max(1, min(min_concurrent_requests, max_concurrent_requests))
             concurrency_step = max(1, concurrency_step)
 
-            def normalize_chunk_size(raw_size: int, *, pending: int) -> int:
-                if pending <= 0:
-                    return 0
-                size = max(1, min(raw_size, pending))
-                if pending <= beam_width:
-                    return pending
-                if beam_width > 1:
-                    size = max(beam_width, (size // beam_width) * beam_width)
-                    size = min(size, pending)
-                return max(1, size)
+            grouped_task_indices: list[list[int]] = []
+            group_index_map: dict[tuple[int, int, int, int], int] = {}
+            for task_idx in range(total_tasks):
+                step = int(trajectory_info[task_idx]["step"])
+                validate_flag = int(bool(trajectory_info[task_idx]["validate"]))
+                sample_index = int(trajectory_info[task_idx]["sample_index"])
+                rollout_n = int(trajectory_info[task_idx]["rollout_n"])
+                stage1_sample_idx = rollout_n // beam_width
+                group_key = (step, validate_flag, sample_index, stage1_sample_idx)
+                existing_group_idx = group_index_map.get(group_key)
+                if existing_group_idx is None:
+                    group_index_map[group_key] = len(grouped_task_indices)
+                    grouped_task_indices.append([task_idx])
+                else:
+                    grouped_task_indices[existing_group_idx].append(task_idx)
 
-            chunk_size = normalize_chunk_size(max_concurrent_requests, pending=total_tasks)
+            total_groups = len(grouped_task_indices)
+            if total_groups == 0:
+                return self._postprocess([], input_non_tensor_batch=batch.non_tensor_batch)
+
+            def normalize_group_concurrency(raw_request_budget: int, *, pending_groups: int) -> tuple[int, int]:
+                request_budget = max(1, raw_request_budget)
+                request_budget = min(request_budget, max_concurrent_requests)
+                group_concurrency = max(1, request_budget // beam_width)
+                group_concurrency = min(group_concurrency, pending_groups)
+                request_budget = group_concurrency * beam_width
+                return request_budget, group_concurrency
+
+            request_budget, group_concurrency = normalize_group_concurrency(
+                max_concurrent_requests,
+                pending_groups=total_groups,
+            )
             print(
                 "[Validation Progress] Starting async two-stage rollout: "
-                f"total_requests={total_tasks}, max_concurrent_requests={chunk_size}, "
+                f"total_requests={total_tasks}, total_stage1_groups={total_groups}, "
+                f"max_concurrent_requests={request_budget}, concurrent_groups={group_concurrency}, "
                 f"adaptive_concurrency={adaptive_concurrency}"
             )
 
-            completed_count = 0
-            chunk_start = 0
-            while chunk_start < total_tasks:
-                chunk_end = min(chunk_start + chunk_size, total_tasks)
+            async def run_group_indices(group_task_indices: list[int]) -> list[tuple[int, Any]]:
                 tasks = [
                     asyncio.create_task(run_indexed_task(task_idx, build_task_kwargs(task_idx)))
-                    for task_idx in range(chunk_start, chunk_end)
+                    for task_idx in group_task_indices
                 ]
-                for task in asyncio.as_completed(tasks):
-                    output_idx, output = await task
-                    outputs[output_idx] = output
-                    completed_count += 1
-                    if completed_count % 100 == 0 or completed_count == total_tasks:
+                return await asyncio.gather(*tasks)
+
+            completed_count = 0
+            next_progress_log = 100
+            group_cursor = 0
+            while group_cursor < total_groups:
+                group_end = min(group_cursor + group_concurrency, total_groups)
+                group_batch = grouped_task_indices[group_cursor:group_end]
+                group_tasks = [
+                    asyncio.create_task(run_group_indices(group_task_indices))
+                    for group_task_indices in group_batch
+                ]
+                for group_task in asyncio.as_completed(group_tasks):
+                    group_outputs = await group_task
+                    for output_idx, output in group_outputs:
+                        outputs[output_idx] = output
+                    completed_count += len(group_outputs)
+                    while next_progress_log <= completed_count or completed_count == total_tasks:
                         elapsed = time.monotonic() - started_at
                         rate = completed_count / elapsed if elapsed > 0 else 0.0
                         print(
                             "[Validation Progress] "
                             f"completed={completed_count}/{total_tasks}, elapsed={elapsed:.1f}s, rate={rate:.2f} req/s"
                         )
-                pending_after_chunk = total_tasks - completed_count
-                if adaptive_concurrency and pending_after_chunk > 0:
-                    next_chunk = chunk_size
+                        if completed_count == total_tasks:
+                            break
+                        next_progress_log += 100
+                pending_after_groups = total_groups - group_end
+                pending_after_requests = total_tasks - completed_count
+                if adaptive_concurrency and pending_after_groups > 0:
+                    next_request_budget = request_budget
                     server_metrics = await self._read_server_runtime_metrics()
                     if server_metrics is not None:
                         inflight = int(server_metrics["inflight_engine_requests"])
@@ -378,18 +413,21 @@ class OpenOneRecAgentLoopWorker(AgentLoopWorker):
                         max_inflight = max(1, int(server_metrics["max_inflight_engine_requests"]))
                         inflight_ratio = inflight / max_inflight
                         if waiters > 0 or pending_build_tasks > 0 or inflight_ratio >= 0.95:
-                            next_chunk -= concurrency_step
+                            next_request_budget -= concurrency_step
                         elif inflight_ratio <= 0.70:
-                            next_chunk += concurrency_step
+                            next_request_budget += concurrency_step
                     else:
                         sampled_gpu_util = self._read_gpu_utilization()
                         if sampled_gpu_util is not None:
                             if sampled_gpu_util < target_gpu_util - gpu_util_tolerance:
-                                next_chunk += concurrency_step
+                                next_request_budget += concurrency_step
                             elif sampled_gpu_util > target_gpu_util + gpu_util_tolerance:
-                                next_chunk -= concurrency_step
-                    next_chunk = max(min_concurrent_requests, min(max_concurrent_requests, next_chunk))
-                    chunk_size = normalize_chunk_size(next_chunk, pending=pending_after_chunk)
+                                next_request_budget -= concurrency_step
+                    next_request_budget = max(min_concurrent_requests, min(max_concurrent_requests, next_request_budget))
+                    request_budget, group_concurrency = normalize_group_concurrency(
+                        next_request_budget,
+                        pending_groups=pending_after_groups,
+                    )
                     if server_metrics is not None:
                         print(
                             "[Validation Adaptive] "
@@ -397,16 +435,19 @@ class OpenOneRecAgentLoopWorker(AgentLoopWorker):
                             f"{server_metrics['max_inflight_engine_requests']}, "
                             f"waiters={server_metrics['engine_request_waiters']}, "
                             f"pending_build={server_metrics['pending_build_tasks']}, "
-                            f"pending={pending_after_chunk}, next_chunk_size={chunk_size}"
+                            f"pending_requests={pending_after_requests}, pending_groups={pending_after_groups}, "
+                            f"next_max_concurrent_requests={request_budget}, next_concurrent_groups={group_concurrency}"
                         )
                     else:
                         sampled_gpu_util = self._read_gpu_utilization()
                         gpu_util_text = f"{sampled_gpu_util:.1f}%" if sampled_gpu_util is not None else "n/a"
                         print(
                             "[Validation Adaptive] "
-                            f"gpu_util={gpu_util_text}, pending={pending_after_chunk}, next_chunk_size={chunk_size}"
+                            f"gpu_util={gpu_util_text}, pending_requests={pending_after_requests}, "
+                            f"pending_groups={pending_after_groups}, "
+                            f"next_max_concurrent_requests={request_budget}, next_concurrent_groups={group_concurrency}"
                         )
-                chunk_start = chunk_end
+                group_cursor = group_end
         else:
             tasks = [
                 asyncio.create_task(run_indexed_task(task_idx, build_task_kwargs(task_idx)))
