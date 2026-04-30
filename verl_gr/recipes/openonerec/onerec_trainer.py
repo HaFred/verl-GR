@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import time
 from collections import defaultdict
+from fnmatch import fnmatch
 from importlib import import_module
 
 DataProto = getattr(import_module("verl"), "DataProto")
@@ -124,6 +127,83 @@ def openonerec_maybe_log_val_generations(trainer, inputs, outputs, scores):
     rng.shuffle(samples)
     samples = samples[:generations_to_log]
     trainer.validation_generations_logger.log(trainer.config.trainer.logger, samples, trainer.global_steps)
+
+
+def _extract_eval_sids(text) -> set[str]:
+    if not isinstance(text, str):
+        return set()
+
+    sids = []
+    for part in text.split("<|sid_begin|>"):
+        if "<|sid_end|>" not in part:
+            continue
+        sid = part.split("<|sid_end|>", 1)[0].strip()
+        if sid:
+            sids.append(sid)
+    return set(sids)
+
+
+def _extract_eval_generation_sid(text) -> str:
+    if not isinstance(text, str):
+        return ""
+
+    generation = text.strip()
+    if "</think>" in generation:
+        generation = generation.split("</think>")[-1].strip()
+    if "<|sid_begin|>" in generation:
+        # Two-stage validation responses may include CoT text before the item
+        # prefix. Skip that pre-prefix segment to match the standalone evaluator.
+        for part in generation.split("<|sid_begin|>")[1:]:
+            if "<|sid_end|>" in part:
+                sid = part.split("<|sid_end|>", 1)[0].strip()
+                if sid:
+                    return sid
+            sid = part.strip()
+            if sid:
+                return sid
+    return generation
+
+
+def _add_pass_at_k_reward_info(
+    reward_extra_infos_dict: dict[str, list],
+    data_sources,
+    sample_inputs: list[str],
+    sample_outputs: list[str],
+    sample_ground_truths: list[str],
+    k: int = 32,
+) -> dict[str, float]:
+    if not sample_outputs or not sample_ground_truths:
+        return {}
+
+    grouped_indices = defaultdict(list)
+    for idx, (data_source, prompt) in enumerate(zip(data_sources, sample_inputs, strict=True)):
+        grouped_indices[(data_source, prompt)].append(idx)
+
+    pass_at_k_values = [0.0] * len(sample_outputs)
+    source_values = defaultdict(list)
+    source_counts = defaultdict(lambda: [0, 0])
+    for (data_source, _prompt), indices in grouped_indices.items():
+        candidate_indices = indices[:k]
+        gt_ids = _extract_eval_sids(sample_ground_truths[indices[0]])
+        predicted = [_extract_eval_generation_sid(sample_outputs[idx]) for idx in candidate_indices]
+        if source_counts[data_source][1] < 3:
+            print(f"[pass_at_{k}/debug] {data_source} gt_sample={list(gt_ids)[:3]} pred_top5={predicted[:5]}")
+
+        group_value = float(any(sid in gt_ids for sid in predicted[:k] if sid))
+        source_values[data_source].append(group_value)
+        source_counts[data_source][0] += int(group_value)
+        source_counts[data_source][1] += 1
+        for idx in indices:
+            pass_at_k_values[idx] = group_value
+
+    reward_extra_infos_dict[f"pass_at_{k}"] = pass_at_k_values
+    for data_source, (hits, total) in source_counts.items():
+        print(f"[pass_at_{k}/evaluator_style] {data_source}: {hits}/{total} = {hits / max(total, 1):.6f}")
+    return {
+        f"val-aux/{data_source}/pass_at_{k}": float(np.mean(values))
+        for data_source, values in source_values.items()
+        if values
+    }
 
 
 def openonerec_validate(trainer):
@@ -369,9 +449,32 @@ def openonerec_validate(trainer):
         print(f"[Validation Debug] No duplicate prompts found. Total unique prompts: {len(prompt_counts)}")
     print(f"[Validation Debug] Total samples: {len(sample_inputs)}, Total scores: {len(sample_scores)}")
 
+    for key_info, values in reward_extra_infos_dict.items():
+        assert len(values) == 0 or len(values) == len(sample_scores), (
+            f"{key_info}: len(values)={len(values)}, len(sample_scores)={len(sample_scores)}"
+        )
+
     data_sources = np.concatenate(data_source_lst, axis=0)
-    data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+    pass_at_k_metrics = _add_pass_at_k_reward_info(
+        reward_extra_infos_dict=reward_extra_infos_dict,
+        data_sources=data_sources,
+        sample_inputs=sample_inputs,
+        sample_outputs=sample_outputs,
+        sample_ground_truths=sample_ground_truths,
+        k=32,
+    )
+    if "pass_at_32" in reward_extra_infos_dict:
+        for key, value in pass_at_k_metrics.items():
+            data_source = key.split("/")[1] if "/" in key else "unknown"
+            print(f"[pass_at_32] {data_source}: {value}")
+        print(f"len reward_extra_infos_dict['pass_at_32']: {len(reward_extra_infos_dict['pass_at_32'])}")
+
+    validation_infos_for_aggregation = {
+        key: values for key, values in reward_extra_infos_dict.items() if key != "pass_at_32"
+    }
+    data_src2var2metric2val = process_validation_metrics(data_sources, sample_inputs, validation_infos_for_aggregation)
     metric_dict = {}
+    pass_at_aliases = {}
     for data_source, var2metric2val in data_src2var2metric2val.items():
         core_var = "acc" if "acc" in var2metric2val else "reward"
         for var_name, metric2val in var2metric2val.items():
@@ -384,6 +487,14 @@ def openonerec_validate(trainer):
                 )
                 metric_sec = "val-core" if is_core else "val-aux"
                 metric_dict[f"{metric_sec}/{data_source}/{var_name}/{metric_name}"] = metric_val
+                if var_name in {"pass_at_1", "score"} and metric_name == f"best@{n_max}/mean" and n_max > 1:
+                    alias = f"val-aux/{data_source}/pass_at_{n_max}/mean"
+                    if var_name == "pass_at_1" or alias not in pass_at_aliases:
+                        pass_at_aliases[alias] = metric_val
+
+    metric_dict.update(pass_at_aliases)
+    metric_dict.update(pass_at_k_metrics)
+    metric_dict.update({f"{key}/mean": value for key, value in pass_at_k_metrics.items()})
 
     if len(sample_turns) > 0:
         sample_turns = np.concatenate(sample_turns)
@@ -397,4 +508,123 @@ def openonerec_validate(trainer):
         metric_dict["val/response_length/max"] = response_lengths_tensor.max().item()
         metric_dict["val/response_length/min"] = response_lengths_tensor.min().item()
     return metric_dict
+
+
+def _config_bool(value, default=False):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "y", "on"}
+    return bool(value)
+
+
+def _checkpoint_score_from_metrics(trainer, local_global_step_folder, metrics):
+    if not metrics:
+        return None
+
+    metric_pattern = str(trainer.config.trainer.get("best_ckpt_metric", "val-aux/*/pass_at_32/mean"))
+    exact_matches = []
+    wildcard_matches = []
+    for key, value in metrics.items():
+        try:
+            numeric_value = float(value)
+        except (TypeError, ValueError):
+            continue
+
+        if key == metric_pattern:
+            exact_matches.append((key, numeric_value))
+        elif fnmatch(key, metric_pattern):
+            wildcard_matches.append((key, numeric_value))
+
+    matches = exact_matches or wildcard_matches
+    if not matches:
+        return None
+
+    score = sum(value for _, value in matches) / len(matches)
+    return {
+        "score": float(score),
+        "metric": metric_pattern,
+        "matched_metrics": {key: value for key, value in matches},
+        "path": os.path.abspath(local_global_step_folder),
+        "global_step": int(trainer.global_steps),
+        "evaluated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+def openonerec_evaluate_and_prune_checkpoint(trainer, local_global_step_folder, metrics=None):
+    if not _config_bool(trainer.config.trainer.get("best_ckpt_prune_enable", True), default=True):
+        print("[checkpoint_eval] best_ckpt_prune_enable is false; skipping best-checkpoint pruning.")
+        return
+
+    eval_score = _checkpoint_score_from_metrics(trainer, local_global_step_folder, metrics)
+    if eval_score is None:
+        metric_pattern = trainer.config.trainer.get("best_ckpt_metric", "val-aux/*/pass_at_32/mean")
+        print(
+            f"[checkpoint_eval] No logged checkpoint metric matching {metric_pattern}; "
+            f"skipping best-checkpoint pruning for {local_global_step_folder}."
+        )
+        return
+
+    keep_count = int(trainer.config.trainer.get("best_ckpts_to_keep", 3))
+    if keep_count <= 0:
+        print("[checkpoint_eval] best_ckpts_to_keep <= 0; skipping pruning.")
+        return
+
+    ckpt_root = os.path.abspath(str(trainer.config.trainer.default_local_dir))
+    score_path = os.path.join(ckpt_root, "best_pass32_checkpoints.json")
+    os.makedirs(ckpt_root, exist_ok=True)
+
+    records = []
+    if os.path.isfile(score_path):
+        try:
+            with open(score_path, "r", encoding="utf-8") as handle:
+                records = json.load(handle).get("checkpoints", [])
+        except Exception as exc:
+            print(f"[checkpoint_eval] Failed to read existing score file {score_path}: {exc}")
+            records = []
+
+    current_path = os.path.abspath(local_global_step_folder)
+    records = [record for record in records if os.path.isdir(record.get("path", "")) and record.get("path") != current_path]
+    records.append(eval_score)
+    records.sort(
+        key=lambda record: (float(record.get("score", float("-inf"))), int(record.get("global_step", -1))),
+        reverse=True,
+    )
+
+    keep_records = records[:keep_count]
+    remove_records = records[keep_count:]
+    keep_paths = {record["path"] for record in keep_records}
+
+    for record in remove_records:
+        path = record.get("path")
+        if path and os.path.isdir(path) and path not in keep_paths:
+            print(
+                f"[checkpoint_eval] Removing checkpoint outside top {keep_count}: "
+                f"{path} ({record.get('metric')}={record.get('score')})"
+            )
+            shutil.rmtree(path, ignore_errors=True)
+
+    latest_tracker = os.path.join(ckpt_root, "latest_checkpointed_iteration.txt")
+    if keep_records:
+        latest_kept_step = max(int(record["global_step"]) for record in keep_records)
+        with open(latest_tracker, "w", encoding="utf-8") as handle:
+            handle.write(str(latest_kept_step))
+
+    with open(score_path, "w", encoding="utf-8") as handle:
+        json.dump(
+            {
+                "metric": eval_score["metric"],
+                "keep_count": keep_count,
+                "checkpoints": keep_records,
+            },
+            handle,
+            indent=2,
+        )
+
+    print(
+        "[checkpoint_eval] Best checkpoints: "
+        + ", ".join(f"global_step_{record['global_step']}={float(record['score']):.6f}" for record in keep_records)
+    )
 

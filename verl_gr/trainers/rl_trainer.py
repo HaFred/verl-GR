@@ -9,6 +9,7 @@ from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
 from verl.utils.torch_functional import masked_mean
 
 from verl_gr.recipes.openonerec.onerec_trainer import (
+    openonerec_evaluate_and_prune_checkpoint,
     openonerec_dump_generations,
     openonerec_maybe_log_val_generations,
     openonerec_validate,
@@ -170,7 +171,9 @@ class RLTrainer(RayPPOTrainerBase):
         return gen_batch
 
     def _validate(self):
-        return openonerec_validate(self)
+        metrics = openonerec_validate(self)
+        self._last_validation_metrics = metrics
+        return metrics
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, ground_truths=None):
         return openonerec_dump_generations(
@@ -185,4 +188,13 @@ class RLTrainer(RayPPOTrainerBase):
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         return openonerec_maybe_log_val_generations(self, inputs=inputs, outputs=outputs, scores=scores)
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+        local_global_step_folder = f"{self.config.trainer.default_local_dir}/global_step_{self.global_steps}"
+        openonerec_evaluate_and_prune_checkpoint(
+            self,
+            local_global_step_folder,
+            metrics=getattr(self, "_last_validation_metrics", None),
+        )
 

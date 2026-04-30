@@ -38,13 +38,17 @@ ROLLOUT_MODE="${ROLLOUT_MODE:-async}"
 # - test_freq controls when validation runs.
 # - log_val_generations controls how many samples are printed per validation.
 TEST_FREQ="${TEST_FREQ:-20}"
+SAVE_FREQ="${SAVE_FREQ:-${TEST_FREQ}}"
 VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-8}"
 VAL_DUMP_GENERATIONS="${VAL_DUMP_GENERATIONS:-True}"
+BEST_CKPTS_TO_KEEP="${BEST_CKPTS_TO_KEEP:-3}"
+BEST_CKPT_PRUNE_ENABLE="${BEST_CKPT_PRUNE_ENABLE:-True}"
+BEST_CKPT_METRIC="${BEST_CKPT_METRIC:-val-aux/*/pass_at_32/mean}"
 # Allow explicit control at launch time, e.g.:
 #   AGENT_LOOP_NUM_WORKERS=2 ./scripts/run_openonerec_grpo.sh
 AGENT_LOOP_NUM_WORKERS="${AGENT_LOOP_NUM_WORKERS:-${N_GPUS:-1}}"
 
-ENABLE_THINK="${ENABLE_THINK:-True}"
+ENABLE_THINK="${ENABLE_THINK:-False}"
 ENABLE_NONTHINK="${ENABLE_NONTHINK:-False}"
 USE_FORCE_PREFIX="${USE_FORCE_PREFIX:-False}"
 DATA_DIR="${DATA_DIR:-${VERL_GR_ROOT}/verl_gr/recipes/openonerec/output/rl_data}"
@@ -92,7 +96,7 @@ echo "Cluster: ${N_NODES} node(s) x ${N_GPUS} GPU(s)"
 echo "Model: ${BASE_MODEL}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Max tokens per GPU: ${MAX_TOKENS_PER_GPU}"
-echo "Validation test_freq: ${TEST_FREQ}, log_val_generations: ${VAL_LOG_GENERATIONS}"
+echo "Validation test_freq: ${TEST_FREQ}, save_freq: ${SAVE_FREQ}, log_val_generations: ${VAL_LOG_GENERATIONS}"
 echo "Agent loop workers: ${AGENT_LOOP_NUM_WORKERS}"
 echo "FSDP strategy: ${FSDP_STRATEGY}"
 echo "Output: ${OUTPUT_DIR}"
@@ -143,10 +147,14 @@ done
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.default_local_dir="${OUTPUT_DIR}/ckpt" \
   trainer.test_freq="${TEST_FREQ}" \
+  trainer.save_freq="${SAVE_FREQ}" \
   trainer.log_val_generations="${VAL_LOG_GENERATIONS}" \
   trainer.validation_data_dir=${VALIDATION_DATA_DIR_ARG} \
+  ++trainer.best_ckpt_prune_enable="${BEST_CKPT_PRUNE_ENABLE}" \
+  ++trainer.best_ckpts_to_keep="${BEST_CKPTS_TO_KEEP}" \
+  ++trainer.best_ckpt_metric="${BEST_CKPT_METRIC}" \
   trainer.logger='[tensorboard, wandb]' \
-  trainer.remove_previous_ckpt_in_save=True \
+  trainer.remove_previous_ckpt_in_save=False \
   +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
   +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \
