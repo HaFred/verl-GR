@@ -224,11 +224,15 @@ def openonerec_validate(trainer):
     sample_scores = []
     sample_turns = []
     sample_ground_truths = []
+    total_val_batches = len(trainer.val_dataloader)
+    cumulative_raw_prompts = 0
+    cumulative_expanded_requests = 0
     batch_idx = 0
 
     for test_data in trainer.val_dataloader:
         test_batch = DataProto.from_single_dict(test_data)
         print(f"[Validation Debug] Batch {batch_idx}: test_batch size = {len(test_batch)}")
+        raw_batch_size = len(test_batch)
         batch_idx += 1
         val_kwargs = trainer.config.actor_rollout_ref.rollout.val_kwargs
         rollout_config = trainer.config.actor_rollout_ref.rollout
@@ -251,6 +255,17 @@ def openonerec_validate(trainer):
             test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
         elif not use_beam_search_val:
             test_batch = test_batch.repeat(repeat_times=val_kwargs.n, interleave=True)
+
+        expanded_request_count = len(test_batch)
+        cumulative_raw_prompts += raw_batch_size
+        cumulative_expanded_requests += expanded_request_count
+        print(
+            "[Validation Global] "
+            f"batch={batch_idx}/{total_val_batches}, raw_prompts={raw_batch_size}, "
+            f"expanded_requests={expanded_request_count}, "
+            f"cumulative_raw_prompts={cumulative_raw_prompts}, "
+            f"cumulative_expanded_requests={cumulative_expanded_requests}"
+        )
 
         if (
             trainer.use_rm

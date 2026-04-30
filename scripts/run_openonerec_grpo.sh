@@ -19,7 +19,7 @@ N_NODES="${N_NODES:-$(echo "${RAY_INFO}" | awk '{print $1}')}"
 N_GPUS="${N_GPUS:-$(echo "${RAY_INFO}" | awk '{print $2}')}"
 if [[ -z "${N_NODES}" || -z "${N_GPUS}" || "${N_NODES}" == "0" ]]; then
   N_NODES=1
-  N_GPUS=2
+  # N_GPUS=2
 fi
 
 BASE_MODEL="${BASE_MODEL:-/path/to/your/model}"
@@ -41,6 +41,17 @@ TEST_FREQ="${TEST_FREQ:-20}"
 SAVE_FREQ="${SAVE_FREQ:-${TEST_FREQ}}"
 VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-8}"
 VAL_DUMP_GENERATIONS="${VAL_DUMP_GENERATIONS:-True}"
+VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:--1}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-200}"
+VALIDATION_ADAPTIVE_CONCURRENCY="${VALIDATION_ADAPTIVE_CONCURRENCY:-True}"
+VALIDATION_MIN_CONCURRENT_REQUESTS="${VALIDATION_MIN_CONCURRENT_REQUESTS:-64}"
+VALIDATION_MAX_CONCURRENT_REQUESTS="${VALIDATION_MAX_CONCURRENT_REQUESTS:-256}"
+VALIDATION_TARGET_GPU_UTILIZATION="${VALIDATION_TARGET_GPU_UTILIZATION:-85.0}"
+VALIDATION_GPU_UTIL_TOLERANCE="${VALIDATION_GPU_UTIL_TOLERANCE:-7.5}"
+VALIDATION_CONCURRENCY_STEP="${VALIDATION_CONCURRENCY_STEP:-32}"
+VAL_THINKING_TEMPERATURE="${VAL_THINKING_TEMPERATURE:-0.6}"
+VAL_THINKING_TOP_P="${VAL_THINKING_TOP_P:-0.95}"
+VAL_THINKING_TOP_K="${VAL_THINKING_TOP_K:-50}"
 BEST_CKPTS_TO_KEEP="${BEST_CKPTS_TO_KEEP:-3}"
 BEST_CKPT_PRUNE_ENABLE="${BEST_CKPT_PRUNE_ENABLE:-True}"
 BEST_CKPT_METRIC="${BEST_CKPT_METRIC:-val-aux/*/pass_at_32/mean}"
@@ -97,6 +108,11 @@ echo "Model: ${BASE_MODEL}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Max tokens per GPU: ${MAX_TOKENS_PER_GPU}"
 echo "Validation test_freq: ${TEST_FREQ}, save_freq: ${SAVE_FREQ}, log_val_generations: ${VAL_LOG_GENERATIONS}"
+echo "Validation max samples: ${VAL_MAX_SAMPLES}, val batch size: ${VAL_BATCH_SIZE}"
+echo "Validation adaptive concurrency: ${VALIDATION_ADAPTIVE_CONCURRENCY}"
+echo "Validation min/max concurrent requests: ${VALIDATION_MIN_CONCURRENT_REQUESTS}/${VALIDATION_MAX_CONCURRENT_REQUESTS}"
+echo "Validation target gpu util +/- tol: ${VALIDATION_TARGET_GPU_UTILIZATION}% +/- ${VALIDATION_GPU_UTIL_TOLERANCE}%"
+echo "Validation concurrency step: ${VALIDATION_CONCURRENCY_STEP}"
 echo "Agent loop workers: ${AGENT_LOOP_NUM_WORKERS}"
 echo "FSDP strategy: ${FSDP_STRATEGY}"
 echo "Output: ${OUTPUT_DIR}"
@@ -124,6 +140,8 @@ done
   data.enable_think="${ENABLE_THINK}" \
   data.enable_nonthink="${ENABLE_NONTHINK}" \
   data.use_force_prefix="${USE_FORCE_PREFIX}" \
+  data.val_max_samples="${VAL_MAX_SAMPLES}" \
+  data.val_batch_size="${VAL_BATCH_SIZE}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
   data.custom_cls.path="${OPENONEREC_RECIPE_PATH}" \
   custom_reward_function.path="${OPENONEREC_RECIPE_PATH}" \
@@ -135,9 +153,20 @@ done
   actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_TOKENS_PER_GPU}" \
   actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}" \
   actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}" \
+  actor_rollout_ref.rollout.custom.validation_adaptive_concurrency="${VALIDATION_ADAPTIVE_CONCURRENCY}" \
+  actor_rollout_ref.rollout.custom.validation_min_concurrent_requests="${VALIDATION_MIN_CONCURRENT_REQUESTS}" \
+  actor_rollout_ref.rollout.custom.validation_max_concurrent_requests="${VALIDATION_MAX_CONCURRENT_REQUESTS}" \
+  actor_rollout_ref.rollout.custom.validation_target_gpu_utilization="${VALIDATION_TARGET_GPU_UTILIZATION}" \
+  actor_rollout_ref.rollout.custom.validation_gpu_util_tolerance="${VALIDATION_GPU_UTIL_TOLERANCE}" \
+  actor_rollout_ref.rollout.custom.validation_concurrency_step="${VALIDATION_CONCURRENCY_STEP}" \
   actor_rollout_ref.rollout.agent.num_workers="${AGENT_LOOP_NUM_WORKERS}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+  actor_rollout_ref.rollout.val_kwargs.temperature="${VAL_THINKING_TEMPERATURE}" \
+  actor_rollout_ref.rollout.val_kwargs.top_p="${VAL_THINKING_TOP_P}" \
+  actor_rollout_ref.rollout.val_kwargs.top_k="${VAL_THINKING_TOP_K}" \
+  actor_rollout_ref.rollout.val_kwargs.n=1 \
   ++actor_rollout_ref.rollout.mode="${ROLLOUT_MODE}" \
   ++actor_rollout_ref.rollout.name="two_stage" \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
