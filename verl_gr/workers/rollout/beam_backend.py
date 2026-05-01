@@ -54,6 +54,7 @@ async def run_async_beam_search(
     ignore_eos: bool,
     length_penalty: float,
     generate_one_token: Callable[[list[int], str], Awaitable[Any]],
+    allowed_tokens_fn: Callable[[list[int], list[int]], list[int]] | None = None,
 ) -> list[BeamCandidate]:
     active = [BeamCandidate(prompt_token_ids=list(prompt_token_ids))]
     completed: list[BeamCandidate] = []
@@ -92,6 +93,9 @@ async def run_async_beam_search(
                 key=lambda item: item[1].logprob,
                 reverse=True,
             )[:logprobs_num]
+            if allowed_tokens_fn is not None:
+                allowed_tokens = set(allowed_tokens_fn(beam.prompt_token_ids, beam.generated_token_ids))
+                ranked_tokens = [(token_id, token_info) for token_id, token_info in ranked_tokens if int(token_id) in allowed_tokens]
 
             for token_id, token_info in ranked_tokens:
                 next_beam = beam.extend(int(token_id), float(token_info.logprob))

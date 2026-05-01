@@ -19,21 +19,20 @@ from verl.trainer.main_ppo import (
 from verl.trainer.ppo.ray_trainer import Role
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.dataset.rl_dataset import collate_fn
-from verl_gr.recipes.openonerec.onerec_recipe import OneRecTask
+from verl_gr.recipes.task_factory import build_task
 from verl_gr.trainers.rl_trainer import RLTrainer
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[2] / "configs" / "verl_gr" / "openonerec"
 
 
 def _build_main():
-    task_impl = OneRecTask()
-
     @ray.remote(num_cpus=1)
     class TaskRunner(BaseTaskRunner):
         def __init__(self):
             super().__init__()
 
         def run(self, config):
+            task_impl = build_task(config)
             task_impl.sanitize_fsdp2_wrap_policy(config)
             pprint(OmegaConf.to_container(config, resolve=True))
             OmegaConf.resolve(config)
@@ -97,6 +96,7 @@ def _build_main():
             trainer.fit()
 
     def run_ppo(config) -> None:
+        task_impl = build_task(config)
         task_impl.sanitize_fsdp2_wrap_policy(config)
         auto_set_device(config)
         config = migrate_legacy_reward_impl(config)

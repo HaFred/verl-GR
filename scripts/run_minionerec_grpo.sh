@@ -1,0 +1,113 @@
+#!/usr/bin/env bash
+# MiniOneRec GRPO runtime launcher for verl-GR.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
+VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
+MINIONEREC_RECIPE_PATH="${VERL_GR_ROOT}/verl_gr/recipes/minionerec/minionerec_recipe.py"
+MINIONEREC_REWARD_PATH="${VERL_GR_ROOT}/verl_gr/recipes/minionerec/minionerec_reward.py"
+PYTHON_BIN="${PYTHON_BIN:-python3}"
+if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
+  PYTHON_BIN="python"
+fi
+
+RAY_INFO="$("${PYTHON_BIN}" -c "import ray; ray.init(address='auto', ignore_reinit_error=True); nodes=[n for n in ray.nodes() if n.get('Alive')]; gpus=next((int(n.get('Resources',{}).get('GPU',0)) for n in nodes if n.get('Resources',{}).get('GPU',0)>0),0); print(f'{len(nodes)} {gpus}')" 2>/dev/null || true)"
+N_NODES="${N_NODES:-$(echo "${RAY_INFO}" | awk '{print $1}')}"
+N_GPUS="${N_GPUS:-$(echo "${RAY_INFO}" | awk '{print $2}')}"
+if [[ -z "${N_NODES}" || -z "${N_GPUS}" || "${N_NODES}" == "0" ]]; then
+  N_NODES=1
+  N_GPUS=2
+fi
+
+BASE_MODEL="${BASE_MODEL:-/path/to/your/model}"
+TRAIN_FILE="${TRAIN_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/train/Office_Products_5_2016-10-2018-11.csv}"
+VAL_FILE="${VAL_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/valid/Office_Products_5_2016-10-2018-11.csv}"
+INFO_FILE="${INFO_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/info/Office_Products_5_2016-10-2018-11.txt}"
+BASE_MODEL_DIRNAME="$(basename "${BASE_MODEL%/}")"
+
+BEAM_WIDTH="${BEAM_WIDTH:-20}"
+ITEM_MAX_TOKENS="${ITEM_MAX_TOKENS:-16}"
+LOGPROBS_MULTIPLIER="${LOGPROBS_MULTIPLIER:-8}"
+AGENT_LOOP_NUM_WORKERS="${AGENT_LOOP_NUM_WORKERS:-${N_GPUS:-1}}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-$((N_GPUS * N_NODES))}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
+ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-512}"
+ROLLOUT_MODE="${ROLLOUT_MODE:-async}"
+TEST_FREQ="${TEST_FREQ:-20}"
+VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-8}"
+
+PROJECT_NAME="${PROJECT_NAME:-MiniOneRec_RL}"
+LAUNCH_TIMESTAMP="${LAUNCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
+EXPERIMENT_NAME="${EXPERIMENT_NAME:-${BASE_MODEL_DIRNAME}_minionerec_${LAUNCH_TIMESTAMP}}"
+OUTPUT_DIR="${OUTPUT_DIR:-${VERL_GR_ROOT}/outputs/${EXPERIMENT_NAME}}"
+WANDB_MODE="${WANDB_MODE:-offline}"
+RAY_TMPDIR="${RAY_TMPDIR:-${OUTPUT_DIR}/ray_tmp}"
+RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
+
+mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
+VAL_DATA_DIR="${VAL_DATA_DIR:-${OUTPUT_DIR}/val_generations}"
+mkdir -p "${VAL_DATA_DIR}"
+
+export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
+export WANDB_MODE
+export RAY_TMPDIR
+export TMPDIR="${RAY_TMPDIR}"
+
+echo "==================================="
+echo "MiniOneRec GRPO (verl-GR runtime)"
+echo "==================================="
+echo "Cluster: ${N_NODES} node(s) x ${N_GPUS} GPU(s)"
+echo "Model: ${BASE_MODEL}"
+echo "Train: ${TRAIN_FILE}"
+echo "Val: ${VAL_FILE}"
+echo "Info: ${INFO_FILE}"
+echo "Beam width: ${BEAM_WIDTH}"
+echo "Item max tokens: ${ITEM_MAX_TOKENS}"
+echo "Output: ${OUTPUT_DIR}"
+echo "==================================="
+
+"${PYTHON_BIN}" -u -m verl_gr.trainers.main_ppo \
+  ++task.class_path="verl_gr.recipes.minionerec.minionerec_recipe.MiniOneRecTask" \
+  ++task.trainer_adapter_class="verl_gr.recipes.minionerec.minionerec_trainer.MiniOneRecTrainerAdapter" \
+  data.train_files="[${TRAIN_FILE}]" \
+  data.val_files="[${VAL_FILE}]" \
+  data.custom_cls.name="MiniOneRecDataset" \
+  data.custom_cls.path="${MINIONEREC_RECIPE_PATH}" \
+  custom_reward_function.name="compute_score" \
+  custom_reward_function.path="${MINIONEREC_REWARD_PATH}" \
+  data.train_batch_size="${TRAIN_BATCH_SIZE}" \
+  data.max_prompt_length="${MAX_PROMPT_LENGTH:-2560}" \
+  data.max_response_length="${MAX_RESPONSE_LENGTH:-64}" \
+  actor_rollout_ref.model.path="${BASE_MODEL}" \
+  actor_rollout_ref.rollout.name="constrained_beam" \
+  ++actor_rollout_ref.rollout.mode="${ROLLOUT_MODE}" \
+  actor_rollout_ref.rollout.n=1 \
+  actor_rollout_ref.rollout.agent.num_workers="${AGENT_LOOP_NUM_WORKERS}" \
+  actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_TOKENS_PER_GPU}" \
+  actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}" \
+  actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${MAX_TOKENS_PER_GPU}" \
+  actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${MAX_TOKENS_PER_GPU}" \
+  actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \
+  actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="${MAX_TOKENS_PER_GPU}" \
+  actor_rollout_ref.rollout.custom.beam_width="${BEAM_WIDTH}" \
+  actor_rollout_ref.rollout.custom.beam_search_params.max_tokens="${ITEM_MAX_TOKENS}" \
+  ++actor_rollout_ref.rollout.custom.beam_search_params.logprobs_multiplier="${LOGPROBS_MULTIPLIER}" \
+  ++actor_rollout_ref.rollout.custom.beam_search_params.constraint.type="minionerec_prefix_trie" \
+  ++actor_rollout_ref.rollout.custom.beam_search_params.constraint.info_file="${INFO_FILE}" \
+  ++actor_rollout_ref.rollout.custom.beam_search_params.constraint.base_model="${BASE_MODEL}" \
+  ++actor_rollout_ref.rollout.custom.beam_search_params.constraint.fallback_to_eos=true \
+  trainer.n_gpus_per_node="${N_GPUS}" \
+  trainer.nnodes="${N_NODES}" \
+  trainer.project_name="${PROJECT_NAME}" \
+  trainer.experiment_name="${EXPERIMENT_NAME}" \
+  trainer.default_local_dir="${OUTPUT_DIR}/ckpt" \
+  trainer.validation_data_dir="${VAL_DATA_DIR}" \
+  trainer.test_freq="${TEST_FREQ}" \
+  trainer.log_val_generations="${VAL_LOG_GENERATIONS}" \
+  trainer.logger='[tensorboard, wandb]' \
+  +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
+  +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
+  global_profiler.save_path="${OUTPUT_DIR}/profiles" \
+  critic.enable=False \
+  "$@"

@@ -6,7 +6,7 @@ from typing import Any
 
 from verl.single_controller.base.decorator import Dispatch, register
 from verl.workers.engine_workers import ActorRolloutRefWorker
-from verl_gr.workers.rollout.two_stage_registration import register_two_stage_rollout_class
+from verl_gr.workers.rollout.registration import register_two_stage_rollout_class
 
 
 class OneRecActorRolloutRefWorker(ActorRolloutRefWorker):
