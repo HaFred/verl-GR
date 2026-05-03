@@ -4,10 +4,21 @@ from __future__ import annotations
 
 from typing import Any
 
+from omegaconf import OmegaConf, open_dict
+from transformers import AutoConfig
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.fs import copy_to_local
 from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
+
+MODEL_TYPE_TO_TRANSFORMER_LAYER = {
+    "qwen2": "Qwen2DecoderLayer",
+    "qwen3": "Qwen3DecoderLayer",
+    "llama": "LlamaDecoderLayer",
+    "mistral": "MistralDecoderLayer",
+    "gemma": "GemmaDecoderLayer",
+    "gemma2": "Gemma2DecoderLayer",
+}
 
 
 def build_hf_tokenizer_and_processor(
@@ -85,6 +96,35 @@ class RecipeTaskRuntime:
     def get_actor_rollout_ref_worker(self, config):
         return ActorRolloutRefWorker
 
+    def configure_fsdp_wrap_policy(self, config, model_path: str, *, trust_remote_code: bool) -> None:
+        """Align FSDP wrap target with the actual HF model family."""
+
+        try:
+            hf_config = AutoConfig.from_pretrained(model_path, trust_remote_code=trust_remote_code)
+        except Exception:
+            return
+        layer_cls = MODEL_TYPE_TO_TRANSFORMER_LAYER.get(str(getattr(hf_config, "model_type", "")).lower())
+        if layer_cls is None:
+            return
+
+        actor_rollout_ref = config.get("actor_rollout_ref")
+        if actor_rollout_ref is None:
+            return
+        for role_name in ("actor", "ref"):
+            role_cfg = actor_rollout_ref.get(role_name)
+            if role_cfg is None or str(role_cfg.get("strategy", "fsdp")) not in {"fsdp", "fsdp2"}:
+                continue
+            with open_dict(role_cfg):
+                fsdp_cfg = role_cfg.get("fsdp_config")
+                if fsdp_cfg is None:
+                    role_cfg.fsdp_config = OmegaConf.create({})
+                    fsdp_cfg = role_cfg.fsdp_config
+                wrap_policy = fsdp_cfg.get("wrap_policy")
+                if wrap_policy is None:
+                    fsdp_cfg.wrap_policy = OmegaConf.create({})
+                    wrap_policy = fsdp_cfg.wrap_policy
+                wrap_policy.transformer_layer_cls_to_wrap = [layer_cls]
+
     def prepare(self, config) -> dict[str, Any]:
         if not self._rollout_counts_expanded:
             self.expand_rollout_counts(config)
@@ -97,6 +137,7 @@ class RecipeTaskRuntime:
             use_shm=config.actor_rollout_ref.model.get("use_shm", False),
         )
         trust_remote_code = config.data.get("trust_remote_code", False)
+        self.configure_fsdp_wrap_policy(config, local_path, trust_remote_code=trust_remote_code)
         tokenizer, processor = build_hf_tokenizer_and_processor(
             local_path,
             trust_remote_code=trust_remote_code,
