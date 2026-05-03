@@ -198,21 +198,27 @@ class MiniOneRecDataset(Dataset):
         with open(self.sid_index_path, "r", encoding="utf-8") as f:
             indices = json.load(f)
 
-        records: list[dict[str, Any]] = []
+        title2sid: dict[str, str] = {}
+        description2sid: dict[str, str] = {}
         for item_id, sids in indices.items():
             if item_id not in item_feat or len(sids) < 3:
                 continue
             combined_sid = str(sids[0]) + str(sids[1]) + str(sids[2])
             title = str(item_feat[item_id].get("title", ""))
             description = maybe_parse_description(item_feat[item_id].get("description", ""))
-            for task, text in (("title2sid", title), ("description2sid", description)):
-                if not text:
-                    continue
+            if title:
+                title2sid[title] = combined_sid
+            if description:
+                description2sid[description] = combined_sid
+
+        records: list[dict[str, Any]] = []
+        for task, mapping in (("title2sid", title2sid), ("description2sid", description2sid)):
+            for text, sid in mapping.items():
                 prompt, history_key = build_title2sid_prompt(task, text)
                 records.append(
                     build_minionerec_record(
                         prompt=prompt,
-                        target=f"{combined_sid}\n",
+                        target=f"{sid}\n",
                         history_key=history_key,
                         task=task,
                     )

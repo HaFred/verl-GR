@@ -96,6 +96,15 @@ async def run_async_beam_search(
             if allowed_tokens_fn is not None:
                 allowed_tokens = set(allowed_tokens_fn(beam.prompt_token_ids, beam.generated_token_ids))
                 ranked_tokens = [(token_id, token_info) for token_id, token_info in ranked_tokens if int(token_id) in allowed_tokens]
+                if not ranked_tokens and eos_token_id in allowed_tokens:
+                    next_beam = beam.extend(int(eos_token_id), 0.0)
+                    if not ignore_eos:
+                        next_beam.finish_reason = "stop"
+                        next_beam.stop_reason = eos_token_id
+                        completed.append(next_beam)
+                    else:
+                        expanded.append(next_beam)
+                    continue
 
             for token_id, token_info in ranked_tokens:
                 next_beam = beam.extend(int(token_id), float(token_info.logprob))

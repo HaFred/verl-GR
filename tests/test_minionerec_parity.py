@@ -1,7 +1,10 @@
 import math
+import asyncio
+from types import SimpleNamespace
 
 import numpy as np
 
+from verl_gr.workers.rollout.beam_backend import run_async_beam_search
 from verl_gr.recipes.minionerec.minionerec_format import (
     build_seq_title2sid_prompt,
     build_sid_prompt,
@@ -59,3 +62,26 @@ def test_ndcg_penalties_match_minionerec_formula():
     expected = [(-value / sum(raw)) for value in raw]
     assert penalties == expected
     assert all(value < 0 for value in penalties)
+
+
+def test_constrained_beam_falls_back_to_eos_when_top_logprobs_miss_allowed_tokens():
+    async def generate_one_token(_prompt_ids, _request_id):
+        token_info = SimpleNamespace(logprob=-1.0)
+        output = SimpleNamespace(outputs=[SimpleNamespace(finish_reason=None, logprobs=[{7: token_info}], token_ids=[7])])
+        return output
+
+    beams = asyncio.run(
+        run_async_beam_search(
+            prompt_token_ids=[1, 2, 3],
+            beam_width=1,
+            max_tokens=4,
+            eos_token_id=9,
+            ignore_eos=False,
+            length_penalty=1.0,
+            generate_one_token=generate_one_token,
+            allowed_tokens_fn=lambda _prompt, _generated: [9],
+        )
+    )
+
+    assert beams[0].generated_token_ids == [9]
+    assert beams[0].finish_reason == "stop"
