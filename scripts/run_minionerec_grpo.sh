@@ -116,11 +116,11 @@ echo "==================================="
   data.val_files="[${VAL_FILE}]" \
   data.custom_cls.name="MiniOneRecDataset" \
   data.custom_cls.path="${MINIONEREC_RECIPE_PATH}" \
-  data.category="${CATEGORY}" \
-  data.sid_index_path="${SID_INDEX_FILE}" \
-  data.item_meta_path="${ITEM_META_FILE}" \
-  data.include_alignment_tasks=true \
-  data.seq_title_sample="${SEQ_TITLE_SAMPLE:-10000}" \
+  +data.category="${CATEGORY}" \
+  +data.sid_index_path="${SID_INDEX_FILE}" \
+  +data.item_meta_path="${ITEM_META_FILE}" \
+  +data.include_alignment_tasks=true \
+  +data.seq_title_sample="${SEQ_TITLE_SAMPLE:-10000}" \
   custom_reward_function.name="compute_score" \
   custom_reward_function.path="${MINIONEREC_REWARD_PATH}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
