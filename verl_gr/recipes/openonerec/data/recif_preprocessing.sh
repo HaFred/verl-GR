@@ -25,7 +25,7 @@ RUN_SFT_PRODUCT_REC=1
 
 # ============== Configuration ==============
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-RECIF_DIR=/data/models/fredhong/hf_home/OpenOneRec-RecIF
+RECIF_DIR=/home/dyvm6xra/dyvm6xrauser49/xms-gr/OpenOneRec-RecIF
 
 INPUT_METADATA="${RECIF_DIR}/onerec_bench_release.parquet"
 PID2SID_MAPPING="${RECIF_DIR}/video_ad_pid2sid.parquet"
