@@ -3,13 +3,12 @@
 from __future__ import annotations
 
 import copy
-import functools
+import json
 import logging
 import os
 from typing import Any, Optional
 
 import datasets
-import numpy as np
 import torch
 import verl.utils.torch_functional as verl_F
 from omegaconf import DictConfig, ListConfig
@@ -17,15 +16,54 @@ from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
-from verl_gr.recipes.minionerec.minionerec_format import build_sid_prompt, parse_maybe_list
+from verl_gr.recipes.minionerec.minionerec_format import (
+    build_seq_title2sid_prompt,
+    build_sid_prompt,
+    build_title2sid_prompt,
+    maybe_parse_description,
+    parse_maybe_list,
+    sample_records,
+)
 
 logger = logging.getLogger(__name__)
 
 MINIONEREC_SOURCE = "minionerec"
 
-def extract_minionerec_prompt_fields(row: dict[str, Any], *, prompt_key: str) -> dict[str, Any]:
-    """Build prompt/reward fields compatible with verl reward routing."""
+CATEGORY_DESCRIPTIONS = {
+    "Industrial_and_Scientific": "industrial and scientific items",
+    "Office_Products": "office products",
+    "Toys_and_Games": "toys and games",
+    "Sports": "sports and outdoors",
+    "Books": "books",
+}
 
+
+def build_minionerec_record(
+    *,
+    prompt: str,
+    target: str,
+    history_key: str,
+    task: str,
+    index: int | None = None,
+    dedup: bool = False,
+) -> dict[str, Any]:
+    target_sid = target.strip()
+    return {
+        "prompt": prompt,
+        "reward_model": {"ground_truth": target, "style": "rule"},
+        "source": MINIONEREC_SOURCE,
+        "data_source": MINIONEREC_SOURCE,
+        "extra_info": {
+            "history_key": history_key,
+            "target_sid": target_sid,
+            "dedup": dedup,
+            "task": task,
+            **({"index": index} if index is not None else {}),
+        },
+    }
+
+
+def build_sid_record(row: dict[str, Any], *, index: int | None = None) -> dict[str, Any]:
     history_item_sid = parse_maybe_list(row.get("history_item_sid"))
     if not history_item_sid:
         raise ValueError("MiniOneRec sample has empty history_item_sid.")
@@ -40,16 +78,25 @@ def extract_minionerec_prompt_fields(row: dict[str, Any], *, prompt_key: str) ->
     last_history_item_id = history_item_ids[-1] if history_item_ids else None
     dedup = str(row.get("item_id")) == str(last_history_item_id) if last_history_item_id is not None else False
 
-    row[prompt_key] = prompt
-    row["reward_model"] = {"ground_truth": target, "style": "rule"}
-    row["source"] = row.get("source", MINIONEREC_SOURCE)
+    return build_minionerec_record(
+        prompt=prompt,
+        target=target,
+        history_key=history_key,
+        task="sid",
+        index=index,
+        dedup=dedup,
+    )
+
+
+def extract_minionerec_prompt_fields(row: dict[str, Any], *, prompt_key: str) -> dict[str, Any]:
+    """Build prompt/reward fields compatible with verl reward routing."""
+
+    record = build_sid_record(row)
+    row[prompt_key] = record["prompt"]
+    row["reward_model"] = record["reward_model"]
+    row["source"] = row.get("source", record["source"])
     row["data_source"] = row.get("data_source", row["source"])
-    row["extra_info"] = {
-        **(row.get("extra_info") or {}),
-        "history_key": history_key,
-        "target_sid": target_sid,
-        "dedup": dedup,
-    }
+    row["extra_info"] = {**(row.get("extra_info") or {}), **record["extra_info"]}
     return row
 
 
@@ -88,6 +135,12 @@ class MiniOneRecDataset(Dataset):
         self.filter_overlong_prompts = config.get("filter_overlong_prompts", True)
         self.shuffle = config.get("shuffle", False)
         self.seed = config.get("seed", None)
+        self.category = config.get("category", "Industrial_and_Scientific")
+        self.category_text = CATEGORY_DESCRIPTIONS.get(self.category, self.category)
+        self.include_alignment_tasks = config.get("include_alignment_tasks", True)
+        self.sid_index_path = config.get("sid_index_path")
+        self.item_meta_path = config.get("item_meta_path")
+        self.seq_title_sample = int(config.get("seq_title_sample", 10000))
         self.num_workers = config.get("filter_overlong_prompts_workers", max(1, os.cpu_count() // 4))
         if self.num_workers is not None:
             self.num_workers = min(self.num_workers, os.cpu_count())
@@ -115,27 +168,82 @@ class MiniOneRecDataset(Dataset):
 
     def _read_files_and_tokenize(self) -> None:
         dataframes = [self._load_file(data_file) for data_file in self.data_files]
-        self.dataframe = datasets.concatenate_datasets(dataframes)
-        logger.info("MiniOneRec dataset len: %s", len(self.dataframe))
+        source_dataframe = datasets.concatenate_datasets(dataframes)
+        logger.info("MiniOneRec source dataset len: %s", len(source_dataframe))
 
+        records = self._build_sid_records(source_dataframe)
+        if self.include_alignment_tasks:
+            records.extend(self._build_title2sid_records())
+            records.extend(self._build_seq_title2sid_records(source_dataframe))
+
+        self.dataframe = datasets.Dataset.from_list(records)
+        logger.info("MiniOneRec combined dataset len: %s", len(self.dataframe))
+        if self.shuffle:
+            self.dataframe = self.dataframe.shuffle(seed=self.seed)
         if self.max_samples > 0 and self.max_samples < len(self.dataframe):
-            if self.shuffle:
-                rngs_args = (self.seed,) if self.seed is not None else ()
-                rng = np.random.default_rng(*rngs_args)
-                indices = rng.choice(len(self.dataframe), size=self.max_samples, replace=False)
-            else:
-                indices = np.arange(self.max_samples)
-            self.dataframe = self.dataframe.select(indices.tolist())
-
-        extract_fn = functools.partial(extract_minionerec_prompt_fields, prompt_key=self.prompt_key)
-        self.dataframe = self.dataframe.map(
-            extract_fn,
-            num_proc=self.num_workers,
-            desc="Extract MiniOneRec prompts and reward annotations",
-        )
+            self.dataframe = self.dataframe.select(list(range(self.max_samples)))
         if self.filter_overlong_prompts:
             self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
         logger.info("MiniOneRec processed dataset len: %s", len(self.dataframe))
+
+    def _build_sid_records(self, dataframe: datasets.Dataset) -> list[dict[str, Any]]:
+        return [build_sid_record(dict(row), index=idx) for idx, row in enumerate(dataframe)]
+
+    def _build_title2sid_records(self) -> list[dict[str, Any]]:
+        if not self.sid_index_path or not self.item_meta_path:
+            logger.warning("Skip RLTitle2SidDataset parity task: sid_index_path or item_meta_path is missing.")
+            return []
+        with open(self.item_meta_path, "r", encoding="utf-8") as f:
+            item_feat = json.load(f)
+        with open(self.sid_index_path, "r", encoding="utf-8") as f:
+            indices = json.load(f)
+
+        records: list[dict[str, Any]] = []
+        for item_id, sids in indices.items():
+            if item_id not in item_feat or len(sids) < 3:
+                continue
+            combined_sid = str(sids[0]) + str(sids[1]) + str(sids[2])
+            title = str(item_feat[item_id].get("title", ""))
+            description = maybe_parse_description(item_feat[item_id].get("description", ""))
+            for task, text in (("title2sid", title), ("description2sid", description)):
+                if not text:
+                    continue
+                prompt, history_key = build_title2sid_prompt(task, text)
+                records.append(
+                    build_minionerec_record(
+                        prompt=prompt,
+                        target=f"{combined_sid}\n",
+                        history_key=history_key,
+                        task=task,
+                    )
+                )
+        return records
+
+    def _build_seq_title2sid_records(self, dataframe: datasets.Dataset) -> list[dict[str, Any]]:
+        records: list[dict[str, Any]] = []
+        for idx, row in enumerate(dataframe):
+            row = dict(row)
+            history_item_title = parse_maybe_list(row.get("history_item_title"))
+            target_sid = str(row.get("item_sid", "")).strip()
+            if not history_item_title or not target_sid:
+                continue
+            is_duplicate = False
+            if "history_item_id" in row:
+                history_item_id = parse_maybe_list(row.get("history_item_id"))
+                last_history_item_id = history_item_id[-1] if history_item_id else None
+                is_duplicate = str(row.get("item_id")) == str(last_history_item_id) if last_history_item_id is not None else False
+            prompt, history_key = build_seq_title2sid_prompt(history_item_title)
+            records.append(
+                build_minionerec_record(
+                    prompt=prompt,
+                    target=f"{target_sid}\n",
+                    history_key=history_key,
+                    task="seq_title2sid",
+                    index=idx,
+                    dedup=is_duplicate,
+                )
+            )
+        return sample_records(records, self.seq_title_sample, seed=self.seed)
 
     def maybe_filter_out_long_prompts(self, dataframe: datasets.Dataset) -> datasets.Dataset:
         tokenizer = self.tokenizer

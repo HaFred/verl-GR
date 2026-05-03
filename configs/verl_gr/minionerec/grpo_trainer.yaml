@@ -23,6 +23,11 @@ data:
   custom_cls:
     name: MiniOneRecDataset
     path: null
+  category: Industrial_and_Scientific
+  include_alignment_tasks: true
+  sid_index_path: null
+  item_meta_path: null
+  seq_title_sample: 10000
   data_source_key: source
   reward_fn_key: source
 

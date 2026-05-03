@@ -48,6 +48,9 @@ BASE_MODEL="${BASE_MODEL:-/path/to/your/model}"
 TRAIN_FILE="${TRAIN_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/train/Industrial_and_Scientific_5_2016-10-2018-11.csv}"
 VAL_FILE="${VAL_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/valid/Industrial_and_Scientific_5_2016-10-2018-11.csv}"
 INFO_FILE="${INFO_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/info/Industrial_and_Scientific_5_2016-10-2018-11.txt}"
+SID_INDEX_FILE="${SID_INDEX_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/index/Industrial_and_Scientific.index.json}"
+ITEM_META_FILE="${ITEM_META_FILE:-${VERL_GR_ROOT}/../MiniOneRec/data/Amazon/index/Industrial_and_Scientific.item.json}"
+CATEGORY="${CATEGORY:-Industrial_and_Scientific}"
 BASE_MODEL_DIRNAME="$(basename "${BASE_MODEL%/}")"
 
 # rl.sh: num_generations=16 → beam 宽度对齐；temperature=1.0；train_batch_size=64；epochs=2；lr=1e-5
@@ -95,6 +98,8 @@ echo "Model: ${BASE_MODEL}"
 echo "Train: ${TRAIN_FILE}"
 echo "Val: ${VAL_FILE}"
 echo "Info: ${INFO_FILE}"
+echo "SID index: ${SID_INDEX_FILE}"
+echo "Item meta: ${ITEM_META_FILE}"
 echo "Beam width: ${BEAM_WIDTH} (rl.sh num_generations)"
 echo "Train batch size: ${TRAIN_BATCH_SIZE} | epochs: ${TOTAL_EPOCHS} | lr: ${LEARNING_RATE}"
 echo "PPO micro_batch/GPU: ${PPO_MICRO_BATCH_PER_GPU} (≈rl gradient_accum_steps 2)"
@@ -111,6 +116,11 @@ echo "==================================="
   data.val_files="[${VAL_FILE}]" \
   data.custom_cls.name="MiniOneRecDataset" \
   data.custom_cls.path="${MINIONEREC_RECIPE_PATH}" \
+  data.category="${CATEGORY}" \
+  data.sid_index_path="${SID_INDEX_FILE}" \
+  data.item_meta_path="${ITEM_META_FILE}" \
+  data.include_alignment_tasks=true \
+  data.seq_title_sample="${SEQ_TITLE_SAMPLE:-10000}" \
   custom_reward_function.name="compute_score" \
   custom_reward_function.path="${MINIONEREC_REWARD_PATH}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \

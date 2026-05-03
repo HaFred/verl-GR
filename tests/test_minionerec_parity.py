@@ -2,7 +2,12 @@ import math
 
 import numpy as np
 
-from verl_gr.recipes.minionerec.minionerec_format import build_sid_prompt, parse_maybe_list
+from verl_gr.recipes.minionerec.minionerec_format import (
+    build_seq_title2sid_prompt,
+    build_sid_prompt,
+    build_title2sid_prompt,
+    parse_maybe_list,
+)
 from verl_gr.recipes.minionerec.minionerec_reward import compute_score, ndcg_penalties, normalize_sid
 
 
@@ -20,6 +25,25 @@ def test_sid_dataset_prompt_matches_minionerec_template():
 def test_parse_maybe_list_accepts_minionerec_csv_lists():
     assert parse_maybe_list("['<a_1><b_2><c_3>']") == ["<a_1><b_2><c_3>"]
     assert parse_maybe_list(np.array(["x", "y"])) == ["x", "y"]
+
+
+def test_title2sid_prompt_matches_minionerec_template():
+    prompt, history_key = build_title2sid_prompt("title2sid", "A useful tool")
+    assert history_key == "A useful tool"
+    assert prompt == "### User Input: \nWhich item has the title: A useful tool?\n\n### Response:\n"
+
+    prompt, history_key = build_title2sid_prompt("description2sid", "A small part")
+    assert history_key == "A small part"
+    assert prompt == '### User Input: \nAn item can be described as follows: "A small part". Which item is it describing?\n\n### Response:\n'
+
+
+def test_seq_title2sid_prompt_matches_minionerec_template():
+    prompt, history_key = build_seq_title2sid_prompt(["Hammer", "Screwdriver"])
+    assert history_key == "Hammer::Screwdriver"
+    assert prompt == (
+        '### User Input: \nGiven the title sequence of user historical interactive items: "Hammer", "Screwdriver", '
+        "can you recommend a suitable next item for the user?\n\n### Response:\n"
+    )
 
 
 def test_sample_level_reward_normalization():
