@@ -322,6 +322,22 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
         beam_config: BeamSearchConfig,
     ):
         eos_token_id = self.model_config.tokenizer.eos_token_id
+
+        async def generate_next_tokens(
+            current_prompt_token_ids_list: list[list[int]],
+            request_suffixes: list[str],
+            allowed_token_ids_list: list[list[int]] | None = None,  # noqa: ARG001
+        ):
+            tasks = [
+                asyncio.create_task(generate_one_token(current_prompt_token_ids, request_suffix))
+                for current_prompt_token_ids, request_suffix in zip(
+                    current_prompt_token_ids_list,
+                    request_suffixes,
+                    strict=True,
+                )
+            ]
+            return await asyncio.gather(*tasks)
+
         async def generate_one_token(current_prompt_token_ids: list[int], request_suffix: str):
             prompt = TokensPrompt(
                 prompt_token_ids=current_prompt_token_ids,
@@ -350,7 +366,7 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
             eos_token_id=eos_token_id,
             ignore_eos=beam_config.ignore_eos,
             length_penalty=beam_config.length_penalty,
-            generate_one_token=generate_one_token,
+            generate_next_tokens=generate_next_tokens,
         )
 
     async def _run_generate_request(

@@ -219,7 +219,36 @@ class ConstrainedBeamvLLMHttpServer(vLLMHttpServer):
         eos_token_id = self.model_config.tokenizer.eos_token_id
         allowed_tokens_fn = build_constraint_from_config(beam_config.constraint, tokenizer=self.model_config.tokenizer)
 
-        async def generate_one_token(current_prompt_token_ids: list[int], request_suffix: str):
+        async def generate_next_tokens(
+            current_prompt_token_ids_list: list[list[int]],
+            request_suffixes: list[str],
+            allowed_token_ids_list: list[list[int]] | None,
+        ):
+            tasks = []
+            if allowed_token_ids_list is None:
+                allowed_token_ids_list = [None] * len(current_prompt_token_ids_list)  # type: ignore[list-item]
+            for current_prompt_token_ids, request_suffix, allowed_token_ids in zip(
+                current_prompt_token_ids_list,
+                request_suffixes,
+                allowed_token_ids_list,
+                strict=True,
+            ):
+                tasks.append(
+                    asyncio.create_task(
+                        generate_one_token(
+                            current_prompt_token_ids=current_prompt_token_ids,
+                            request_suffix=request_suffix,
+                            allowed_token_ids=allowed_token_ids,
+                        )
+                    )
+                )
+            return await asyncio.gather(*tasks)
+
+        async def generate_one_token(
+            current_prompt_token_ids: list[int],
+            request_suffix: str,
+            allowed_token_ids: list[int] | None,
+        ):
             prompt = TokensPrompt(prompt_token_ids=current_prompt_token_ids, multi_modal_data=multi_modal_data)
             params = SamplingParams(
                 max_tokens=1,
@@ -228,6 +257,7 @@ class ConstrainedBeamvLLMHttpServer(vLLMHttpServer):
                 top_p=beam_config.top_p,
                 top_k=beam_config.top_k,
                 repetition_penalty=1.0,
+                allowed_token_ids=allowed_token_ids,
             )
             return await self._run_generate_request(
                 prompt=prompt,
@@ -244,7 +274,7 @@ class ConstrainedBeamvLLMHttpServer(vLLMHttpServer):
             eos_token_id=eos_token_id,
             ignore_eos=beam_config.ignore_eos,
             length_penalty=beam_config.length_penalty,
-            generate_one_token=generate_one_token,
+            generate_next_tokens=generate_next_tokens,
             allowed_tokens_fn=allowed_tokens_fn,
         )
 

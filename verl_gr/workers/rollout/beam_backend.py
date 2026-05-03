@@ -53,28 +53,67 @@ async def run_async_beam_search(
     eos_token_id: int,
     ignore_eos: bool,
     length_penalty: float,
-    generate_one_token: Callable[[list[int], str], Awaitable[Any]],
+    generate_one_token: Callable[[list[int], str], Awaitable[Any]] | None = None,
+    generate_next_tokens: Callable[[list[list[int]], list[str], list[list[int]] | None], Awaitable[list[Any]]] | None = None,
     allowed_tokens_fn: Callable[[list[int], list[int]], list[int]] | None = None,
 ) -> list[BeamCandidate]:
+    if generate_next_tokens is None:
+        if generate_one_token is None:
+            raise ValueError("Either generate_one_token or generate_next_tokens must be provided.")
+
+        async def generate_next_tokens(
+            prompt_token_ids_list: list[list[int]],
+            request_suffixes: list[str],
+            allowed_token_ids_list: list[list[int]] | None = None,  # noqa: ARG001
+        ) -> list[Any]:
+            tasks = [
+                asyncio.create_task(generate_one_token(prompt_token_ids, request_suffix))
+                for prompt_token_ids, request_suffix in zip(prompt_token_ids_list, request_suffixes, strict=True)
+            ]
+            return await asyncio.gather(*tasks)
+
     active = [BeamCandidate(prompt_token_ids=list(prompt_token_ids))]
     completed: list[BeamCandidate] = []
     logprobs_num = max(2 * beam_width, 1)
 
+    def add_fallback_token(beam: BeamCandidate, allowed_tokens: set[int], expanded: list[BeamCandidate]) -> bool:
+        """Force a legal token when vLLM top-logprobs miss constrained tokens."""
+
+        if allowed_tokens:
+            token_id = eos_token_id if eos_token_id in allowed_tokens else min(allowed_tokens)
+        else:
+            token_id = eos_token_id
+        if token_id is None:
+            return False
+        next_beam = beam.extend(int(token_id), 0.0)
+        if token_id == eos_token_id and not ignore_eos:
+            next_beam.finish_reason = "stop"
+            next_beam.stop_reason = eos_token_id
+            completed.append(next_beam)
+        else:
+            expanded.append(next_beam)
+        return True
+
     for step in range(max_tokens):
-        tasks = [
-            asyncio.create_task(
-                generate_one_token(
-                    beam.full_prompt_token_ids,
-                    f"beam-step-{step}-{beam_idx}-{uuid4().hex}",
-                )
-            )
-            for beam_idx, beam in enumerate(active)
-        ]
-        outputs = await asyncio.gather(*tasks)
+        prompt_token_ids_list = [beam.full_prompt_token_ids for beam in active]
+        request_suffixes = [f"beam-step-{step}-{beam_idx}-{uuid4().hex}" for beam_idx, _ in enumerate(active)]
+        allowed_token_ids_list = None
+        if allowed_tokens_fn is not None:
+            allowed_token_ids_list = []
+            for beam in active:
+                allowed_token_ids = list(allowed_tokens_fn(beam.prompt_token_ids, beam.generated_token_ids))
+                if not allowed_token_ids and eos_token_id is not None:
+                    allowed_token_ids = [int(eos_token_id)]
+                allowed_token_ids_list.append(allowed_token_ids)
+
+        outputs = await generate_next_tokens(prompt_token_ids_list, request_suffixes, allowed_token_ids_list)
 
         expanded: list[BeamCandidate] = []
-        for beam, output in zip(active, outputs, strict=True):
+        for beam_idx, (beam, output) in enumerate(zip(active, outputs, strict=True)):
+            allowed_tokens = set(allowed_token_ids_list[beam_idx]) if allowed_token_ids_list is not None else None
             if not output.outputs:
+                if allowed_tokens is not None:
+                    add_fallback_token(beam, allowed_tokens, expanded)
                 continue
             first_output = output.outputs[0]
             if first_output.finish_reason == "error":
@@ -85,6 +124,8 @@ async def run_async_beam_search(
                     token_logprob = 0.0
                     next_beam = beam.extend(token_id, token_logprob)
                     expanded.append(next_beam)
+                elif allowed_tokens is not None:
+                    add_fallback_token(beam, allowed_tokens, expanded)
                 continue
 
             step_logprobs = first_output.logprobs[0]
@@ -93,17 +134,10 @@ async def run_async_beam_search(
                 key=lambda item: item[1].logprob,
                 reverse=True,
             )[:logprobs_num]
-            if allowed_tokens_fn is not None:
-                allowed_tokens = set(allowed_tokens_fn(beam.prompt_token_ids, beam.generated_token_ids))
+            if allowed_tokens is not None:
                 ranked_tokens = [(token_id, token_info) for token_id, token_info in ranked_tokens if int(token_id) in allowed_tokens]
-                if not ranked_tokens and eos_token_id in allowed_tokens:
-                    next_beam = beam.extend(int(eos_token_id), 0.0)
-                    if not ignore_eos:
-                        next_beam.finish_reason = "stop"
-                        next_beam.stop_reason = eos_token_id
-                        completed.append(next_beam)
-                    else:
-                        expanded.append(next_beam)
+                if not ranked_tokens:
+                    add_fallback_token(beam, allowed_tokens, expanded)
                     continue
 
             for token_id, token_info in ranked_tokens:
@@ -132,6 +166,9 @@ async def run_async_beam_search(
         if beam.finish_reason is None:
             beam.finish_reason = "length"
         completed.append(beam)
+
+    if not completed and allowed_tokens_fn is not None:
+        add_fallback_token(active[0], set(allowed_tokens_fn(active[0].prompt_token_ids, active[0].generated_token_ids)), completed)
 
     completed.sort(
         key=lambda candidate: beam_search_score(

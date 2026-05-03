@@ -85,3 +85,79 @@ def test_constrained_beam_falls_back_to_eos_when_top_logprobs_miss_allowed_token
 
     assert beams[0].generated_token_ids == [9]
     assert beams[0].finish_reason == "stop"
+
+
+def test_constrained_beam_falls_back_to_allowed_token_when_top_logprobs_miss_non_eos():
+    async def generate_one_token(_prompt_ids, _request_id):
+        token_info = SimpleNamespace(logprob=-1.0)
+        output = SimpleNamespace(outputs=[SimpleNamespace(finish_reason=None, logprobs=[{7: token_info}], token_ids=[7])])
+        return output
+
+    beams = asyncio.run(
+        run_async_beam_search(
+            prompt_token_ids=[1, 2, 3],
+            beam_width=1,
+            max_tokens=1,
+            eos_token_id=9,
+            ignore_eos=False,
+            length_penalty=1.0,
+            generate_one_token=generate_one_token,
+            allowed_tokens_fn=lambda _prompt, _generated: [8],
+        )
+    )
+
+    assert beams[0].generated_token_ids == [8]
+
+
+def test_batched_beam_passes_allowed_token_ids_to_batch_api():
+    captured_allowed = []
+
+    async def generate_next_tokens(_prompt_ids_list, _request_suffixes, allowed_token_ids_list):
+        captured_allowed.extend(allowed_token_ids_list)
+        token_info = SimpleNamespace(logprob=-1.0)
+        return [
+            SimpleNamespace(outputs=[SimpleNamespace(finish_reason=None, logprobs=[{8: token_info}], token_ids=[8])])
+        ]
+
+    beams = asyncio.run(
+        run_async_beam_search(
+            prompt_token_ids=[1, 2, 3],
+            beam_width=1,
+            max_tokens=1,
+            eos_token_id=9,
+            ignore_eos=False,
+            length_penalty=1.0,
+            generate_next_tokens=generate_next_tokens,
+            allowed_tokens_fn=lambda _prompt, _generated: [8],
+        )
+    )
+
+    assert captured_allowed == [[8]]
+    assert beams[0].generated_token_ids == [8]
+
+
+def test_unconstrained_batched_beam_does_not_pass_allowed_token_ids():
+    captured_allowed = ["not-called"]
+
+    async def generate_next_tokens(_prompt_ids_list, _request_suffixes, allowed_token_ids_list):
+        captured_allowed.clear()
+        captured_allowed.append(allowed_token_ids_list)
+        token_info = SimpleNamespace(logprob=-1.0)
+        return [
+            SimpleNamespace(outputs=[SimpleNamespace(finish_reason=None, logprobs=[{7: token_info}], token_ids=[7])])
+        ]
+
+    beams = asyncio.run(
+        run_async_beam_search(
+            prompt_token_ids=[1, 2, 3],
+            beam_width=1,
+            max_tokens=1,
+            eos_token_id=9,
+            ignore_eos=False,
+            length_penalty=1.0,
+            generate_next_tokens=generate_next_tokens,
+        )
+    )
+
+    assert captured_allowed == [None]
+    assert beams[0].generated_token_ids == [7]
