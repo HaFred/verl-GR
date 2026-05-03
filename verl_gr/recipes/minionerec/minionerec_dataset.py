@@ -183,6 +183,9 @@ class MiniOneRecDataset(Dataset):
         row["attention_mask"] = attention_mask[0]
         row["position_ids"] = position_ids[0]
         row["raw_prompt_ids"] = self.tokenizer.encode(raw_prompt, add_special_tokens=False)[-self.max_prompt_length :]
+        # verl's AgentLoopWorker postprocess expects a `raw_prompt` field.
+        # MiniOneRec prompts are plain strings, while chat recipes use message lists.
+        row["raw_prompt"] = raw_prompt
         row["raw_prompt_text"] = raw_prompt
         row["index"] = (row.get("extra_info") or {}).get("index", index)
         row["tools_kwargs"] = {}
