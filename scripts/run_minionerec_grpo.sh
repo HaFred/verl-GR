@@ -80,6 +80,7 @@ WANDB_MODE="${WANDB_MODE:-offline}"
 # Defaulting ray_tmp under OUTPUT_DIR (long $HOME + experiment name) often exceeds that limit.
 RAY_TMPDIR="${RAY_TMPDIR:-$(mktemp -d "/tmp/rvXXXXXX")}"
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
+VERL_ZMQ_SOCKET_PREFIX="${VERL_ZMQ_SOCKET_PREFIX:-verl-gr-minionerec-${LAUNCH_TIMESTAMP}-$$}"
 
 mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 VAL_DATA_DIR="${VAL_DATA_DIR:-${OUTPUT_DIR}/val_generations}"
@@ -89,6 +90,7 @@ export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
 export WANDB_MODE
 export RAY_TMPDIR
 export TMPDIR="${RAY_TMPDIR}"
+export VERL_ZMQ_SOCKET_PREFIX
 
 echo "==================================="
 echo "MiniOneRec GRPO (verl-GR runtime)"
@@ -107,6 +109,7 @@ echo "FSDP wrap layer: ${FSDP_TRANSFORMER_LAYERS}"
 echo "Item max tokens: ${ITEM_MAX_TOKENS}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray tmp (short path for Unix socket limit): ${RAY_TMPDIR}"
+echo "ZMQ socket prefix: ${VERL_ZMQ_SOCKET_PREFIX}"
 echo "==================================="
 
 "${PYTHON_BIN}" -u -m verl_gr.trainers.main_ppo \

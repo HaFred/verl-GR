@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -43,6 +44,8 @@ class ConstrainedBeamvLLMHttpServer(vLLMHttpServer):
     _MAX_CONSTRAINED_BEAM_CACHE_SIZE = 1024
 
     def __init__(self, *args, **kwargs):
+        os.environ["VERL_ROLLOUT_ZMQ_NAMESPACE"] = "constrained-beam"
+        os.environ.setdefault("VERL_ZMQ_SOCKET_PREFIX", "verl-gr-constrained-beam")
         super().__init__(*args, **kwargs)
         self._constrained_beam_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._constrained_beam_build_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
@@ -54,6 +57,9 @@ class ConstrainedBeamvLLMHttpServer(vLLMHttpServer):
             )
         )
         self._constrained_beam_engine_request_semaphore = asyncio.Semaphore(max(1, max_inflight_requests))
+
+    def _get_worker_extension_cls(self) -> str:
+        return "verl_gr.workers.rollout.zmq_utils.VerlGRVLLMColocateWorkerExtension"
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         build_tasks = list(self._constrained_beam_build_tasks.values())

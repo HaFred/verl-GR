@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from importlib import import_module
 import logging
+import os
 
 import ray
 import torch
 
 from verl import DataProto
 from verl_gr.third_party.vllm import BeamSearchParams, LoRARequest
+from verl_gr.workers.rollout.zmq_utils import build_zmq_handle
 from verl_gr.workers.rollout.beam_config import (
     BeamSearchConfig,
     resolve_beam_search_config,
@@ -42,6 +44,13 @@ class TwoStagevLLMRollout(ServerAdapter):
             logger.warning(
                 "TwoStagevLLMRollout is running in async adapter mode on verl>=0.7.1. "
                 "Two-stage generation logic must be implemented in async agent-loop flow."
+            )
+            local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+            local_rank = self.rollout_rank % local_world_size
+            self.zmq_handle = build_zmq_handle(
+                namespace="two-stage",
+                replica_rank=self.replica_rank,
+                local_rank=local_rank,
             )
             return
 
