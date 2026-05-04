@@ -15,7 +15,7 @@ defaults:
 data:
   max_prompt_length: 10240
   prompt_key: prompt
-  shuffle: true
+  shuffle: false
   val_batch_size: 100
   max_response_length: 2048
   filter_overlong_prompts: true
