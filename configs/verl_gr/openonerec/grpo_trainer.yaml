@@ -16,6 +16,7 @@ data:
   max_prompt_length: 10240
   prompt_key: prompt
   shuffle: false
+  val_batch_size: 100
   max_response_length: 2048
   filter_overlong_prompts: true
   filter_overlong_prompts_workers: 16
@@ -84,9 +85,21 @@ actor_rollout_ref:
     enable_chunked_prefill: true
     calculate_log_probs: false
     layered_summon: false
+    val_kwargs:
+      do_sample: true
+      temperature: 0.6
+      top_p: 0.95
+      top_k: 50
+      n: 1
     custom:
       beam_width: 32
       two_stage_max_inflight_requests: 8
+      validation_adaptive_concurrency: true
+      validation_min_concurrent_requests: 64
+      validation_max_concurrent_requests: 256
+      validation_target_gpu_utilization: 85.0
+      validation_gpu_util_tolerance: 7.5
+      validation_concurrency_step: 32
       beam_search_params:
         max_tokens: 3
       decode_config:
