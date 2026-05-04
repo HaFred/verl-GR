@@ -15,6 +15,7 @@ from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_validate,
 )
 from verl_gr.workers.rollout.beam_config import (
+    BEAM_RETURN_MODE_KEY,
     BEAM_SEARCH_PARAMS_KEY,
     BEAM_WIDTH_KEY,
     DECODE_CONFIG_KEY,
@@ -104,6 +105,23 @@ def compute_advantage(
 class RLTrainer(RayPPOTrainerBase):
     """RayPPOTrainer override with different workload helpers."""
 
+    def _get_task_adapter(self):
+        adapter = getattr(self, "_verl_gr_task_adapter", None)
+        if adapter is not None:
+            return adapter
+        task_cfg = self.config.get("task")
+        adapter_class_path = None
+        if task_cfg is not None:
+            adapter_class_path = task_cfg.get("trainer_adapter_class", task_cfg.get("trainer_hooks_class"))
+        if adapter_class_path:
+            adapter_cls = load_object(str(adapter_class_path))
+            adapter = adapter_cls()
+        else:
+            adapter_cls = load_object("verl_gr.recipes.openonerec.onerec_trainer.OpenOneRecTrainerAdapter")
+            adapter = adapter_cls()
+        self._verl_gr_task_adapter = adapter
+        return adapter
+
     @staticmethod
     def _ensure_reward_routing_keys(proto: DataProto) -> None:
         """Ensure both source aliases exist for reward-loop compatibility."""
@@ -114,6 +132,9 @@ class RLTrainer(RayPPOTrainerBase):
             non_tensor["source"] = non_tensor["data_source"]
 
     def _get_gen_batch(self, batch: DataProto) -> DataProto:
+        return self._get_task_adapter().prepare_gen_batch(self, batch)
+
+    def _prepare_recommendation_gen_batch(self, batch: DataProto) -> DataProto:
         """Prepare generation batch without conflicting prompt tensors.
 
         In verl>=0.7.1 async rollout mode, generation output may include input_ids.
@@ -161,6 +182,9 @@ class RLTrainer(RayPPOTrainerBase):
                     "max_tokens": self.config.data.get("max_response_length", rollout_cfg.response_length),
                 }
             )
+            beam_search_params = rollout_custom.get(BEAM_SEARCH_PARAMS_KEY) or {}
+            if beam_search_params.get("constraint") is not None:
+                gen_batch.meta_info["constraint"] = beam_search_params.get("constraint")
             gen_batch.meta_info.update(
                 build_two_stage_sampling_params(
                     reasoning_max_tokens=int(reasoning_max_tokens),
@@ -168,6 +192,22 @@ class RLTrainer(RayPPOTrainerBase):
                     beam_width=int(beam_width),
                 )
             )
+        elif rollout_cfg.get("name") == "constrained_beam":
+            rollout_custom = rollout_cfg.get("custom") or {}
+            beam_search_params = rollout_custom.get(BEAM_SEARCH_PARAMS_KEY) or {}
+            beam_width = int(rollout_custom.get(BEAM_WIDTH_KEY, rollout_custom.get("beam_size", 20)))
+            item_max_tokens = int(beam_search_params.get("max_tokens", self.config.data.get("max_response_length", 64)))
+            gen_batch.meta_info.update(
+                {
+                    "enable_constrained_beam_rollout": True,
+                    "max_tokens": item_max_tokens,
+                    BEAM_WIDTH_KEY: beam_width,
+                    BEAM_RETURN_MODE_KEY: "best_only",
+                    BEAM_SEARCH_PARAMS_KEY: dict(beam_search_params),
+                }
+            )
+            if beam_search_params.get("constraint") is not None:
+                gen_batch.meta_info["constraint"] = beam_search_params.get("constraint")
         return gen_batch
 
     def _validate(self):
@@ -176,7 +216,7 @@ class RLTrainer(RayPPOTrainerBase):
         return metrics
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, ground_truths=None):
-        return openonerec_dump_generations(
+        return self._get_task_adapter().dump_generations(
             self,
             inputs=inputs,
             outputs=outputs,
@@ -187,7 +227,7 @@ class RLTrainer(RayPPOTrainerBase):
         )
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
-        return openonerec_maybe_log_val_generations(self, inputs=inputs, outputs=outputs, scores=scores)
+        return self._get_task_adapter().maybe_log_val_generations(self, inputs=inputs, outputs=outputs, scores=scores)
 
     def _save_checkpoint(self):
         super()._save_checkpoint()

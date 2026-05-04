@@ -30,6 +30,7 @@ from verl_gr.workers.rollout.beam_config import (
     build_two_stage_sampling_params,
     get_rollout_custom_nested_value,
 )
+from verl_gr.trainers.task_adapter import TrainerTaskAdapter
 
 
 class ValidationGenerationsLogger:
@@ -283,7 +284,15 @@ def openonerec_validate(trainer):
 
         batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
         non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-        for key in ("multi_modal_data", "raw_prompt", "tools_kwargs", "interaction_kwargs", "agent_name", "extra_info"):
+        for key in (
+            "multi_modal_data",
+            "raw_prompt",
+            "raw_prompt_text",
+            "tools_kwargs",
+            "interaction_kwargs",
+            "agent_name",
+            "extra_info",
+        ):
             if key in test_batch.non_tensor_batch:
                 non_tensor_batch_keys_to_pop.append(key)
         test_gen_batch = test_batch.pop(
@@ -323,6 +332,9 @@ def openonerec_validate(trainer):
                 ),
             )
             meta_info["enable_two_stage_rollout"] = True
+            beam_search_params = rollout_custom.get(BEAM_SEARCH_PARAMS_KEY) or {}
+            if beam_search_params.get("constraint") is not None:
+                meta_info["constraint"] = beam_search_params.get("constraint")
             meta_info.update(
                 build_two_stage_sampling_params(
                     reasoning_max_tokens=int(reasoning_max_tokens),
