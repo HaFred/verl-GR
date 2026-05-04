@@ -8,8 +8,12 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
 from verl.utils.torch_functional import masked_mean
 
-from verl_gr.recipes.task_factory import load_object
-from verl_gr.trainers.task_adapter import TrainerTaskAdapter
+from verl_gr.recipes.openonerec.onerec_trainer import (
+    openonerec_evaluate_and_prune_checkpoint,
+    openonerec_dump_generations,
+    openonerec_maybe_log_val_generations,
+    openonerec_validate,
+)
 from verl_gr.workers.rollout.beam_config import (
     BEAM_RETURN_MODE_KEY,
     BEAM_SEARCH_PARAMS_KEY,
@@ -207,19 +211,9 @@ class RLTrainer(RayPPOTrainerBase):
         return gen_batch
 
     def _validate(self):
-        return self._get_task_adapter().validate(self)
-
-    def _compute_reward_colocate(self, batch: DataProto):
-        reward_batch = super()._compute_reward_colocate(batch)
-        reward_batch, metrics = self._get_task_adapter().postprocess_rewards(self, batch, reward_batch)
-        if metrics:
-            reward_extra_keys = list(reward_batch.meta_info.get("reward_extra_keys", []))
-            for key, value in metrics.items():
-                reward_batch.non_tensor_batch[key] = value
-                if key not in reward_extra_keys:
-                    reward_extra_keys.append(key)
-            reward_batch.meta_info["reward_extra_keys"] = reward_extra_keys
-        return reward_batch
+        metrics = openonerec_validate(self)
+        self._last_validation_metrics = metrics
+        return metrics
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, ground_truths=None):
         return self._get_task_adapter().dump_generations(
@@ -234,4 +228,13 @@ class RLTrainer(RayPPOTrainerBase):
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         return self._get_task_adapter().maybe_log_val_generations(self, inputs=inputs, outputs=outputs, scores=scores)
+
+    def _save_checkpoint(self):
+        super()._save_checkpoint()
+        local_global_step_folder = f"{self.config.trainer.default_local_dir}/global_step_{self.global_steps}"
+        openonerec_evaluate_and_prune_checkpoint(
+            self,
+            local_global_step_folder,
+            metrics=getattr(self, "_last_validation_metrics", None),
+        )
 
