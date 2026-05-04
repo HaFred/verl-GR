@@ -134,6 +134,7 @@ for arg in "$@"; do
   fi
 done
 
+# avoid conflicts: trainer.val_before_train=False needs to be false to avoid 2nd run of val_in_train, as now we have a built-in val run for keeping the ckpt top-k
 "${PYTHON_BIN}" -u -m verl_gr.trainers.main_ppo \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="${VAL_FILES}" \
@@ -177,6 +178,7 @@ done
   trainer.default_local_dir="${OUTPUT_DIR}/ckpt" \
   trainer.test_freq="${TEST_FREQ}" \
   trainer.save_freq="${SAVE_FREQ}" \
+  trainer.val_before_train=False \
   trainer.log_val_generations="${VAL_LOG_GENERATIONS}" \
   trainer.validation_data_dir=${VALIDATION_DATA_DIR_ARG} \
   ++trainer.best_ckpt_prune_enable="${BEST_CKPT_PRUNE_ENABLE}" \
