@@ -56,7 +56,8 @@ BASE_MODEL_DIRNAME="$(basename "${BASE_MODEL%/}")"
 # rl.sh: num_generations=16 → beam 宽度对齐；temperature=1.0；train_batch_size=64；epochs=2；lr=1e-5
 BEAM_WIDTH="${BEAM_WIDTH:-16}"
 ITEM_MAX_TOKENS="${ITEM_MAX_TOKENS:-16}"
-LOGPROBS_MULTIPLIER="${LOGPROBS_MULTIPLIER:-16}"
+LOGPROBS_MULTIPLIER="${LOGPROBS_MULTIPLIER:-2}"
+CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS="${CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS:-64}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
@@ -149,6 +150,7 @@ echo "==================================="
   actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap="[${FSDP_TRANSFORMER_LAYERS}]" \
   trainer.total_epochs="${TOTAL_EPOCHS}" \
   actor_rollout_ref.rollout.custom.beam_width="${BEAM_WIDTH}" \
+  actor_rollout_ref.rollout.custom.constrained_beam_max_inflight_requests="${CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS}" \
   actor_rollout_ref.rollout.custom.beam_search_params.max_tokens="${ITEM_MAX_TOKENS}" \
   ++actor_rollout_ref.rollout.custom.beam_search_params.logprobs_multiplier="${LOGPROBS_MULTIPLIER}" \
   ++actor_rollout_ref.rollout.custom.beam_search_params.constraint.type="minionerec_prefix_trie" \

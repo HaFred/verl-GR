@@ -86,10 +86,10 @@ actor_rollout_ref:
     layered_summon: false
     custom:
       beam_width: 20
-      constrained_beam_max_inflight_requests: 8
+      constrained_beam_max_inflight_requests: 64
       beam_search_params:
         max_tokens: 16
-        logprobs_multiplier: 8
+        logprobs_multiplier: 2
         constraint:
           type: minionerec_prefix_trie
           info_file: null
