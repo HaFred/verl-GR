@@ -8,6 +8,7 @@ from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
 from verl.utils.torch_functional import masked_mean
 
+from verl_gr.recipes.task_factory import load_object
 from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_evaluate_and_prune_checkpoint,
     openonerec_dump_generations,
