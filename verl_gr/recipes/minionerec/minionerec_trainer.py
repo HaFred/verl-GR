@@ -85,13 +85,23 @@ class MiniOneRecTrainerAdapter(TrainerTaskAdapter):
             test_batch = DataProto.from_single_dict(test_data)
             val_kwargs = trainer.config.actor_rollout_ref.rollout.val_kwargs
             rollout_cfg = trainer.config.actor_rollout_ref.rollout
-            beam_width = int((rollout_cfg.get("custom") or {}).get(BEAM_WIDTH_KEY, val_kwargs.get("n", 1)))
-            test_batch = test_batch.repeat(repeat_times=beam_width, interleave=True)
+            rollout_custom = rollout_cfg.get("custom") or {}
+            beam_width = int(rollout_custom.get(BEAM_WIDTH_KEY, val_kwargs.get("n", 1)))
+            base_generations_per_prompt = int(
+                rollout_custom.get("num_generations_per_prompt", max(1, int(rollout_cfg.get("n", 1)) // max(beam_width, 1)))
+            )
+            repeat_times = max(1, base_generations_per_prompt) * max(1, beam_width)
+            test_batch = test_batch.repeat(repeat_times=repeat_times, interleave=True)
 
             input_ids = test_batch.batch["input_ids"]
-            sample_inputs.extend([trainer.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids])
+            if "raw_prompt" in test_batch.non_tensor_batch:
+                sample_inputs.extend([str(v) for v in test_batch.non_tensor_batch["raw_prompt"]])
+            else:
+                sample_inputs.extend([trainer.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids])
             if "reward_model" in test_batch.non_tensor_batch:
-                sample_ground_truths.extend([item["ground_truth"] for item in test_batch.non_tensor_batch["reward_model"]])
+                sample_ground_truths.extend(
+                    [normalize_sid(item.get("ground_truth", "")) for item in test_batch.non_tensor_batch["reward_model"]]
+                )
 
             test_gen_batch = trainer._prepare_recommendation_gen_batch(test_batch)
             meta_info = {
@@ -124,7 +134,7 @@ class MiniOneRecTrainerAdapter(TrainerTaskAdapter):
             test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
 
             output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [trainer.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            output_texts = [normalize_sid(trainer.tokenizer.decode(ids, skip_special_tokens=True)) for ids in output_ids]
             sample_outputs.extend(output_texts)
             test_batch = test_batch.union(test_output_gen_batch)
             test_batch.meta_info["validate"] = True
@@ -161,7 +171,45 @@ class MiniOneRecTrainerAdapter(TrainerTaskAdapter):
                 ground_truths=sample_ground_truths,
             )
         data_sources = np.concatenate(data_source_lst, axis=0) if data_source_lst else np.array(["minionerec"])
-        return process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        metric_dict = process_validation_metrics(data_sources, sample_inputs, reward_extra_infos_dict)
+        metric_dict.update(
+            self._compute_pass_at_k_metrics(
+                data_sources=data_sources,
+                sample_inputs=sample_inputs,
+                sample_outputs=sample_outputs,
+                sample_ground_truths=sample_ground_truths,
+                k=32,
+            )
+        )
+        return metric_dict
+
+    @staticmethod
+    def _compute_pass_at_k_metrics(
+        *,
+        data_sources,
+        sample_inputs: list[str],
+        sample_outputs: list[str],
+        sample_ground_truths: list[str],
+        k: int,
+    ) -> dict[str, float]:
+        if not sample_outputs or not sample_ground_truths:
+            return {}
+        grouped_indices: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for idx, (data_source, prompt) in enumerate(zip(data_sources, sample_inputs, strict=True)):
+            grouped_indices[(str(data_source), str(prompt))].append(idx)
+        source_values: dict[str, list[float]] = defaultdict(list)
+        for (data_source, _prompt), indices in grouped_indices.items():
+            candidate_indices = indices[:k]
+            gt_sid = normalize_sid(sample_ground_truths[indices[0]])
+            hit = float(any(normalize_sid(sample_outputs[idx]) == gt_sid and gt_sid != "" for idx in candidate_indices))
+            source_values[data_source].append(hit)
+        metrics = {}
+        for data_source, values in source_values.items():
+            key = f"val-aux/{data_source}/pass_at_{k}"
+            val = float(np.mean(values)) if values else 0.0
+            metrics[key] = val
+            metrics[f"{key}/mean"] = val
+        return metrics
 
     @staticmethod
     def _group_keys(batch: DataProto) -> list[Any]:

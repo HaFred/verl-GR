@@ -118,7 +118,11 @@ class RLTrainer(RayPPOTrainerBase):
             adapter_cls = load_object(str(adapter_class_path))
             adapter = adapter_cls()
         else:
-            adapter_cls = load_object("verl_gr.recipes.openonerec.onerec_trainer.OpenOneRecTrainerAdapter")
+            rollout_name = str(self.config.actor_rollout_ref.rollout.get("name", ""))
+            if rollout_name == "constrained_beam":
+                adapter_cls = load_object("verl_gr.recipes.minionerec.minionerec_trainer.MiniOneRecTrainerAdapter")
+            else:
+                adapter_cls = load_object("verl_gr.recipes.openonerec.onerec_trainer.OpenOneRecTrainerAdapter")
             adapter = adapter_cls()
         self._verl_gr_task_adapter = adapter
         return adapter

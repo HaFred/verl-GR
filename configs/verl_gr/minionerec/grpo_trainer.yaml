@@ -85,6 +85,9 @@ actor_rollout_ref:
     calculate_log_probs: false
     layered_summon: false
     custom:
+      # MiniOneRec semantics: constrained-beam groups per prompt before beam expansion.
+      # Effective rollout requests per prompt = num_generations_per_prompt * beam_width.
+      num_generations_per_prompt: 1
       beam_width: 20
       constrained_beam_max_inflight_requests: 64
       beam_search_params:
