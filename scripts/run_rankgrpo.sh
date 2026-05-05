@@ -2,15 +2,19 @@
 # Minimal Rank-GRPO runtime launcher for verl-GR.
 
 set -euo pipefail
-clear
-export CUDA_VISIBLE_DEVICES=4,5,6,7
-N_GPUS=4
+clear || true
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
+export DS_IGNORE_CUDA_DETECTION="${DS_IGNORE_CUDA_DETECTION:-1}"
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+N_GPUS="${N_GPUS:-2}"
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
 PROJECT_ROOT="$(dirname "${VERL_GR_ROOT}")"
 RANKGRPO_RECIPE_PATH="${VERL_GR_ROOT}/verl_gr/recipes/rankgrpo/rankgrpo_recipe.py"
-PYTHON_BIN="${PYTHON_BIN:-python3}"
+VERL_LIB_PATH="${VERL_LIB_PATH:-}"
+VERL_GR_ENV="${VERL_GR_ENV:-/home/dyvm6xra/dyvm6xrauser45/miniconda3/envs/verl_080}"
+PYTHON_BIN="${PYTHON_BIN:-${VERL_GR_ENV}/bin/python}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
 fi
@@ -36,12 +40,13 @@ TRAIN_FILES="${TRAIN_FILES:-[${TRAIN_DATASET_DIR}]}"
 VAL_FILES="${VAL_FILES:-[${VAL_DATASET_DIR}]}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 REC_NUM="${REC_NUM:-20}"
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-$((N_GPUS * N_NODES))}"
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-6}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-$((16 * N_GPUS))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-512}"
 ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-True}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.5}"
-ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-1}"
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
+ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-${N_GPUS}}"
 # vLLM sleep-mode memory release can crash in CUDA/cumem after long runs on this
 # stack. Keep rollout memory resident by default; override both to True if needed.
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-False}"
@@ -51,10 +56,13 @@ LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 ADAM_BETA1="${ADAM_BETA1:-0.9}"
 ADAM_BETA2="${ADAM_BETA2:-0.99}"
+WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
 PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.06}"
 PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
 FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp}"
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
+DATA_SHUFFLE="${DATA_SHUFFLE:-True}"
+SEED="${SEED:-3407}"
 PROJECT_NAME="${PROJECT_NAME:-RankGRPO}"
 LAUNCH_TIMESTAMP="${LAUNCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
 EXPERIMENT_NAME="${EXPERIMENT_NAME:-${BASE_MODEL_DIRNAME}_${LAUNCH_TIMESTAMP}}"
@@ -73,16 +81,26 @@ fi
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 SAVE_FREQ="${SAVE_FREQ:-200}"
-TEST_FREQ="${TEST_FREQ:-200}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
-VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-2000}"
+TEST_FREQ="${TEST_FREQ:-${SAVE_FREQ}}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
+TOPK_CKPT_KEEP="${TOPK_CKPT_KEEP:-3}"
+TOPK_CKPT_METRIC="${TOPK_CKPT_METRIC:-val-core/rankgrpo/reward/mean@1}"
+TOPK_CKPT_MODE="${TOPK_CKPT_MODE:-max}"
+TRAIN_MAX_SAMPLES="${TRAIN_MAX_SAMPLES:--1}"
+VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-1600}"
 LOGGER_BACKENDS="${LOGGER_BACKENDS:-[tensorboard]}"
+REMOVE_PREVIOUS_CKPT_IN_SAVE="${REMOVE_PREVIOUS_CKPT_IN_SAVE:-False}"
+GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
 
 mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
 export TENSORBOARD_DIR
-export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
+if [[ -n "${VERL_LIB_PATH}" ]]; then
+  export PYTHONPATH="${VERL_GR_ROOT}:${VERL_LIB_PATH}:${PYTHONPATH:-}"
+else
+  export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
+fi
 export VLLM_ATTENTION_BACKEND
 export WANDB_MODE
 export RAY_TMPDIR
@@ -97,10 +115,18 @@ echo "Train data: ${TRAIN_FILES}"
 echo "Validation data: ${VAL_FILES}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Rec num: ${REC_NUM}"
+echo "Train batch size: ${TRAIN_BATCH_SIZE}"
+echo "Validation batch size: ${VAL_BATCH_SIZE}"
 echo "Rollout free cache engine: ${ROLLOUT_FREE_CACHE_ENGINE}"
 echo "Rollout sleep mode: ${ROLLOUT_ENABLE_SLEEP_MODE}"
+echo "Rollout tensor parallel size: ${ROLLOUT_TENSOR_PARALLEL_SIZE}"
 echo "Learning rate: ${LEARNING_RATE}"
+echo "Save/test freq: ${SAVE_FREQ}/${TEST_FREQ}"
+echo "Top-k checkpoints: keep=${TOPK_CKPT_KEEP}, metric=${TOPK_CKPT_METRIC}, mode=${TOPK_CKPT_MODE}"
 echo "Output: ${OUTPUT_DIR}"
+if [[ -n "${VERL_LIB_PATH}" ]]; then
+  echo "verl library path: ${VERL_LIB_PATH}"
+fi
 echo "==================================="
 
 for arg in "$@"; do
@@ -111,13 +137,18 @@ for arg in "$@"; do
   fi
 done
 
-"${PYTHON_BIN}" -u -m verl_gr.trainers.main_rankgrpo \
+"${PYTHON_BIN}" -u -m verl_gr.trainers.main_ppo \
+  --config-path "${VERL_GR_ROOT}/configs/verl_gr/rankgrpo" \
+  --config-name rankgrpo_trainer \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="${VAL_FILES}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
+  data.val_batch_size="${VAL_BATCH_SIZE}" \
+  data.shuffle="${DATA_SHUFFLE}" \
+  data.seed="${SEED}" \
   data.max_prompt_length=2048 \
   data.max_response_length=1024 \
-  ++data.train_max_samples=40000 \
+  ++data.train_max_samples="${TRAIN_MAX_SAMPLES}" \
   ++data.val_max_samples="${VAL_MAX_SAMPLES}" \
   data.custom_cls.path="${RANKGRPO_RECIPE_PATH}" \
   custom_reward_function.path="${RANKGRPO_RECIPE_PATH}" \
@@ -133,6 +164,7 @@ done
   actor_rollout_ref.actor.optim.lr_warmup_steps="${LR_WARMUP_STEPS}" \
   actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
   actor_rollout_ref.actor.optim.betas="[${ADAM_BETA1},${ADAM_BETA2}]" \
+  actor_rollout_ref.actor.optim.weight_decay="${WEIGHT_DECAY}" \
   actor_rollout_ref.ref.log_prob_max_token_len_per_gpu="${MAX_TOKENS_PER_GPU}" \
   actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu="${MAX_TOKENS_PER_GPU}" \
   actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_TOKENS_PER_GPU}" \
@@ -141,10 +173,12 @@ done
   actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TENSOR_PARALLEL_SIZE}" \
   actor_rollout_ref.rollout.free_cache_engine="${ROLLOUT_FREE_CACHE_ENGINE}" \
-  actor_rollout_ref.rollout.enable_sleep_mode="${ROLLOUT_ENABLE_SLEEP_MODE}" \
+  +actor_rollout_ref.rollout.enable_sleep_mode="${ROLLOUT_ENABLE_SLEEP_MODE}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
+  actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
+  algorithm.rank_grpo.importance_sampling_level=item \
   trainer.n_gpus_per_node="${N_GPUS}" \
   trainer.nnodes="${N_NODES}" \
   trainer.project_name="${PROJECT_NAME}" \
@@ -154,8 +188,11 @@ done
   trainer.save_freq="${SAVE_FREQ}" \
   trainer.test_freq="${TEST_FREQ}" \
   trainer.val_before_train="${VAL_BEFORE_TRAIN}" \
+  +trainer.topk_ckpt_keep="${TOPK_CKPT_KEEP}" \
+  +trainer.topk_ckpt_metric="${TOPK_CKPT_METRIC}" \
+  +trainer.topk_ckpt_mode="${TOPK_CKPT_MODE}" \
   trainer.logger="${LOGGER_BACKENDS}" \
-  trainer.remove_previous_ckpt_in_save=True \
+  trainer.remove_previous_ckpt_in_save="${REMOVE_PREVIOUS_CKPT_IN_SAVE}" \
   +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
   +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \

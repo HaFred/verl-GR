@@ -12,6 +12,9 @@ defaults:
 
 # ---------- OpenOneRec GRPO defaults ----------
 
+task:
+  name: openonerec
+
 data:
   max_prompt_length: 10240
   prompt_key: prompt

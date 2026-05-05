@@ -1,6 +1,9 @@
 """RL trainer extensions for verl-GR with bridged ray-trainer API."""
 
+import json
 import math
+import os
+import shutil
 from collections import defaultdict
 from typing import Any
 
@@ -341,6 +344,90 @@ class RLTrainer(RayPPOTrainerBase):
         self._add_actor_lr_metrics(actor_output.meta_info["metrics"])
         return actor_output
 
+    def _checkpoint_topk_state_path(self) -> str:
+        return os.path.join(self.config.trainer.default_local_dir, "topk_checkpoints.json")
+
+    def _load_topk_checkpoint_state(self) -> list[dict[str, Any]]:
+        if hasattr(self, "_topk_checkpoints"):
+            return self._topk_checkpoints
+        state_path = self._checkpoint_topk_state_path()
+        try:
+            with open(state_path) as f:
+                state = json.load(f)
+        except FileNotFoundError:
+            state = []
+        self._topk_checkpoints = state if isinstance(state, list) else []
+        return self._topk_checkpoints
+
+    def _save_topk_checkpoint_state(self, state: list[dict[str, Any]]) -> None:
+        os.makedirs(self.config.trainer.default_local_dir, exist_ok=True)
+        with open(self._checkpoint_topk_state_path(), "w") as f:
+            json.dump(state, f, indent=2, sort_keys=True)
+        if state:
+            latest_kept_step = max(int(entry["step"]) for entry in state)
+            latest_path = os.path.join(self.config.trainer.default_local_dir, "latest_checkpointed_iteration.txt")
+            with open(latest_path, "w") as f:
+                f.write(str(latest_kept_step))
+        self._topk_checkpoints = state
+
+    def _select_topk_metric(self, metrics: dict[str, Any]) -> tuple[str | None, float | None]:
+        metric_name = _cfg_get(self.config.trainer, "topk_ckpt_metric", None)
+        if metric_name:
+            value = metrics.get(metric_name)
+            return metric_name, self._as_float(value, default=float("nan"))
+
+        for candidate in (
+            "val-core/rankgrpo/reward/mean@1",
+            "val-core/rankgrpo/score/mean@1",
+            "val-core/rankgrpo/rank_reward_sum/mean@1",
+        ):
+            if candidate in metrics:
+                return candidate, self._as_float(metrics[candidate], default=float("nan"))
+
+        for key in sorted(metrics):
+            if key.startswith("val-core/") and key.endswith("/mean@1"):
+                return key, self._as_float(metrics[key], default=float("nan"))
+        return None, None
+
+    def _update_topk_checkpoints(self, metrics: dict[str, Any]) -> None:
+        top_k = self._as_int(_cfg_get(self.config.trainer, "topk_ckpt_keep", 0), default=0)
+        if top_k <= 0 or self.global_steps <= 0:
+            return
+
+        ckpt_dir = os.path.join(self.config.trainer.default_local_dir, f"global_step_{self.global_steps}")
+        if not os.path.isdir(ckpt_dir):
+            return
+
+        metric_name, metric_value = self._select_topk_metric(metrics)
+        if metric_name is None or metric_value is None or not math.isfinite(metric_value):
+            print("[topk] No finite validation metric found; skipping checkpoint ranking.")
+            return
+
+        mode = str(_cfg_get(self.config.trainer, "topk_ckpt_mode", "max")).lower()
+        reverse = mode != "min"
+        state = [entry for entry in self._load_topk_checkpoint_state() if int(entry.get("step", -1)) != self.global_steps]
+        state.append(
+            {
+                "step": int(self.global_steps),
+                "metric": metric_name,
+                "value": float(metric_value),
+                "path": ckpt_dir,
+            }
+        )
+        state.sort(key=lambda entry: float(entry["value"]), reverse=reverse)
+        keep = state[:top_k]
+        drop = state[top_k:]
+
+        keep_paths = {entry["path"] for entry in keep}
+        for entry in drop:
+            path = entry.get("path")
+            if path and path not in keep_paths and os.path.isdir(path):
+                shutil.rmtree(path)
+                print(f"[topk] Removed checkpoint outside top-{top_k}: {path}")
+
+        self._save_topk_checkpoint_state(keep)
+        print(f"[topk] Kept top-{top_k} checkpoints by {metric_name}: {keep}")
+
     @staticmethod
     def _ensure_reward_routing_keys(proto: DataProto) -> None:
         """Ensure both source aliases exist for reward-loop compatibility."""
@@ -419,7 +506,9 @@ class RLTrainer(RayPPOTrainerBase):
         return gen_batch
 
     def _validate(self):
-        return openonerec_validate(self)
+        metrics = openonerec_validate(self)
+        self._update_topk_checkpoints(metrics)
+        return metrics
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, ground_truths=None):
         return openonerec_dump_generations(

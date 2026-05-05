@@ -9,10 +9,17 @@ defaults:
   - ppo_trainer
   - _self_
 
+task:
+  name: rankgrpo
+
 data:
+  train_batch_size: 6
   max_prompt_length: 2048
   prompt_key: prompt
   shuffle: false
+  val_batch_size: 32
+  train_max_samples: -1
+  val_max_samples: 1600
   max_response_length: 1024
   filter_overlong_prompts: true
   filter_overlong_prompts_workers: 16
@@ -51,15 +58,15 @@ actor_rollout_ref:
     entropy_checkpointing: true
     clip_ratio_high: 0.08
     use_dynamic_bsz: true
-    ppo_mini_batch_size: 8
+    ppo_mini_batch_size: 6
     ppo_max_token_len_per_gpu: 40960
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
     optim:
       lr: 1e-6
-      lr_warmup_steps: 10
-      weight_decay: 0.1
+      lr_warmup_steps: 0
+      weight_decay: 0.0
     fsdp_config:
       wrap_policy:
         transformer_layer_cls_to_wrap:
@@ -74,11 +81,11 @@ actor_rollout_ref:
     name: vllm
     n: 8
     dtype: bfloat16
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 2
     temperature: 1.0
     top_p: 1.0
     do_sample: true
-    gpu_memory_utilization: 0.8
+    gpu_memory_utilization: 0.25
     max_num_batched_tokens: 40960
     max_num_seqs: 512
     log_prob_max_token_len_per_gpu: 40960
@@ -120,12 +127,15 @@ trainer:
   val_before_train: false
   default_hdfs_dir: null
   logger: [tensorboard]
-  remove_previous_ckpt_in_save: true
-  save_freq: 20
-  test_freq: -1
-  total_epochs: 2
+  remove_previous_ckpt_in_save: false
+  save_freq: 200
+  test_freq: 200
+  topk_ckpt_keep: 3
+  topk_ckpt_metric: val-core/rankgrpo/reward/mean@1
+  topk_ckpt_mode: max
+  total_epochs: 1
   nnodes: 1
-  n_gpus_per_node: 8
+  n_gpus_per_node: 2
 
 critic:
   enable: false
