@@ -61,6 +61,7 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
         super().__init__(*args, **kwargs)
         self._two_stage_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._two_stage_build_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
+        self._two_stage_stage2_lock = asyncio.Lock()
         # vLLM V1 can become unstable when too many short-lived async requests hit the
         # engine core at once. Two-stage beam search multiplies request fan-out, so we
         # cap in-flight engine requests per server to keep IPC pressure bounded.
@@ -71,7 +72,22 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
                 get_rollout_custom_value(self.config, "beam_subrequest_parallelism", 8),
             )
         )
-        self._two_stage_engine_request_semaphore = asyncio.Semaphore(max(1, max_inflight_requests))
+        self._two_stage_max_inflight_requests = max(1, max_inflight_requests)
+        self._two_stage_engine_request_semaphore = asyncio.Semaphore(self._two_stage_max_inflight_requests)
+
+    async def get_two_stage_runtime_metrics(self) -> dict[str, int]:
+        semaphore_waiters = getattr(self._two_stage_engine_request_semaphore, "_waiters", None)
+        waiter_count = len(semaphore_waiters) if semaphore_waiters is not None else 0
+        available_slots = int(getattr(self._two_stage_engine_request_semaphore, "_value", 0))
+        inflight = max(0, self._two_stage_max_inflight_requests - available_slots)
+        pending_build_tasks = sum(0 if task.done() else 1 for task in self._two_stage_build_tasks.values())
+        return {
+            "max_inflight_engine_requests": int(self._two_stage_max_inflight_requests),
+            "inflight_engine_requests": inflight,
+            "engine_request_waiters": int(waiter_count),
+            "pending_build_tasks": int(pending_build_tasks),
+            "cache_entries": int(len(self._two_stage_cache)),
+        }
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         """Abort vLLM requests and clear two-stage state kept outside vLLM."""
@@ -229,14 +245,15 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
             add_special_tokens=False,
         )
         stage2_prompt_ids = prompt_ids + stage1_token_ids + prefix_ids
-        stage2_candidates = await self._run_stage2_beam_search(
-            prompt_token_ids=stage2_prompt_ids,
-            multi_modal_data=multi_modal_data,
-            request_id=f"{request_id}:stage2",
-            lora_request=lora_request,
-            priority=priority,
-            beam_config=beam_config,
-        )
+        async with self._two_stage_stage2_lock:
+            stage2_candidates = await self._run_stage2_beam_search(
+                prompt_token_ids=stage2_prompt_ids,
+                multi_modal_data=multi_modal_data,
+                request_id=f"{request_id}:stage2",
+                lora_request=lora_request,
+                priority=priority,
+                beam_config=beam_config,
+            )
 
         extra_fields = {"global_steps": self.global_steps}
         extract_prompt_logprobs(
@@ -323,6 +340,21 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
     ):
         eos_token_id = self.model_config.tokenizer.eos_token_id
 
+        async def generate_next_tokens(
+            current_prompt_token_ids_list: list[list[int]],
+            request_suffixes: list[str],
+            allowed_token_ids_list: list[list[int]] | None = None,  # noqa: ARG001
+        ):
+            tasks = [
+                asyncio.create_task(generate_one_token(current_prompt_token_ids, request_suffix))
+                for current_prompt_token_ids, request_suffix in zip(
+                    current_prompt_token_ids_list,
+                    request_suffixes,
+                    strict=True,
+                )
+            ]
+            return await asyncio.gather(*tasks)
+
         async def generate_one_token(current_prompt_token_ids: list[int], request_suffix: str):
             prompt = TokensPrompt(
                 prompt_token_ids=current_prompt_token_ids,
@@ -330,7 +362,7 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
             )
             params = SamplingParams(
                 max_tokens=1,
-                logprobs=max(2 * beam_config.width, 1),
+                logprobs=max(beam_config.logprobs_multiplier * beam_config.width, 1),
                 temperature=beam_config.temperature,
                 top_p=beam_config.top_p,
                 top_k=beam_config.top_k,
@@ -351,7 +383,7 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
             eos_token_id=eos_token_id,
             ignore_eos=beam_config.ignore_eos,
             length_penalty=beam_config.length_penalty,
-            generate_one_token=generate_one_token,
+            generate_next_tokens=generate_next_tokens,
         )
 
     async def _run_generate_request(

@@ -42,6 +42,8 @@ class BeamSearchConfig:
     temperature: float = 0.0
     top_p: float = 1.0
     top_k: int = -1
+    constraint: dict[str, Any] | None = None
+    logprobs_multiplier: int = 2
 
 
 @dataclass(slots=True)
@@ -136,6 +138,14 @@ def resolve_beam_search_config(
     )
     top_p = float(_pop_first(beam_search_params, ("top_p",), _pop_first(source, ("stage2_top_p",), 1.0)))
     top_k = int(_pop_first(beam_search_params, ("top_k",), _pop_first(source, ("stage2_top_k",), -1)))
+    constraint = _as_dict(
+        _pop_first(
+            beam_search_params,
+            ("constraint",),
+            _pop_first(source, ("constraint",), get_rollout_custom_nested_value(config, (BEAM_SEARCH_PARAMS_KEY, "constraint"), None)),
+        )
+    )
+    logprobs_multiplier = int(_pop_first(beam_search_params, ("logprobs_multiplier",), 2))
 
     return BeamSearchConfig(
         width=max(1, beam_width),
@@ -148,6 +158,8 @@ def resolve_beam_search_config(
         temperature=temperature,
         top_p=top_p,
         top_k=top_k,
+        constraint=constraint or None,
+        logprobs_multiplier=max(1, logprobs_multiplier),
     )
 
 

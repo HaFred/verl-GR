@@ -19,7 +19,7 @@ N_NODES="${N_NODES:-$(echo "${RAY_INFO}" | awk '{print $1}')}"
 N_GPUS="${N_GPUS:-$(echo "${RAY_INFO}" | awk '{print $2}')}"
 if [[ -z "${N_NODES}" || -z "${N_GPUS}" || "${N_NODES}" == "0" ]]; then
   N_NODES=1
-  N_GPUS=2
+  # N_GPUS=2
 fi
 
 BASE_MODEL="${BASE_MODEL:-/path/to/your/model}"
@@ -37,14 +37,29 @@ ROLLOUT_MODE="${ROLLOUT_MODE:-async}"
 # Validation logging controls:
 # - test_freq controls when validation runs.
 # - log_val_generations controls how many samples are printed per validation.
-TEST_FREQ="${TEST_FREQ:-20}"
-VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-8}"
+TEST_FREQ="${TEST_FREQ:-100}"
+SAVE_FREQ="${SAVE_FREQ:-${TEST_FREQ}}"
+VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-4}"
 VAL_DUMP_GENERATIONS="${VAL_DUMP_GENERATIONS:-True}"
+VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:--1}"
+VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-100}"
+VALIDATION_ADAPTIVE_CONCURRENCY="${VALIDATION_ADAPTIVE_CONCURRENCY:-True}"
+VALIDATION_MIN_CONCURRENT_REQUESTS="${VALIDATION_MIN_CONCURRENT_REQUESTS:-32}"
+VALIDATION_MAX_CONCURRENT_REQUESTS="${VALIDATION_MAX_CONCURRENT_REQUESTS:-64}"
+VALIDATION_TARGET_GPU_UTILIZATION="${VALIDATION_TARGET_GPU_UTILIZATION:-85.0}"
+VALIDATION_GPU_UTIL_TOLERANCE="${VALIDATION_GPU_UTIL_TOLERANCE:-7.5}"
+VALIDATION_CONCURRENCY_STEP="${VALIDATION_CONCURRENCY_STEP:-32}"
+VAL_THINKING_TEMPERATURE="${VAL_THINKING_TEMPERATURE:-0.6}"
+VAL_THINKING_TOP_P="${VAL_THINKING_TOP_P:-0.95}"
+VAL_THINKING_TOP_K="${VAL_THINKING_TOP_K:-50}"
+BEST_CKPTS_TO_KEEP="${BEST_CKPTS_TO_KEEP:-3}"
+BEST_CKPT_PRUNE_ENABLE="${BEST_CKPT_PRUNE_ENABLE:-True}"
+BEST_CKPT_METRIC="${BEST_CKPT_METRIC:-val-aux/*/pass_at_32/mean}"
 # Allow explicit control at launch time, e.g.:
 #   AGENT_LOOP_NUM_WORKERS=2 ./scripts/run_openonerec_grpo.sh
 AGENT_LOOP_NUM_WORKERS="${AGENT_LOOP_NUM_WORKERS:-${N_GPUS:-1}}"
 
-ENABLE_THINK="${ENABLE_THINK:-True}"
+ENABLE_THINK="${ENABLE_THINK:-False}"
 ENABLE_NONTHINK="${ENABLE_NONTHINK:-False}"
 USE_FORCE_PREFIX="${USE_FORCE_PREFIX:-False}"
 DATA_DIR="${DATA_DIR:-${VERL_GR_ROOT}/verl_gr/recipes/openonerec/output/rl_data}"
@@ -92,7 +107,12 @@ echo "Cluster: ${N_NODES} node(s) x ${N_GPUS} GPU(s)"
 echo "Model: ${BASE_MODEL}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Max tokens per GPU: ${MAX_TOKENS_PER_GPU}"
-echo "Validation test_freq: ${TEST_FREQ}, log_val_generations: ${VAL_LOG_GENERATIONS}"
+echo "Validation test_freq: ${TEST_FREQ}, save_freq: ${SAVE_FREQ}, log_val_generations: ${VAL_LOG_GENERATIONS}"
+echo "Validation max samples: ${VAL_MAX_SAMPLES}, val batch size: ${VAL_BATCH_SIZE}"
+echo "Validation adaptive concurrency: ${VALIDATION_ADAPTIVE_CONCURRENCY}"
+echo "Validation min/max concurrent requests: ${VALIDATION_MIN_CONCURRENT_REQUESTS}/${VALIDATION_MAX_CONCURRENT_REQUESTS}"
+echo "Validation target gpu util +/- tol: ${VALIDATION_TARGET_GPU_UTILIZATION}% +/- ${VALIDATION_GPU_UTIL_TOLERANCE}%"
+echo "Validation concurrency step: ${VALIDATION_CONCURRENCY_STEP}"
 echo "Agent loop workers: ${AGENT_LOOP_NUM_WORKERS}"
 echo "FSDP strategy: ${FSDP_STRATEGY}"
 echo "Output: ${OUTPUT_DIR}"
@@ -114,12 +134,15 @@ for arg in "$@"; do
   fi
 done
 
+# avoid conflicts: trainer.val_before_train=False needs to be false to avoid 2nd run of val_in_train, as now we have a built-in val run for keeping the ckpt top-k
 "${PYTHON_BIN}" -u -m verl_gr.trainers.main_ppo \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="${VAL_FILES}" \
   data.enable_think="${ENABLE_THINK}" \
   data.enable_nonthink="${ENABLE_NONTHINK}" \
   data.use_force_prefix="${USE_FORCE_PREFIX}" \
+  data.val_max_samples="${VAL_MAX_SAMPLES}" \
+  data.val_batch_size="${VAL_BATCH_SIZE}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
   data.custom_cls.path="${OPENONEREC_RECIPE_PATH}" \
   custom_reward_function.path="${OPENONEREC_RECIPE_PATH}" \
@@ -131,9 +154,20 @@ done
   actor_rollout_ref.rollout.max_num_batched_tokens="${MAX_TOKENS_PER_GPU}" \
   actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}" \
   actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}" \
+  actor_rollout_ref.rollout.custom.validation_adaptive_concurrency="${VALIDATION_ADAPTIVE_CONCURRENCY}" \
+  actor_rollout_ref.rollout.custom.validation_min_concurrent_requests="${VALIDATION_MIN_CONCURRENT_REQUESTS}" \
+  actor_rollout_ref.rollout.custom.validation_max_concurrent_requests="${VALIDATION_MAX_CONCURRENT_REQUESTS}" \
+  actor_rollout_ref.rollout.custom.validation_target_gpu_utilization="${VALIDATION_TARGET_GPU_UTILIZATION}" \
+  actor_rollout_ref.rollout.custom.validation_gpu_util_tolerance="${VALIDATION_GPU_UTIL_TOLERANCE}" \
+  actor_rollout_ref.rollout.custom.validation_concurrency_step="${VALIDATION_CONCURRENCY_STEP}" \
   actor_rollout_ref.rollout.agent.num_workers="${AGENT_LOOP_NUM_WORKERS}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+  actor_rollout_ref.rollout.val_kwargs.temperature="${VAL_THINKING_TEMPERATURE}" \
+  actor_rollout_ref.rollout.val_kwargs.top_p="${VAL_THINKING_TOP_P}" \
+  actor_rollout_ref.rollout.val_kwargs.top_k="${VAL_THINKING_TOP_K}" \
+  actor_rollout_ref.rollout.val_kwargs.n=1 \
   ++actor_rollout_ref.rollout.mode="${ROLLOUT_MODE}" \
   ++actor_rollout_ref.rollout.name="two_stage" \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
@@ -143,10 +177,15 @@ done
   trainer.experiment_name="${EXPERIMENT_NAME}" \
   trainer.default_local_dir="${OUTPUT_DIR}/ckpt" \
   trainer.test_freq="${TEST_FREQ}" \
+  trainer.save_freq="${SAVE_FREQ}" \
+  trainer.val_before_train=False \
   trainer.log_val_generations="${VAL_LOG_GENERATIONS}" \
   trainer.validation_data_dir=${VALIDATION_DATA_DIR_ARG} \
-  trainer.logger='[tensorboard]' \
-  trainer.remove_previous_ckpt_in_save=True \
+  ++trainer.best_ckpt_prune_enable="${BEST_CKPT_PRUNE_ENABLE}" \
+  ++trainer.best_ckpts_to_keep="${BEST_CKPTS_TO_KEEP}" \
+  ++trainer.best_ckpt_metric="${BEST_CKPT_METRIC}" \
+  trainer.logger='[tensorboard, wandb]' \
+  trainer.remove_previous_ckpt_in_save=False \
   +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
   +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \
