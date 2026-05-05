@@ -150,7 +150,7 @@ echo "==================================="
   actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap="[${FSDP_TRANSFORMER_LAYERS}]" \
   trainer.total_epochs="${TOTAL_EPOCHS}" \
   actor_rollout_ref.rollout.custom.beam_width="${BEAM_WIDTH}" \
-  actor_rollout_ref.rollout.custom.constrained_beam_max_inflight_requests="${CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS}" \
+  ++actor_rollout_ref.rollout.custom.constrained_beam_max_inflight_requests="${CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS}" \
   actor_rollout_ref.rollout.custom.beam_search_params.max_tokens="${ITEM_MAX_TOKENS}" \
   ++actor_rollout_ref.rollout.custom.beam_search_params.logprobs_multiplier="${LOGPROBS_MULTIPLIER}" \
   ++actor_rollout_ref.rollout.custom.beam_search_params.constraint.type="minionerec_prefix_trie" \
