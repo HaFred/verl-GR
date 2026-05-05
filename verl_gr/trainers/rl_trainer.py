@@ -4,16 +4,22 @@ import json
 import math
 import os
 import shutil
+import uuid
 from collections import defaultdict
 from typing import Any
 
+import numpy as np
 import torch
 
 from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
+from verl.trainer.ppo.reward import extract_reward
+from verl.utils import tensordict_utils as tu
 from verl.utils.torch_functional import masked_mean
+from verl.workers.utils.padding import left_right_2_no_padding
 
 from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_evaluate_and_prune_checkpoint,
@@ -21,6 +27,7 @@ from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_maybe_log_val_generations,
     openonerec_validate,
 )
+from verl_gr.trainers.task_adapter import TrainerTaskAdapter
 from verl_gr.workers.rollout.beam_config import (
     BEAM_RETURN_MODE_KEY,
     BEAM_SEARCH_PARAMS_KEY,
@@ -32,6 +39,36 @@ from verl_gr.workers.rollout.beam_config import (
 
 AdvantageEstimator = getattr(core_algos, "AdvantageEstimator")
 _RANKGRPO_TOKENIZER = None
+
+
+class _OpenOneRecTrainerAdapter(TrainerTaskAdapter):
+    def prepare_gen_batch(self, trainer, batch: DataProto) -> DataProto:
+        return trainer._prepare_recommendation_gen_batch(batch)
+
+    def validate(self, trainer):
+        return openonerec_validate(trainer)
+
+    def dump_generations(self, trainer, inputs, outputs, scores, reward_extra_infos_dict, dump_path, ground_truths=None):
+        return openonerec_dump_generations(
+            trainer,
+            inputs=inputs,
+            outputs=outputs,
+            scores=scores,
+            reward_extra_infos_dict=reward_extra_infos_dict,
+            dump_path=dump_path,
+            ground_truths=ground_truths,
+        )
+
+    def maybe_log_val_generations(self, trainer, inputs, outputs, scores):
+        return openonerec_maybe_log_val_generations(trainer, inputs=inputs, outputs=outputs, scores=scores)
+
+
+class _RankGRPOTrainerAdapter(TrainerTaskAdapter):
+    def prepare_gen_batch(self, trainer, batch: DataProto) -> DataProto:
+        return trainer._prepare_recommendation_gen_batch(batch)
+
+    def validate(self, trainer):
+        return trainer._rankgrpo_validate()
 
 
 def apply_kl_penalty(data: DataProto, kl_ctrl, kl_penalty: str = "kl"):
@@ -272,6 +309,39 @@ class RLTrainer(RayPPOTrainerBase):
 
             ray_trainer_mod.compute_advantage = compute_advantage
 
+    def fit(self):
+        logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
+        if logging_steps <= 1:
+            return super().fit()
+
+        from verl.utils.tracking import Tracking
+
+        original_log = Tracking.log
+
+        def log_every_n_steps(tracking_self, data, step, backend=None):
+            if step == 0 or step % logging_steps == 0:
+                return original_log(tracking_self, data=data, step=step, backend=backend)
+            return None
+
+        Tracking.log = log_every_n_steps
+        try:
+            return super().fit()
+        finally:
+            Tracking.log = original_log
+
+    def _get_task_adapter(self) -> TrainerTaskAdapter:
+        if hasattr(self, "_task_adapter"):
+            return self._task_adapter
+
+        task_name = str(_cfg_get(_cfg_get(self.config, "task", None), "name", "")).lower()
+        if task_name == "openonerec":
+            self._task_adapter = _OpenOneRecTrainerAdapter()
+        elif task_name == "rankgrpo":
+            self._task_adapter = _RankGRPOTrainerAdapter()
+        else:
+            self._task_adapter = TrainerTaskAdapter()
+        return self._task_adapter
+
     @staticmethod
     def _as_float(value: Any, default: float = 0.0) -> float:
         try:
@@ -346,6 +416,171 @@ class RLTrainer(RayPPOTrainerBase):
         self._add_actor_lr_metrics(actor_output.meta_info["metrics"])
         return actor_output
 
+    def _compute_eval_actor_metrics(self, batch: DataProto) -> dict[str, Any]:
+        """Compute actor loss metrics in eval mode without stepping the optimizer."""
+
+        rollout_config = self.config.actor_rollout_ref.rollout
+        batch.meta_info["multi_turn"] = rollout_config.multi_turn.enable
+        batch.meta_info["temperature"] = rollout_config.temperature
+
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        calculate_entropy = self.config.actor_rollout_ref.actor.calculate_entropy or (
+            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        )
+        tu.assign_non_tensor(
+            batch_td,
+            calculate_entropy=calculate_entropy,
+            compute_loss=True,
+            global_batch_size=batch.batch.batch_size[0],
+        )
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        return dict(tu.get(output, "metrics") or {})
+
+    @staticmethod
+    def _mean_metric(values: list[tuple[float, int]]) -> float | None:
+        total_weight = sum(weight for _, weight in values)
+        if total_weight <= 0:
+            return None
+        return sum(value * weight for value, weight in values) / total_weight
+
+    def _rankgrpo_validate(self):
+        data_source_lst = []
+        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
+        eval_loss_values: list[tuple[float, int]] = []
+
+        sample_inputs = []
+        sample_outputs = []
+        sample_gts = []
+        sample_scores = []
+        sample_turns = []
+        sample_uids = []
+
+        val_kwargs = self.config.actor_rollout_ref.rollout.val_kwargs
+        for test_data in self.val_dataloader:
+            test_batch = DataProto.from_single_dict(test_data)
+            if "uid" not in test_batch.non_tensor_batch:
+                test_batch.non_tensor_batch["uid"] = np.array(
+                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
+                )
+
+            test_batch = test_batch.repeat(repeat_times=val_kwargs.n, interleave=True)
+            ground_truths = [
+                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
+            ]
+            sample_gts.extend(ground_truths)
+
+            test_gen_batch = self._get_gen_batch(test_batch)
+            test_gen_batch.meta_info = {
+                "eos_token_id": self.tokenizer.eos_token_id,
+                "pad_token_id": self.tokenizer.pad_token_id,
+                "recompute_log_prob": False,
+                "do_sample": val_kwargs.do_sample,
+                "validate": True,
+                "global_steps": self.global_steps,
+            }
+
+            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
+            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
+            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
+            self.checkpoint_manager.sleep_replicas()
+            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
+                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
+                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
+
+            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
+            output_ids = test_output_gen_batch.batch["responses"]
+            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
+            sample_outputs.extend(output_texts)
+
+            test_batch = test_batch.union(test_output_gen_batch)
+            test_batch.meta_info["validate"] = True
+            test_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
+
+            input_ids = test_batch.batch["prompts"]
+            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
+            sample_inputs.extend(input_texts)
+            sample_uids.extend(test_batch.non_tensor_batch["uid"])
+
+            reward_tensor, reward_extra_info = extract_reward(test_batch)
+            scores = reward_tensor.sum(-1).cpu().tolist()
+            sample_scores.extend(scores)
+
+            reward_extra_infos_dict["reward"].extend(scores)
+            for key, values in reward_extra_info.items():
+                reward_extra_infos_dict.setdefault(key, [])
+                if isinstance(values, np.ndarray):
+                    reward_extra_infos_dict[key].extend(values.tolist())
+                else:
+                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
+
+            if "__num_turns__" in test_batch.non_tensor_batch:
+                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
+
+            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
+
+            if "response_mask" not in test_batch.batch.keys():
+                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
+            test_batch.meta_info["global_token_num"] = torch.sum(test_batch.batch["attention_mask"], dim=-1).tolist()
+
+            old_log_prob, _ = self._compute_old_log_prob(test_batch)
+            old_log_prob.batch.pop("entropys", None)
+            test_batch = test_batch.union(old_log_prob)
+            if self.use_reference_policy:
+                ref_log_prob = self._compute_ref_log_prob(test_batch)
+                test_batch = test_batch.union(ref_log_prob)
+
+            test_batch.batch["token_level_scores"] = reward_tensor
+            if reward_extra_info:
+                test_batch.non_tensor_batch.update({key: np.array(value) for key, value in reward_extra_info.items()})
+            if self.config.algorithm.use_kl_in_reward:
+                test_batch, _ = apply_kl_penalty(
+                    test_batch,
+                    kl_ctrl=self.kl_ctrl_in_reward,
+                    kl_penalty=self.config.algorithm.kl_penalty,
+                )
+            else:
+                test_batch.batch["token_level_rewards"] = test_batch.batch["token_level_scores"]
+
+            test_batch = compute_advantage(
+                test_batch,
+                adv_estimator=self.config.algorithm.adv_estimator,
+                gamma=self.config.algorithm.gamma,
+                lam=self.config.algorithm.lam,
+                num_repeat=self.config.actor_rollout_ref.rollout.n,
+                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
+                config=self.config.algorithm,
+                tokenizer=self.tokenizer,
+            )
+            eval_actor_metrics = self._compute_eval_actor_metrics(test_batch)
+            eval_loss = eval_actor_metrics.get("loss")
+            if eval_loss is not None and math.isfinite(self._as_float(eval_loss, default=float("nan"))):
+                eval_loss_values.append((float(eval_loss), int(reward_tensor.shape[0])))
+            self.checkpoint_manager.update_weights(self.global_steps)
+
+        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+
+        val_data_dir = self.config.trainer.get("validation_data_dir", None)
+        if val_data_dir:
+            self._dump_generations(
+                inputs=sample_inputs,
+                outputs=sample_outputs,
+                scores=sample_scores,
+                reward_extra_infos_dict=reward_extra_infos_dict,
+                dump_path=val_data_dir,
+                ground_truths=sample_gts,
+            )
+
+        for key_info, lst in reward_extra_infos_dict.items():
+            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
+
+        data_sources = np.concatenate(data_source_lst, axis=0)
+        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+        eval_loss = self._mean_metric(eval_loss_values)
+        if eval_loss is not None:
+            metric_dict["eval/loss"] = eval_loss
+        return metric_dict
+
     def _checkpoint_topk_state_path(self) -> str:
         return os.path.join(self.config.trainer.default_local_dir, "topk_checkpoints.json")
 
@@ -373,7 +608,11 @@ class RLTrainer(RayPPOTrainerBase):
         self._topk_checkpoints = state
 
     def _select_topk_metric(self, metrics: dict[str, Any]) -> tuple[str | None, float | None]:
-        metric_name = _cfg_get(self.config.trainer, "topk_ckpt_metric", None)
+        metric_name = _cfg_get(
+            self.config.trainer,
+            "best_ckpt_metric",
+            _cfg_get(self.config.trainer, "topk_ckpt_metric", None),
+        )
         if metric_name:
             value = metrics.get(metric_name)
             return metric_name, self._as_float(value, default=float("nan"))
@@ -392,7 +631,20 @@ class RLTrainer(RayPPOTrainerBase):
         return None, None
 
     def _update_topk_checkpoints(self, metrics: dict[str, Any]) -> None:
-        top_k = self._as_int(_cfg_get(self.config.trainer, "topk_ckpt_keep", 0), default=0)
+        prune_enabled = _cfg_get(self.config.trainer, "best_ckpt_prune_enable", True)
+        if isinstance(prune_enabled, str):
+            prune_enabled = prune_enabled.strip().lower() in {"1", "true", "yes", "y", "on"}
+        if not prune_enabled:
+            return
+
+        top_k = self._as_int(
+            _cfg_get(
+                self.config.trainer,
+                "best_ckpts_to_keep",
+                _cfg_get(self.config.trainer, "topk_ckpt_keep", 0),
+            ),
+            default=0,
+        )
         if top_k <= 0 or self.global_steps <= 0:
             return
 
@@ -405,7 +657,13 @@ class RLTrainer(RayPPOTrainerBase):
             print("[topk] No finite validation metric found; skipping checkpoint ranking.")
             return
 
-        mode = str(_cfg_get(self.config.trainer, "topk_ckpt_mode", "max")).lower()
+        mode = str(
+            _cfg_get(
+                self.config.trainer,
+                "best_ckpt_mode",
+                _cfg_get(self.config.trainer, "topk_ckpt_mode", "max"),
+            )
+        ).lower()
         reverse = mode != "min"
         state = [entry for entry in self._load_topk_checkpoint_state() if int(entry.get("step", -1)) != self.global_steps]
         state.append(
@@ -530,7 +788,7 @@ class RLTrainer(RayPPOTrainerBase):
         return gen_batch
 
     def _validate(self):
-        metrics = openonerec_validate(self)
+        metrics = self._get_task_adapter().validate(self)
         self._update_topk_checkpoints(metrics)
         return metrics
 
@@ -550,6 +808,9 @@ class RLTrainer(RayPPOTrainerBase):
 
     def _save_checkpoint(self):
         super()._save_checkpoint()
+        task_name = str(_cfg_get(_cfg_get(self.config, "task", None), "name", "")).lower()
+        if task_name != "openonerec":
+            return
         local_global_step_folder = f"{self.config.trainer.default_local_dir}/global_step_{self.global_steps}"
         openonerec_evaluate_and_prune_checkpoint(
             self,

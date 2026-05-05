@@ -130,9 +130,10 @@ trainer:
   remove_previous_ckpt_in_save: false
   save_freq: 200
   test_freq: 200
-  topk_ckpt_keep: 3
-  topk_ckpt_metric: val-core/rankgrpo/reward/mean@1
-  topk_ckpt_mode: max
+  logging_steps: 10
+  best_ckpt_prune_enable: true
+  best_ckpts_to_keep: 3
+  best_ckpt_metric: val-core/rankgrpo/reward/mean@1
   total_epochs: 1
   nnodes: 1
   n_gpus_per_node: 2
