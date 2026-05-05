@@ -22,12 +22,9 @@ PYTHON_BIN="${PYTHON_BIN:-${VERL_GR_ENV}/bin/python}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
 fi
+unset RAY_ADDRESS
 
-RAY_NODE_COUNT="$("${PYTHON_BIN}" -c "import ray; ray.init(address='auto', ignore_reinit_error=True); print(sum(1 for n in ray.nodes() if n.get('Alive')))" 2>/dev/null || true)"
-N_NODES="${N_NODES:-${RAY_NODE_COUNT}}"
-if [[ -z "${N_NODES}" || "${N_NODES}" == "0" ]]; then
-  N_NODES=1
-fi
+N_NODES="${N_NODES:-1}"
 
 SFT_CHECKPOINT="${SFT_CHECKPOINT:-1500}"
 DATA_DIR="${DATA_DIR:-${PROJECT_ROOT}/rankgrpo_data_ckpts}"
@@ -87,14 +84,17 @@ if [[ "${RESUME_MODE}" == "resume_path" ]]; then
   fi
 fi
 WANDB_MODE="${WANDB_MODE:-offline}"
-RAY_TMPDIR="${RAY_TMPDIR:-${OUTPUT_DIR}/ray_tmp}"
+DEFAULT_RAY_JOB_TAG="$(printf '%s_%s' "${EXPERIMENT_NAME}" "${CUDA_VISIBLE_DEVICES}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-48)"
+RAY_JOB_TAG="${RAY_JOB_TAG:-${DEFAULT_RAY_JOB_TAG}}"
+RAY_TMPDIR="${RAY_TMPDIR:-${TMPDIR:-/tmp}/vgr_ray_${USER:-user}_${RAY_JOB_TAG}}"
 RAY_TMPDIR_FALLBACK_ROOT="${RAY_TMPDIR_FALLBACK_ROOT:-${TMPDIR:-/tmp}}"
 RAY_TMPDIR_MAX_LEN="${RAY_TMPDIR_MAX_LEN:-60}"
 if (( ${#RAY_TMPDIR} > RAY_TMPDIR_MAX_LEN )); then
   # Ray creates deep session/socket paths under _temp_dir. Long roots can exceed
   # Linux AF_UNIX path limits, so use a short temp root for Ray only.
   SHORT_USER="${USER:-user}"
-  RAY_TMPDIR="${RAY_TMPDIR_FALLBACK_ROOT}/vgr_ray_${SHORT_USER}"
+  SHORT_TAG="$(printf '%s' "${RAY_JOB_TAG}" | cut -c1-24)"
+  RAY_TMPDIR="${RAY_TMPDIR_FALLBACK_ROOT}/vgr_ray_${SHORT_USER}_${SHORT_TAG}"
   echo "Warning: RAY_TMPDIR path too long, fallback to ${RAY_TMPDIR}" >&2
 fi
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
