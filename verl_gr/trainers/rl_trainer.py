@@ -4,19 +4,14 @@ import json
 import math
 import os
 import shutil
-import uuid
-from collections import defaultdict
 from typing import Any
 
-import numpy as np
 import torch
 
 from verl import DataProto
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
-from verl.trainer.ppo.reward import extract_reward
 from verl.utils import tensordict_utils as tu
 from verl.utils.torch_functional import masked_mean
 from verl.workers.utils.padding import left_right_2_no_padding
@@ -27,6 +22,8 @@ from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_maybe_log_val_generations,
     openonerec_validate,
 )
+from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import compute_rank_grpo_advantage, rankgrpo_enabled
+from verl_gr.recipes.rankgrpo.rankgrpo_trainer import RankGRPOTrainerAdapter
 from verl_gr.trainers.task_adapter import TrainerTaskAdapter
 from verl_gr.workers.rollout.beam_config import (
     BEAM_RETURN_MODE_KEY,
@@ -63,14 +60,6 @@ class _OpenOneRecTrainerAdapter(TrainerTaskAdapter):
         return openonerec_maybe_log_val_generations(trainer, inputs=inputs, outputs=outputs, scores=scores)
 
 
-class _RankGRPOTrainerAdapter(TrainerTaskAdapter):
-    def prepare_gen_batch(self, trainer, batch: DataProto) -> DataProto:
-        return trainer._prepare_recommendation_gen_batch(batch)
-
-    def validate(self, trainer):
-        return trainer._rankgrpo_validate()
-
-
 def apply_kl_penalty(data: DataProto, kl_ctrl, kl_penalty: str = "kl"):
     response_mask = data.batch["response_mask"]
     token_level_scores = data.batch["token_level_scores"]
@@ -99,135 +88,6 @@ def _cfg_get(config: Any, key: str, default=None):
     if hasattr(config, "get"):
         return config.get(key, default)
     return getattr(config, key, default)
-
-
-def _rankgrpo_enabled(config: Any) -> bool:
-    rank_cfg = _cfg_get(config, "rank_grpo", None)
-    return bool(_cfg_get(rank_cfg, "enable", False))
-
-
-def _decode_response_texts(responses: torch.Tensor, response_mask: torch.Tensor, tokenizer) -> list[str]:
-    texts: list[str] = []
-    for ids, mask in zip(responses, response_mask, strict=True):
-        valid_ids = ids[mask.bool()].detach().cpu().tolist()
-        texts.append(tokenizer.decode(valid_ids, skip_special_tokens=True))
-    return texts
-
-
-def _segment_rank_tokens(
-    responses: torch.Tensor,
-    response_mask: torch.Tensor,
-    tokenizer,
-    *,
-    rank_separator: str,
-    rec_num: int,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Assign natural rank ids to response tokens using newline-like separators."""
-
-    device = responses.device
-    batch_size, response_length = responses.size()
-    seg_ids = torch.full((batch_size, response_length), -1, dtype=torch.long, device=device)
-    try:
-        separator_ids = tokenizer.encode(rank_separator, add_special_tokens=False)
-    except Exception:
-        separator_ids = []
-    single_separator_id = int(separator_ids[0]) if len(separator_ids) == 1 else None
-
-    for row_idx in range(batch_size):
-        valid = int(response_mask[row_idx].sum().item())
-        item_id = 0
-        for token_idx in range(valid):
-            seg_ids[row_idx, token_idx] = item_id
-            token_id = int(responses[row_idx, token_idx].item())
-            separator_count = 0
-            if single_separator_id is not None and token_id == single_separator_id:
-                separator_count = 1
-            else:
-                try:
-                    piece = tokenizer.decode([token_id], clean_up_tokenization_spaces=False, skip_special_tokens=False)
-                except TypeError:
-                    piece = tokenizer.decode([token_id])
-                except Exception:
-                    piece = ""
-                separator_count = str(piece).count(rank_separator)
-            if separator_count > 0:
-                item_id += separator_count
-
-    rank_token_mask = response_mask.bool() & (seg_ids >= 0) & (seg_ids < rec_num)
-    return seg_ids, rank_token_mask
-
-
-def _compute_rank_grpo_advantage(
-    data: DataProto,
-    *,
-    config,
-    tokenizer,
-    norm_adv_by_std_in_grpo: bool,
-) -> DataProto:
-    if tokenizer is None:
-        raise ValueError("Rank-GRPO advantage computation requires the trainer tokenizer.")
-
-    rank_cfg = _cfg_get(config, "rank_grpo", {}) or {}
-    rec_num = int(_cfg_get(rank_cfg, "rec_num", 20))
-    rank_separator = _cfg_get(rank_cfg, "rank_separator", "\n")
-    year_tolerance = int(_cfg_get(rank_cfg, "year_tolerance", 2))
-    exclude_seen = bool(_cfg_get(rank_cfg, "exclude_seen", True))
-    normalize_by_std = bool(_cfg_get(rank_cfg, "normalize_by_std", norm_adv_by_std_in_grpo))
-
-    from verl_gr.recipes.rankgrpo.rankgrpo_reward import rank_rewards_from_text
-
-    responses = data.batch["responses"]
-    response_mask = data.batch["response_mask"]
-    response_texts = _decode_response_texts(responses, response_mask, tokenizer)
-    reward_models = data.non_tensor_batch.get("reward_model")
-    if reward_models is None:
-        raise KeyError("Rank-GRPO requires `reward_model` in data.non_tensor_batch.")
-
-    reward_rows = [
-        rank_rewards_from_text(
-            text,
-            reward_model,
-            rec_num=rec_num,
-            year_tolerance=year_tolerance,
-            exclude_seen=exclude_seen,
-        )
-        for text, reward_model in zip(response_texts, reward_models, strict=True)
-    ]
-    rank_rewards = torch.tensor(reward_rows, dtype=torch.float32, device=responses.device)
-
-    uids = data.non_tensor_batch.get("uid")
-    if uids is None:
-        uids = list(range(rank_rewards.size(0)))
-    uid_to_indices: dict[Any, list[int]] = defaultdict(list)
-    for idx, uid in enumerate(uids):
-        uid_to_indices[uid].append(idx)
-
-    rank_advantages = torch.zeros_like(rank_rewards)
-    for indices in uid_to_indices.values():
-        idx_tensor = torch.tensor(indices, dtype=torch.long, device=responses.device)
-        group_rewards = rank_rewards.index_select(0, idx_tensor)
-        centered = group_rewards - group_rewards.mean(dim=0, keepdim=True)
-        if normalize_by_std:
-            std = group_rewards.std(dim=0, unbiased=False, keepdim=True)
-            centered = centered / (std + 1e-4)
-        rank_advantages.index_copy_(0, idx_tensor, centered)
-
-    seg_ids, rank_token_mask = _segment_rank_tokens(
-        responses,
-        response_mask,
-        tokenizer,
-        rank_separator=rank_separator,
-        rec_num=rec_num,
-    )
-    clamped_seg_ids = seg_ids.clamp(min=0, max=rec_num - 1)
-    token_advantages = rank_advantages.gather(1, clamped_seg_ids)
-    token_advantages = token_advantages * rank_token_mask.float()
-
-    data.batch["advantages"] = token_advantages
-    data.batch["returns"] = token_advantages
-    data.batch["rank_token_mask"] = rank_token_mask
-    data.batch["rank_seg_ids"] = seg_ids
-    return data
 
 
 def compute_advantage(
@@ -259,10 +119,10 @@ def compute_advantage(
                 config.pf_ppo.weight_pow,
             )
     elif adv_estimator == AdvantageEstimator.GRPO:
-        if _rankgrpo_enabled(config):
+        if rankgrpo_enabled(config):
             if tokenizer is None:
                 tokenizer = _RANKGRPO_TOKENIZER
-            data = _compute_rank_grpo_advantage(
+            data = compute_rank_grpo_advantage(
                 data,
                 config=config,
                 tokenizer=tokenizer,
@@ -304,7 +164,7 @@ class RLTrainer(RayPPOTrainerBase):
         super().__init__(*args, **kwargs)
         global _RANKGRPO_TOKENIZER
         _RANKGRPO_TOKENIZER = tokenizer
-        if _rankgrpo_enabled(self.config.algorithm):
+        if rankgrpo_enabled(self.config.algorithm):
             import verl.trainer.ppo.ray_trainer as ray_trainer_mod
 
             ray_trainer_mod.compute_advantage = compute_advantage
@@ -337,7 +197,7 @@ class RLTrainer(RayPPOTrainerBase):
         if task_name == "openonerec":
             self._task_adapter = _OpenOneRecTrainerAdapter()
         elif task_name == "rankgrpo":
-            self._task_adapter = _RankGRPOTrainerAdapter()
+            self._task_adapter = RankGRPOTrainerAdapter()
         else:
             self._task_adapter = TrainerTaskAdapter()
         return self._task_adapter
@@ -443,143 +303,6 @@ class RLTrainer(RayPPOTrainerBase):
         if total_weight <= 0:
             return None
         return sum(value * weight for value, weight in values) / total_weight
-
-    def _rankgrpo_validate(self):
-        data_source_lst = []
-        reward_extra_infos_dict: dict[str, list] = defaultdict(list)
-        eval_loss_values: list[tuple[float, int]] = []
-
-        sample_inputs = []
-        sample_outputs = []
-        sample_gts = []
-        sample_scores = []
-        sample_turns = []
-        sample_uids = []
-
-        val_kwargs = self.config.actor_rollout_ref.rollout.val_kwargs
-        for test_data in self.val_dataloader:
-            test_batch = DataProto.from_single_dict(test_data)
-            if "uid" not in test_batch.non_tensor_batch:
-                test_batch.non_tensor_batch["uid"] = np.array(
-                    [str(uuid.uuid4()) for _ in range(len(test_batch.batch))], dtype=object
-                )
-
-            test_batch = test_batch.repeat(repeat_times=val_kwargs.n, interleave=True)
-            ground_truths = [
-                item.non_tensor_batch.get("reward_model", {}).get("ground_truth", None) for item in test_batch
-            ]
-            sample_gts.extend(ground_truths)
-
-            test_gen_batch = self._get_gen_batch(test_batch)
-            test_gen_batch.meta_info = {
-                "eos_token_id": self.tokenizer.eos_token_id,
-                "pad_token_id": self.tokenizer.pad_token_id,
-                "recompute_log_prob": False,
-                "do_sample": val_kwargs.do_sample,
-                "validate": True,
-                "global_steps": self.global_steps,
-            }
-
-            size_divisor = self.config.actor_rollout_ref.rollout.agent.num_workers
-            test_gen_batch_padded, pad_size = pad_dataproto_to_divisor(test_gen_batch, size_divisor)
-            test_output_gen_batch_padded = self.async_rollout_manager.generate_sequences(test_gen_batch_padded)
-            self.checkpoint_manager.sleep_replicas()
-            if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
-                batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
-                test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
-
-            test_output_gen_batch = unpad_dataproto(test_output_gen_batch_padded, pad_size=pad_size)
-            output_ids = test_output_gen_batch.batch["responses"]
-            output_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in output_ids]
-            sample_outputs.extend(output_texts)
-
-            test_batch = test_batch.union(test_output_gen_batch)
-            test_batch.meta_info["validate"] = True
-            test_batch.meta_info["temperature"] = self.config.actor_rollout_ref.rollout.temperature
-
-            input_ids = test_batch.batch["prompts"]
-            input_texts = [self.tokenizer.decode(ids, skip_special_tokens=True) for ids in input_ids]
-            sample_inputs.extend(input_texts)
-            sample_uids.extend(test_batch.non_tensor_batch["uid"])
-
-            reward_tensor, reward_extra_info = extract_reward(test_batch)
-            scores = reward_tensor.sum(-1).cpu().tolist()
-            sample_scores.extend(scores)
-
-            reward_extra_infos_dict["reward"].extend(scores)
-            for key, values in reward_extra_info.items():
-                reward_extra_infos_dict.setdefault(key, [])
-                if isinstance(values, np.ndarray):
-                    reward_extra_infos_dict[key].extend(values.tolist())
-                else:
-                    reward_extra_infos_dict[key].extend(values if isinstance(values, list) else [values])
-
-            if "__num_turns__" in test_batch.non_tensor_batch:
-                sample_turns.append(test_batch.non_tensor_batch["__num_turns__"])
-
-            data_source_lst.append(test_batch.non_tensor_batch.get("data_source", ["unknown"] * reward_tensor.shape[0]))
-
-            if "response_mask" not in test_batch.batch.keys():
-                test_batch.batch["response_mask"] = compute_response_mask(test_batch)
-            test_batch.meta_info["global_token_num"] = torch.sum(test_batch.batch["attention_mask"], dim=-1).tolist()
-
-            old_log_prob, _ = self._compute_old_log_prob(test_batch)
-            old_log_prob.batch.pop("entropys", None)
-            test_batch = test_batch.union(old_log_prob)
-            if self.use_reference_policy:
-                ref_log_prob = self._compute_ref_log_prob(test_batch)
-                test_batch = test_batch.union(ref_log_prob)
-
-            test_batch.batch["token_level_scores"] = reward_tensor
-            if reward_extra_info:
-                test_batch.non_tensor_batch.update({key: np.array(value) for key, value in reward_extra_info.items()})
-            if self.config.algorithm.use_kl_in_reward:
-                test_batch, _ = apply_kl_penalty(
-                    test_batch,
-                    kl_ctrl=self.kl_ctrl_in_reward,
-                    kl_penalty=self.config.algorithm.kl_penalty,
-                )
-            else:
-                test_batch.batch["token_level_rewards"] = test_batch.batch["token_level_scores"]
-
-            test_batch = compute_advantage(
-                test_batch,
-                adv_estimator=self.config.algorithm.adv_estimator,
-                gamma=self.config.algorithm.gamma,
-                lam=self.config.algorithm.lam,
-                num_repeat=self.config.actor_rollout_ref.rollout.n,
-                norm_adv_by_std_in_grpo=self.config.algorithm.get("norm_adv_by_std_in_grpo", True),
-                config=self.config.algorithm,
-                tokenizer=self.tokenizer,
-            )
-            eval_actor_metrics = self._compute_eval_actor_metrics(test_batch)
-            eval_loss = eval_actor_metrics.get("loss")
-            if eval_loss is not None and math.isfinite(self._as_float(eval_loss, default=float("nan"))):
-                eval_loss_values.append((float(eval_loss), int(reward_tensor.shape[0])))
-            self.checkpoint_manager.update_weights(self.global_steps)
-
-        self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
-
-        val_data_dir = self.config.trainer.get("validation_data_dir", None)
-        if val_data_dir:
-            self._dump_generations(
-                inputs=sample_inputs,
-                outputs=sample_outputs,
-                scores=sample_scores,
-                reward_extra_infos_dict=reward_extra_infos_dict,
-                dump_path=val_data_dir,
-                ground_truths=sample_gts,
-            )
-
-        for key_info, lst in reward_extra_infos_dict.items():
-            assert len(lst) == 0 or len(lst) == len(sample_scores), f"{key_info}: {len(lst)=}, {len(sample_scores)=}"
-
-        data_sources = np.concatenate(data_source_lst, axis=0)
-        metric_dict = self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
-        eval_loss = self._mean_metric(eval_loss_values)
-        if eval_loss is not None:
-            metric_dict["eval/loss"] = eval_loss
-        return metric_dict
 
     def _checkpoint_topk_state_path(self) -> str:
         return os.path.join(self.config.trainer.default_local_dir, "topk_checkpoints.json")

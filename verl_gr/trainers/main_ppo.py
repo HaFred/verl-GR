@@ -22,7 +22,7 @@ from verl.trainer.ppo.ray_trainer import Role
 from verl.trainer.ppo.utils import need_critic, need_reference_policy
 from verl.utils.dataset.rl_dataset import collate_fn
 from verl_gr.recipes.openonerec.onerec_recipe import OneRecTask
-from verl_gr.recipes.rankgrpo.rankgrpo_recipe import RankGRPOTask
+from verl_gr.recipes.rankgrpo.rankgrpo_task import RankGRPOTask
 from verl_gr.trainers.rl_trainer import RLTrainer
 
 _CONFIG_ROOT = Path(__file__).resolve().parents[2] / "configs" / "verl_gr" / "openonerec"
