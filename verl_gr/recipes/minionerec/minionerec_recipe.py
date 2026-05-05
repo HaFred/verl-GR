@@ -34,8 +34,11 @@ class MiniOneRecTask(RecipeTaskRuntime):
         # - rollout.n: total rollout requests per prompt seen by trainer/advantage code
         #   (base_generations_per_prompt * beam_width)
         base_generations_per_prompt = int(custom_cfg.get("num_generations_per_prompt", rollout_cfg.get("n", 1)))
-        custom_cfg["num_generations_per_prompt"] = max(1, base_generations_per_prompt)
-        rollout_cfg["n"] = max(1, base_generations_per_prompt) * max(1, beam_size)
+        base_generations_per_prompt = max(1, base_generations_per_prompt)
+        # Struct-mode compatibility: some remote configs may not define this key yet.
+        with open_dict(custom_cfg):
+            custom_cfg["num_generations_per_prompt"] = base_generations_per_prompt
+        rollout_cfg["n"] = base_generations_per_prompt * max(1, beam_size)
 
     def configure_rollout(self, config) -> None:
         if config.actor_rollout_ref.rollout.get("name") != "constrained_beam":
