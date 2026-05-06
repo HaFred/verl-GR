@@ -46,8 +46,8 @@ flowchart LR
     VanillaVLLM["Upstream vanilla vLLM\nused by Rank-GRPO"]
   end
 
-  TaskRunner --> TaskSpec
-  TaskRunner --> TaskFactory
+  TaskRunner -.->|registry| TaskSpec
+  TaskRunner -.->|class-path loader| TaskFactory
   TaskRunner --> RecipeTaskRuntime
   TaskRunner --> Datasets
   TaskRunner --> RLTrainer
@@ -57,21 +57,21 @@ flowchart LR
   RecipeTaskRuntime --> RankGRPOTask
   RankGRPOTask --> RankGRPOTokenizer
 
-  RLTrainer --> TrainerTaskAdapter
+  RLTrainer -.->|_get_task_adapter()| TrainerTaskAdapter
   TrainerTaskAdapter --> OpenOneRecAdapter
   TrainerTaskAdapter --> MiniOneRecAdapter
   TrainerTaskAdapter --> RankGRPOAdapter
-  RLTrainer --> RankGRPOAlgorithm
-  RankGRPOAlgorithm --> RankGRPOReward
-  RankGRPOAdapter --> RankGRPOMetrics
+  RLTrainer -.->|compute_advantage override| RankGRPOAlgorithm
+  RankGRPOAlgorithm -.->|rank_rewards_from_text| RankGRPOReward
+  RankGRPOAdapter -.->|_add_rankgrpo_eval_aliases| RankGRPOMetrics
 
-  OneRecTask --> RolloutRegistration
-  MiniOneRecTask --> RolloutRegistration
+  OneRecTask -.->|register_two_stage_*| RolloutRegistration
+  MiniOneRecTask -.->|register_constrained_beam_*| RolloutRegistration
   OneRecTask --> TwoStageRollout
   MiniOneRecTask --> ConstrainedRollout
   RankGRPOTask --> VanillaVLLM
-  TwoStageRollout --> BeamBackend
-  ConstrainedRollout --> BeamBackend
+  TwoStageRollout -.->|stage2 beams| BeamBackend
+  ConstrainedRollout -.->|constrained beams| BeamBackend
   OneRecTask --> OpenOneRecLoop
   MiniOneRecTask --> MiniOneRecLoop
 ```
@@ -122,6 +122,8 @@ flowchart LR
 
 - Each column is a role in the runtime path, from launch-time task selection to
   rollout execution.
-- Arrows show the main construction, delegation, registration, or dependency
-  relationships used at runtime.
+- Solid arrows show the main construction or direct runtime handoff between
+  role blocks.
+- Dotted arrows show registry lookup, configuration-driven selection,
+  delegation, registration, or dependency edges rather than direct ownership.
 - Boxes group related classes/modules rather than listing every class method.
