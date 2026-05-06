@@ -24,6 +24,31 @@ class RankGRPOTrainerAdapter(TrainerTaskAdapter):
     def validate(self, trainer):
         return rankgrpo_validate(trainer)
 
+    def maybe_log_val_generations(self, trainer, inputs, outputs, scores):
+        _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores)
+        return super().maybe_log_val_generations(trainer, inputs, outputs, scores)
+
+
+def _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores) -> None:
+    generations_to_log = trainer.config.trainer.get("log_val_generations", 0)
+    if generations_to_log == 0:
+        return
+
+    samples = list(zip(inputs, outputs, scores, strict=True))
+    samples.sort(key=lambda item: item[0])
+    rng = np.random.RandomState(42)
+    rng.shuffle(samples)
+    preview = samples[: min(3, generations_to_log, len(samples))]
+    print(
+        f"[val_generations] step={trainer.global_steps} project={trainer.config.trainer.project_name} "
+        f"exp={trainer.config.trainer.experiment_name} logged={min(generations_to_log, len(samples))} "
+        f"preview={len(preview)}"
+    )
+    for idx, (inp, out, score) in enumerate(preview):
+        inp_text = str(inp)[:160].replace("\n", "\\n")
+        out_text = str(out)[:160].replace("\n", "\\n")
+        print(f"[val_generations][{idx}] score={score} input='{inp_text}' output='{out_text}'")
+
 
 def rankgrpo_validate(trainer):
     from verl_gr.trainers.rl_trainer import apply_kl_penalty, compute_advantage, compute_response_mask
