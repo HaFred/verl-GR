@@ -57,16 +57,16 @@ flowchart LR
   RecipeTaskRuntime --> RankGRPOTask
   RankGRPOTask --> RankGRPOTokenizer
 
-  RLTrainer -.->|_get_task_adapter()| TrainerTaskAdapter
+  RLTrainer -.->|get task adapter| TrainerTaskAdapter
   TrainerTaskAdapter --> OpenOneRecAdapter
   TrainerTaskAdapter --> MiniOneRecAdapter
   TrainerTaskAdapter --> RankGRPOAdapter
   RLTrainer -.->|compute_advantage override| RankGRPOAlgorithm
   RankGRPOAlgorithm -.->|rank_rewards_from_text| RankGRPOReward
-  RankGRPOAdapter -.->|_add_rankgrpo_eval_aliases| RankGRPOMetrics
+  RankGRPOAdapter -.->|add eval aliases| RankGRPOMetrics
 
-  OneRecTask -.->|register_two_stage_*| RolloutRegistration
-  MiniOneRecTask -.->|register_constrained_beam_*| RolloutRegistration
+  OneRecTask -.->|register two stage| RolloutRegistration
+  MiniOneRecTask -.->|register constrained beam| RolloutRegistration
   OneRecTask --> TwoStageRollout
   MiniOneRecTask --> ConstrainedRollout
   RankGRPOTask --> VanillaVLLM
