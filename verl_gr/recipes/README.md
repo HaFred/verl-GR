@@ -1,3 +1,5 @@
+# `verl_gr/recipes`
+
 Generative recommendation systems (GenRecSys) use LLMs to produce recommendation rankings. 
 Technically, their approaches are two-fold: output tokens can be treated either as semantic IDs (SIDs) embedded for products, goods, or items, or as natural-language representations of ranked items.
 
