@@ -33,6 +33,7 @@ BASE_MODEL="${BASE_MODEL:-${DATA_DIR}/Qwen2.5-0.5B-Instruct/checkpoint-${SFT_CHE
 BASE_MODEL_DIRNAME="$(basename "${BASE_MODEL%/}")"
 TRAIN_DATASET_DIR="${TRAIN_DATASET_DIR:-${DATA_DIR}/processed_datasets/grpo/grpo_dataset/train}"
 VAL_DATASET_DIR="${VAL_DATASET_DIR:-${DATA_DIR}/processed_datasets/sft_dataset/validation}"
+GT_CATALOG_PATH="${GT_CATALOG_PATH:-${DATA_DIR}/processed_datasets/gt_catalog.pkl}"
 TRAIN_FILES="${TRAIN_FILES:-[${TRAIN_DATASET_DIR}]}"
 VAL_FILES="${VAL_FILES:-[${VAL_DATASET_DIR}]}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
@@ -110,7 +111,7 @@ VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-4}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 BEST_CKPT_PRUNE_ENABLE="${BEST_CKPT_PRUNE_ENABLE:-True}"
 BEST_CKPTS_TO_KEEP="${BEST_CKPTS_TO_KEEP:-${TOPK_CKPT_KEEP:-3}}"
-BEST_CKPT_METRIC="${BEST_CKPT_METRIC:-${TOPK_CKPT_METRIC:-val-aux/rankgrpo/rank_reward_sum/mean@1}}"
+BEST_CKPT_METRIC="${BEST_CKPT_METRIC:-${TOPK_CKPT_METRIC:-eval/reward_total}}"
 TRAIN_MAX_SAMPLES="${TRAIN_MAX_SAMPLES:--1}"
 VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-1600}"
 LOGGER_BACKENDS="${LOGGER_BACKENDS:-[tensorboard]}"
@@ -137,6 +138,7 @@ echo "Cluster: ${N_NODES} node(s) x ${N_GPUS} GPU(s)"
 echo "Model: ${BASE_MODEL}"
 echo "Train data: ${TRAIN_FILES}"
 echo "Validation data: ${VAL_FILES}"
+echo "GT catalog: ${GT_CATALOG_PATH}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Rec num: ${REC_NUM}"
 echo "Train batch size: ${TRAIN_BATCH_SIZE}"
@@ -191,8 +193,10 @@ done
   data.val_max_samples="${VAL_MAX_SAMPLES}" \
   data.custom_cls.path="${RANKGRPO_RECIPE_PATH}" \
   custom_reward_function.path="${RANKGRPO_RECIPE_PATH}" \
+  custom_reward_function.reward_kwargs.gt_catalog_path="${GT_CATALOG_PATH}" \
   data.rankgrpo.rec_num="${REC_NUM}" \
   algorithm.rank_grpo.rec_num="${REC_NUM}" \
+  algorithm.rank_grpo.gt_catalog_path="${GT_CATALOG_PATH}" \
   actor_rollout_ref.actor.use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${ACTOR_MAX_TOKENS_PER_GPU}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \

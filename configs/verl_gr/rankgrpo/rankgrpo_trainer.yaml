@@ -38,6 +38,8 @@ data:
 
 custom_reward_function:
   name: compute_score
+  reward_kwargs:
+    gt_catalog_path: null
 
 actor_rollout_ref:
   hybrid_engine: true
@@ -119,6 +121,7 @@ algorithm:
     normalize_by_std: true
     year_tolerance: 2
     exclude_seen: true
+    gt_catalog_path: null
     importance_sampling_level: token
 
 trainer:
@@ -133,7 +136,7 @@ trainer:
   logging_steps: 10
   best_ckpt_prune_enable: true
   best_ckpts_to_keep: 3
-  best_ckpt_metric: val-core/rankgrpo/reward/mean@1
+  best_ckpt_metric: eval/reward_total
   total_epochs: 1
   nnodes: 1
   n_gpus_per_node: 2

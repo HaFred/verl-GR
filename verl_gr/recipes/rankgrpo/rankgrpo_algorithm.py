@@ -93,6 +93,7 @@ def compute_rank_grpo_advantage(
     year_tolerance = int(_cfg_get(rank_cfg, "year_tolerance", 2))
     exclude_seen = bool(_cfg_get(rank_cfg, "exclude_seen", True))
     normalize_by_std = bool(_cfg_get(rank_cfg, "normalize_by_std", norm_adv_by_std_in_grpo))
+    gt_catalog_path = _cfg_get(rank_cfg, "gt_catalog_path", None)
 
     responses = data.batch["responses"]
     response_mask = data.batch["response_mask"]
@@ -108,6 +109,7 @@ def compute_rank_grpo_advantage(
             rec_num=rec_num,
             year_tolerance=year_tolerance,
             exclude_seen=exclude_seen,
+            gt_catalog_path=gt_catalog_path,
         )
         for text, reward_model in zip(response_texts, reward_models, strict=True)
     ]

@@ -157,7 +157,20 @@ def rankgrpo_validate(trainer):
 
     data_sources = np.concatenate(data_source_lst, axis=0)
     metric_dict = trainer._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
+    _add_rankgrpo_eval_aliases(metric_dict)
     eval_loss = trainer._mean_metric(eval_loss_values)
     if eval_loss is not None:
         metric_dict["eval/loss"] = eval_loss
     return metric_dict
+
+
+def _add_rankgrpo_eval_aliases(metric_dict: dict[str, float]) -> None:
+    """Expose Rank-GRPO validation metrics under the reference TensorBoard names."""
+
+    reward = metric_dict.get("val-aux/rankgrpo/rank_rewards/mean@1")
+    if reward is not None:
+        metric_dict["eval/reward"] = reward
+
+    reward_total = metric_dict.get("val-aux/rankgrpo/rank_reward_sum/mean@1")
+    if reward_total is not None:
+        metric_dict["eval/reward_total"] = reward_total
