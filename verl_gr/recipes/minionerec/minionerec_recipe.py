@@ -29,7 +29,16 @@ class MiniOneRecTask(RecipeTaskRuntime):
                 rollout_cfg.custom = OmegaConf.create({})
             custom_cfg = rollout_cfg.custom
         beam_size = int(custom_cfg.get("beam_width", custom_cfg.get("beam_size", 20)))
-        rollout_cfg["n"] = int(rollout_cfg.get("n", 1)) * beam_size
+        # MiniOneRec's group size semantics are independent from OpenOneRec two-stage:
+        # - base_generations_per_prompt: how many constrained-beam groups per prompt
+        # - rollout.n: total rollout requests per prompt seen by trainer/advantage code
+        #   (base_generations_per_prompt * beam_width)
+        base_generations_per_prompt = int(custom_cfg.get("num_generations_per_prompt", rollout_cfg.get("n", 1)))
+        base_generations_per_prompt = max(1, base_generations_per_prompt)
+        # Struct-mode compatibility: some remote configs may not define this key yet.
+        with open_dict(custom_cfg):
+            custom_cfg["num_generations_per_prompt"] = base_generations_per_prompt
+        rollout_cfg["n"] = base_generations_per_prompt * max(1, beam_size)
 
     def configure_rollout(self, config) -> None:
         if config.actor_rollout_ref.rollout.get("name") != "constrained_beam":

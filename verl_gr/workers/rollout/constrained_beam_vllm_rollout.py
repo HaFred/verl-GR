@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from importlib import import_module
+import os
 
 import ray
+from verl_gr.workers.rollout.zmq_utils import build_zmq_handle
 
 ServerAdapter = getattr(import_module("verl.workers.rollout.vllm_rollout.vllm_rollout"), "ServerAdapter")
 
@@ -19,6 +21,13 @@ class ConstrainedBeamvLLMRollout(ServerAdapter):
                 model_config=kwargs["model_config"],
                 device_mesh=kwargs["device_mesh"],
                 replica_rank=kwargs.get("replica_rank", -1),
+            )
+            local_world_size = int(os.environ["RAY_LOCAL_WORLD_SIZE"])
+            local_rank = self.rollout_rank % local_world_size
+            self.zmq_handle = build_zmq_handle(
+                namespace="constrained-beam",
+                replica_rank=self.replica_rank,
+                local_rank=local_rank,
             )
             return
         raise RuntimeError(

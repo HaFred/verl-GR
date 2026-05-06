@@ -56,7 +56,8 @@ BASE_MODEL_DIRNAME="$(basename "${BASE_MODEL%/}")"
 # rl.sh: num_generations=16 → beam 宽度对齐；temperature=1.0；train_batch_size=64；epochs=2；lr=1e-5
 BEAM_WIDTH="${BEAM_WIDTH:-16}"
 ITEM_MAX_TOKENS="${ITEM_MAX_TOKENS:-16}"
-LOGPROBS_MULTIPLIER="${LOGPROBS_MULTIPLIER:-16}"
+LOGPROBS_MULTIPLIER="${LOGPROBS_MULTIPLIER:-2}"
+CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS="${CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS:-64}"
 ROLLOUT_TEMPERATURE="${ROLLOUT_TEMPERATURE:-1.0}"
 LEARNING_RATE="${LEARNING_RATE:-1e-5}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-2}"
@@ -80,6 +81,7 @@ WANDB_MODE="${WANDB_MODE:-offline}"
 # Defaulting ray_tmp under OUTPUT_DIR (long $HOME + experiment name) often exceeds that limit.
 RAY_TMPDIR="${RAY_TMPDIR:-$(mktemp -d "/tmp/rvXXXXXX")}"
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
+VERL_ZMQ_SOCKET_PREFIX="${VERL_ZMQ_SOCKET_PREFIX:-verl-gr-minionerec-${LAUNCH_TIMESTAMP}-$$}"
 
 mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 VAL_DATA_DIR="${VAL_DATA_DIR:-${OUTPUT_DIR}/val_generations}"
@@ -89,6 +91,7 @@ export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
 export WANDB_MODE
 export RAY_TMPDIR
 export TMPDIR="${RAY_TMPDIR}"
+export VERL_ZMQ_SOCKET_PREFIX
 
 echo "==================================="
 echo "MiniOneRec GRPO (verl-GR runtime)"
@@ -107,6 +110,7 @@ echo "FSDP wrap layer: ${FSDP_TRANSFORMER_LAYERS}"
 echo "Item max tokens: ${ITEM_MAX_TOKENS}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray tmp (short path for Unix socket limit): ${RAY_TMPDIR}"
+echo "ZMQ socket prefix: ${VERL_ZMQ_SOCKET_PREFIX}"
 echo "==================================="
 
 "${PYTHON_BIN}" -u -m verl_gr.trainers.main_ppo \
@@ -146,6 +150,7 @@ echo "==================================="
   actor_rollout_ref.ref.fsdp_config.wrap_policy.transformer_layer_cls_to_wrap="[${FSDP_TRANSFORMER_LAYERS}]" \
   trainer.total_epochs="${TOTAL_EPOCHS}" \
   actor_rollout_ref.rollout.custom.beam_width="${BEAM_WIDTH}" \
+  ++actor_rollout_ref.rollout.custom.constrained_beam_max_inflight_requests="${CONSTRAINED_BEAM_MAX_INFLIGHT_REQUESTS}" \
   actor_rollout_ref.rollout.custom.beam_search_params.max_tokens="${ITEM_MAX_TOKENS}" \
   ++actor_rollout_ref.rollout.custom.beam_search_params.logprobs_multiplier="${LOGPROBS_MULTIPLIER}" \
   ++actor_rollout_ref.rollout.custom.beam_search_params.constraint.type="minionerec_prefix_trie" \

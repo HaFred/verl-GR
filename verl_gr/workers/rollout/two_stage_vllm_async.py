@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -58,6 +59,8 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
     _MAX_TWO_STAGE_CACHE_SIZE = 1024
 
     def __init__(self, *args, **kwargs):
+        os.environ["VERL_ROLLOUT_ZMQ_NAMESPACE"] = "two-stage"
+        os.environ.setdefault("VERL_ZMQ_SOCKET_PREFIX", "verl-gr-two-stage")
         super().__init__(*args, **kwargs)
         self._two_stage_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._two_stage_build_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
@@ -74,6 +77,9 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
         )
         self._two_stage_max_inflight_requests = max(1, max_inflight_requests)
         self._two_stage_engine_request_semaphore = asyncio.Semaphore(self._two_stage_max_inflight_requests)
+
+    def _get_worker_extension_cls(self) -> str:
+        return "verl_gr.workers.rollout.zmq_utils.VerlGRVLLMColocateWorkerExtension"
 
     async def get_two_stage_runtime_metrics(self) -> dict[str, int]:
         semaphore_waiters = getattr(self._two_stage_engine_request_semaphore, "_waiters", None)

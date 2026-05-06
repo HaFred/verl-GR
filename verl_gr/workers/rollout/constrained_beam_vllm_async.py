@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from collections import OrderedDict
 from typing import Any, Optional
 
@@ -43,17 +44,54 @@ class ConstrainedBeamvLLMHttpServer(vLLMHttpServer):
     _MAX_CONSTRAINED_BEAM_CACHE_SIZE = 1024
 
     def __init__(self, *args, **kwargs):
+        os.environ["VERL_ROLLOUT_ZMQ_NAMESPACE"] = "constrained-beam"
+        os.environ.setdefault("VERL_ZMQ_SOCKET_PREFIX", "verl-gr-constrained-beam")
         super().__init__(*args, **kwargs)
         self._constrained_beam_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._constrained_beam_build_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        max_inflight_requests = int(
-            get_rollout_custom_value(
-                self.config,
-                "constrained_beam_max_inflight_requests",
-                get_rollout_custom_value(self.config, "beam_subrequest_parallelism", 8),
-            )
-        )
-        self._constrained_beam_engine_request_semaphore = asyncio.Semaphore(max(1, max_inflight_requests))
+        max_inflight_requests = self._resolve_max_inflight_requests()
+        self._constrained_beam_max_inflight_requests = max(1, max_inflight_requests)
+        self._constrained_beam_engine_request_semaphore = asyncio.Semaphore(self._constrained_beam_max_inflight_requests)
+
+    def _resolve_max_inflight_requests(self) -> int:
+        custom = getattr(self.config, "custom", None)
+        if custom is None:
+            custom_mapping = {}
+        elif isinstance(custom, dict):
+            custom_mapping = custom
+        elif hasattr(custom, "items"):
+            custom_mapping = dict(custom.items())
+        else:
+            custom_mapping = {}
+
+        explicit = custom_mapping.get("constrained_beam_max_inflight_requests")
+        legacy = custom_mapping.get("beam_subrequest_parallelism")
+        if explicit is not None:
+            return int(explicit)
+        if legacy is not None:
+            return int(legacy)
+
+        # Constrained beam emits many max_tokens=1 requests; 8 inflight requests
+        # heavily underutilizes vLLM and becomes the dominant bottleneck.
+        max_num_seqs = int(getattr(self.config, "max_num_seqs", 128) or 128)
+        return max(32, min(max_num_seqs, 128))
+
+    async def get_constrained_beam_runtime_metrics(self) -> dict[str, int]:
+        semaphore_waiters = getattr(self._constrained_beam_engine_request_semaphore, "_waiters", None)
+        waiter_count = len(semaphore_waiters) if semaphore_waiters is not None else 0
+        available_slots = int(getattr(self._constrained_beam_engine_request_semaphore, "_value", 0))
+        inflight = max(0, self._constrained_beam_max_inflight_requests - available_slots)
+        pending_build_tasks = sum(0 if task.done() else 1 for task in self._constrained_beam_build_tasks.values())
+        return {
+            "max_inflight_engine_requests": int(self._constrained_beam_max_inflight_requests),
+            "inflight_engine_requests": inflight,
+            "engine_request_waiters": int(waiter_count),
+            "pending_build_tasks": int(pending_build_tasks),
+            "cache_entries": int(len(self._constrained_beam_cache)),
+        }
+
+    def _get_worker_extension_cls(self) -> str:
+        return "verl_gr.workers.rollout.zmq_utils.VerlGRVLLMColocateWorkerExtension"
 
     async def abort_all_requests(self, reset_prefix_cache: bool = True) -> dict[str, Any]:
         build_tasks = list(self._constrained_beam_build_tasks.values())
@@ -252,7 +290,9 @@ class ConstrainedBeamvLLMHttpServer(vLLMHttpServer):
             prompt = TokensPrompt(prompt_token_ids=current_prompt_token_ids, multi_modal_data=multi_modal_data)
             params = SamplingParams(
                 max_tokens=1,
-                logprobs=max(beam_config.logprobs_multiplier * beam_config.width, 1),
+                # Beam backend only consumes top-(2*beam_width) candidates.
+                # Requesting more logprobs increases payload/CPU with no effect.
+                logprobs=max(2 * beam_config.width, 1),
                 temperature=beam_config.temperature,
                 top_p=beam_config.top_p,
                 top_k=beam_config.top_k,

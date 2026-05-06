@@ -82,6 +82,7 @@ if (( ${#RAY_TMPDIR} > RAY_TMPDIR_MAX_LEN )); then
   echo "Warning: RAY_TMPDIR path too long, fallback to ${RAY_TMPDIR}" >&2
 fi
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
+VERL_ZMQ_SOCKET_PREFIX="${VERL_ZMQ_SOCKET_PREFIX:-verl-gr-openonerec-${LAUNCH_TIMESTAMP}-$$}"
 
 mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 if [[ "${VAL_DUMP_GENERATIONS}" == "True" ]]; then
@@ -99,6 +100,7 @@ export VLLM_ATTENTION_BACKEND
 export WANDB_MODE
 export RAY_TMPDIR
 export TMPDIR="${RAY_TMPDIR}"
+export VERL_ZMQ_SOCKET_PREFIX
 
 echo "==================================="
 echo "OpenOneRec GRPO (verl-GR runtime)"
@@ -118,6 +120,7 @@ echo "FSDP strategy: ${FSDP_STRATEGY}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray temp dir: ${RAY_TMPDIR}"
 echo "Ray spill dir: ${RAY_SPILL_DIR}"
+echo "ZMQ socket prefix: ${VERL_ZMQ_SOCKET_PREFIX}"
 echo "==================================="
 
 # Guardrail: block accidental fallback to legacy OpenOneRec recipe imports.

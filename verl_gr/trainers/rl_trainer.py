@@ -16,6 +16,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.torch_functional import masked_mean
 from verl.workers.utils.padding import left_right_2_no_padding
 
+from verl_gr.recipes.task_factory import load_object
 from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_evaluate_and_prune_checkpoint,
     openonerec_dump_generations,
@@ -200,6 +201,87 @@ class RLTrainer(RayPPOTrainerBase):
             self._task_adapter = RankGRPOTrainerAdapter()
         else:
             self._task_adapter = TrainerTaskAdapter()
+        mode = str(
+            _cfg_get(
+                self.config.trainer,
+                "best_ckpt_mode",
+                _cfg_get(self.config.trainer, "topk_ckpt_mode", "max"),
+            )
+        ).lower()
+        reverse = mode != "min"
+        state = [entry for entry in self._load_topk_checkpoint_state() if int(entry.get("step", -1)) != self.global_steps]
+        state.append(
+            {
+                "step": int(self.global_steps),
+                "metric": metric_name,
+                "value": float(metric_value),
+                "path": ckpt_dir,
+            }
+        )
+        state.sort(key=lambda entry: float(entry["value"]), reverse=reverse)
+        keep = state[:top_k]
+        drop = state[top_k:]
+
+        keep_paths = {entry["path"] for entry in keep}
+        for entry in drop:
+            path = entry.get("path")
+            if path and path not in keep_paths and os.path.isdir(path):
+                shutil.rmtree(path)
+                print(f"[topk] Removed checkpoint outside top-{top_k}: {path}")
+
+        self._save_topk_checkpoint_state(keep)
+        print(f"[topk] Kept top-{top_k} checkpoints by {metric_name}: {keep}")
+            rollout_name = str(self.config.actor_rollout_ref.rollout.get("name", ""))
+            if rollout_name == "constrained_beam":
+                adapter_cls = load_object("verl_gr.recipes.minionerec.minionerec_trainer.MiniOneRecTrainerAdapter")
+            else:
+                adapter_cls = load_object("verl_gr.recipes.openonerec.onerec_trainer.OpenOneRecTrainerAdapter")
+            adapter = adapter_cls()
+        self._verl_gr_task_adapter = adapter
+        return adapter
+      
+        # starat
+        
+        mode = str(
+            _cfg_get(
+                self.config.trainer,
+                "best_ckpt_mode",
+                _cfg_get(self.config.trainer, "topk_ckpt_mode", "max"),
+            )
+        ).lower()
+        reverse = mode != "min"
+        state = [entry for entry in self._load_topk_checkpoint_state() if int(entry.get("step", -1)) != self.global_steps]
+        state.append(
+            {
+                "step": int(self.global_steps),
+                "metric": metric_name,
+                "value": float(metric_value),
+                "path": ckpt_dir,
+            }
+        )
+        state.sort(key=lambda entry: float(entry["value"]), reverse=reverse)
+        keep = state[:top_k]
+        drop = state[top_k:]
+
+        keep_paths = {entry["path"] for entry in keep}
+        for entry in drop:
+            path = entry.get("path")
+            if path and path not in keep_paths and os.path.isdir(path):
+                shutil.rmtree(path)
+                print(f"[topk] Removed checkpoint outside top-{top_k}: {path}")
+
+        self._save_topk_checkpoint_state(keep)
+        print(f"[topk] Kept top-{top_k} checkpoints by {metric_name}: {keep}")
+            rollout_name = str(self.config.actor_rollout_ref.rollout.get("name", ""))
+            if rollout_name == "constrained_beam":
+                adapter_cls = load_object("verl_gr.recipes.minionerec.minionerec_trainer.MiniOneRecTrainerAdapter")
+            else:
+                adapter_cls = load_object("verl_gr.recipes.openonerec.onerec_trainer.OpenOneRecTrainerAdapter")
+            adapter = adapter_cls()
+        self._verl_gr_task_adapter = adapter
+        return adapter
+        
+        # done    
         return self._task_adapter
 
     @staticmethod
@@ -379,37 +461,6 @@ class RLTrainer(RayPPOTrainerBase):
         if metric_name is None or metric_value is None or not math.isfinite(metric_value):
             print("[topk] No finite validation metric found; skipping checkpoint ranking.")
             return
-
-        mode = str(
-            _cfg_get(
-                self.config.trainer,
-                "best_ckpt_mode",
-                _cfg_get(self.config.trainer, "topk_ckpt_mode", "max"),
-            )
-        ).lower()
-        reverse = mode != "min"
-        state = [entry for entry in self._load_topk_checkpoint_state() if int(entry.get("step", -1)) != self.global_steps]
-        state.append(
-            {
-                "step": int(self.global_steps),
-                "metric": metric_name,
-                "value": float(metric_value),
-                "path": ckpt_dir,
-            }
-        )
-        state.sort(key=lambda entry: float(entry["value"]), reverse=reverse)
-        keep = state[:top_k]
-        drop = state[top_k:]
-
-        keep_paths = {entry["path"] for entry in keep}
-        for entry in drop:
-            path = entry.get("path")
-            if path and path not in keep_paths and os.path.isdir(path):
-                shutil.rmtree(path)
-                print(f"[topk] Removed checkpoint outside top-{top_k}: {path}")
-
-        self._save_topk_checkpoint_state(keep)
-        print(f"[topk] Kept top-{top_k} checkpoints by {metric_name}: {keep}")
 
     @staticmethod
     def _ensure_reward_routing_keys(proto: DataProto) -> None:
