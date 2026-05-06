@@ -94,6 +94,12 @@ actor_rollout_ref:
     enable_chunked_prefill: true
     calculate_log_probs: false
     layered_summon: false
+    val_kwargs:
+      n: 8
+      do_sample: true
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
     engine_kwargs:
       vllm:
         max_logprobs: 20

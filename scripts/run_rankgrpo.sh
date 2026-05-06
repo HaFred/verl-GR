@@ -225,6 +225,11 @@ done
   actor_rollout_ref.model.path="${BASE_MODEL}" \
   actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
+  actor_rollout_ref.rollout.val_kwargs.n="${ROLLOUT_N}" \
+  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+  actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
+  actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
+  actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
   algorithm.rank_grpo.importance_sampling_level=item \
   trainer.n_gpus_per_node="${N_GPUS}" \

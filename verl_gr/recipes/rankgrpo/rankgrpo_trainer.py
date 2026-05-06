@@ -25,16 +25,20 @@ class RankGRPOTrainerAdapter(TrainerTaskAdapter):
         return rankgrpo_validate(trainer)
 
     def maybe_log_val_generations(self, trainer, inputs, outputs, scores):
-        _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores)
+        ground_truths = getattr(trainer, "_rankgrpo_preview_ground_truths", None)
+        _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores, ground_truths=ground_truths)
         return super().maybe_log_val_generations(trainer, inputs, outputs, scores)
 
 
-def _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores) -> None:
+def _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores, ground_truths=None) -> None:
     generations_to_log = trainer.config.trainer.get("log_val_generations", 0)
     if generations_to_log == 0:
         return
 
-    samples = list(zip(inputs, outputs, scores, strict=True))
+    if ground_truths is not None and len(ground_truths) == len(scores):
+        samples = list(zip(inputs, outputs, scores, ground_truths, strict=True))
+    else:
+        samples = [(inp, out, score, None) for inp, out, score in zip(inputs, outputs, scores, strict=True)]
     samples.sort(key=lambda item: item[0])
     rng = np.random.RandomState(42)
     rng.shuffle(samples)
@@ -44,10 +48,11 @@ def _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores) -> 
         f"exp={trainer.config.trainer.experiment_name} logged={min(generations_to_log, len(samples))} "
         f"preview={len(preview)}"
     )
-    for idx, (inp, out, score) in enumerate(preview):
+    for idx, (inp, out, score, gt) in enumerate(preview):
         inp_text = str(inp).replace("\n", "\\n")
         out_text = str(out).replace("\n", "\\n")
-        print(f"[val_generations][{idx}] score={score} input='{inp_text}' output='{out_text}'")
+        gt_text = str(gt).replace("\n", "\\n")
+        print(f"[val_generations][{idx}] score={score} ground_truth='{gt_text}' input='{inp_text}' output='{out_text}'")
 
 
 def rankgrpo_validate(trainer):
@@ -164,7 +169,11 @@ def rankgrpo_validate(trainer):
             eval_loss_values.append((float(eval_loss), int(reward_tensor.shape[0])))
         trainer.checkpoint_manager.update_weights(trainer.global_steps)
 
-    trainer._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+    trainer._rankgrpo_preview_ground_truths = sample_gts
+    try:
+        trainer._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
+    finally:
+        trainer._rankgrpo_preview_ground_truths = None
 
     val_data_dir = trainer.config.trainer.get("validation_data_dir", None)
     if val_data_dir:
@@ -192,10 +201,26 @@ def rankgrpo_validate(trainer):
 def _add_rankgrpo_eval_aliases(metric_dict: dict[str, float]) -> None:
     """Expose Rank-GRPO validation metrics under the reference TensorBoard names."""
 
-    reward = metric_dict.get("val-aux/rankgrpo/rank_rewards/mean@1")
+    reward = _select_rankgrpo_mean_metric(metric_dict, "rank_rewards")
     if reward is not None:
         metric_dict["eval/reward"] = reward
 
-    reward_total = metric_dict.get("val-aux/rankgrpo/rank_reward_sum/mean@1")
+    reward_total = _select_rankgrpo_mean_metric(metric_dict, "rank_reward_sum")
     if reward_total is not None:
         metric_dict["eval/reward_total"] = reward_total
+
+
+def _select_rankgrpo_mean_metric(metric_dict: dict[str, float], metric_name: str) -> float | None:
+    prefix = f"val-aux/rankgrpo/{metric_name}/mean@"
+    candidates: list[tuple[int, float]] = []
+    for key, value in metric_dict.items():
+        if not key.startswith(prefix):
+            continue
+        try:
+            n_responses = int(key.removeprefix(prefix))
+        except ValueError:
+            continue
+        candidates.append((n_responses, value))
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: item[0])[1]
