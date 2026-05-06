@@ -5,6 +5,7 @@ set -euo pipefail
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export DS_IGNORE_CUDA_DETECTION="${DS_IGNORE_CUDA_DETECTION:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
+export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
 N_GPUS="${N_GPUS:-2}"
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
@@ -98,6 +99,9 @@ if (( ${#RAY_TMPDIR} > RAY_TMPDIR_MAX_LEN )); then
   echo "Warning: RAY_TMPDIR path too long, fallback to ${RAY_TMPDIR}" >&2
 fi
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
+RAY_NUM_CPUS="${RAY_NUM_CPUS:-$((N_GPUS * 24))}"
+RAY_OBJECT_STORE_MEMORY="${RAY_OBJECT_STORE_MEMORY:-$((N_GPUS * 32 * 1024 * 1024 * 1024))}"
+RAY_INCLUDE_DASHBOARD="${RAY_INCLUDE_DASHBOARD:-False}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
 SAVE_FREQ="${SAVE_FREQ:-200}"
 TEST_FREQ="${TEST_FREQ:-${SAVE_FREQ}}"
@@ -153,6 +157,8 @@ echo "Logging steps: ${LOGGING_STEPS}"
 echo "Validation generations to log: ${VAL_LOG_GENERATIONS}"
 echo "Best checkpoint pruning: enable=${BEST_CKPT_PRUNE_ENABLE}, keep=${BEST_CKPTS_TO_KEEP}, metric=${BEST_CKPT_METRIC}"
 echo "Output: ${OUTPUT_DIR}"
+echo "Ray temp dir: ${RAY_TMPDIR}"
+echo "Ray CPUs/object store/dashboard: ${RAY_NUM_CPUS}/${RAY_OBJECT_STORE_MEMORY}/${RAY_INCLUDE_DASHBOARD}"
 echo "Resume mode: ${RESUME_MODE}"
 if [[ -n "${RESUME_FROM_PATH}" ]]; then
   echo "Resume checkpoint: ${RESUME_FROM_PATH}"
@@ -230,8 +236,13 @@ done
   trainer.best_ckpt_metric="${BEST_CKPT_METRIC}" \
   trainer.logger="${LOGGER_BACKENDS}" \
   trainer.remove_previous_ckpt_in_save="${REMOVE_PREVIOUS_CKPT_IN_SAVE}" \
+  ray_kwargs.ray_init.num_cpus="${RAY_NUM_CPUS}" \
+  +ray_kwargs.ray_init.object_store_memory="${RAY_OBJECT_STORE_MEMORY}" \
+  +ray_kwargs.ray_init.include_dashboard="${RAY_INCLUDE_DASHBOARD}" \
   +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
   +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD="'${VLLM_WORKER_MULTIPROC_METHOD}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE="'${NCCL_IB_DISABLE:-1}'" \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \
   actor_rollout_ref.ref.strategy="${FSDP_STRATEGY}" \
   actor_rollout_ref.actor.strategy="${FSDP_STRATEGY}" \
