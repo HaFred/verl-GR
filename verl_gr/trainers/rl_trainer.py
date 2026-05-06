@@ -4,6 +4,7 @@ import json
 import math
 import os
 import shutil
+import time
 from typing import Any
 
 import torch
@@ -172,8 +173,14 @@ class RLTrainer(RayPPOTrainerBase):
 
     def fit(self):
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
+        ray_trainer_mod, original_tqdm, progress_tqdm_cls = self._install_latency_adjusted_tqdm()
+        self._progress_tqdm_cls = progress_tqdm_cls
         if logging_steps <= 1:
-            return super().fit()
+            try:
+                return super().fit()
+            finally:
+                ray_trainer_mod.tqdm = original_tqdm
+                self._progress_tqdm_cls = None
 
         from verl.utils.tracking import Tracking
 
@@ -189,6 +196,47 @@ class RLTrainer(RayPPOTrainerBase):
             return super().fit()
         finally:
             Tracking.log = original_log
+            ray_trainer_mod.tqdm = original_tqdm
+            self._progress_tqdm_cls = None
+
+    @staticmethod
+    def _install_latency_adjusted_tqdm():
+        import verl.trainer.ppo.ray_trainer as ray_trainer_mod
+
+        original_tqdm = ray_trainer_mod.tqdm
+
+        class LatencyAdjustedTqdm(original_tqdm):
+            _active = None
+
+            def __init__(self, *args, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._paused_at = None
+                LatencyAdjustedTqdm._active = self
+
+            def close(self):
+                if LatencyAdjustedTqdm._active is self:
+                    LatencyAdjustedTqdm._active = None
+                return super().close()
+
+            @classmethod
+            def pause_active(cls):
+                bar = cls._active
+                if bar is not None and bar._paused_at is None:
+                    bar._paused_at = time.monotonic()
+
+            @classmethod
+            def resume_active(cls):
+                bar = cls._active
+                if bar is None or bar._paused_at is None:
+                    return
+                elapsed = time.monotonic() - bar._paused_at
+                bar.start_t += elapsed
+                if hasattr(bar, "last_print_t"):
+                    bar.last_print_t += elapsed
+                bar._paused_at = None
+
+        ray_trainer_mod.tqdm = LatencyAdjustedTqdm
+        return ray_trainer_mod, original_tqdm, LatencyAdjustedTqdm
 
     def _get_task_adapter(self) -> TrainerTaskAdapter:
         if hasattr(self, "_task_adapter"):
@@ -516,9 +564,16 @@ class RLTrainer(RayPPOTrainerBase):
         return gen_batch
 
     def _validate(self):
-        metrics = self._get_task_adapter().validate(self)
-        self._update_topk_checkpoints(metrics)
-        return metrics
+        progress_tqdm_cls = getattr(self, "_progress_tqdm_cls", None)
+        if progress_tqdm_cls is not None:
+            progress_tqdm_cls.pause_active()
+        try:
+            metrics = self._get_task_adapter().validate(self)
+            self._update_topk_checkpoints(metrics)
+            return metrics
+        finally:
+            if progress_tqdm_cls is not None:
+                progress_tqdm_cls.resume_active()
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, ground_truths=None):
         return self._get_task_adapter().dump_generations(
@@ -535,7 +590,14 @@ class RLTrainer(RayPPOTrainerBase):
         return self._get_task_adapter().maybe_log_val_generations(self, inputs=inputs, outputs=outputs, scores=scores)
 
     def _save_checkpoint(self):
-        super()._save_checkpoint()
+        progress_tqdm_cls = getattr(self, "_progress_tqdm_cls", None)
+        if progress_tqdm_cls is not None:
+            progress_tqdm_cls.pause_active()
+        try:
+            super()._save_checkpoint()
+        finally:
+            if progress_tqdm_cls is not None:
+                progress_tqdm_cls.resume_active()
         task_name = str(_cfg_get(_cfg_get(self.config, "task", None), "name", "")).lower()
         if task_name != "openonerec":
             return

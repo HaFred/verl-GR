@@ -38,15 +38,15 @@ def _print_rankgrpo_val_generation_preview(trainer, inputs, outputs, scores) -> 
     samples.sort(key=lambda item: item[0])
     rng = np.random.RandomState(42)
     rng.shuffle(samples)
-    preview = samples[: min(3, generations_to_log, len(samples))]
+    preview = samples[: min(generations_to_log, len(samples))]
     print(
         f"[val_generations] step={trainer.global_steps} project={trainer.config.trainer.project_name} "
         f"exp={trainer.config.trainer.experiment_name} logged={min(generations_to_log, len(samples))} "
         f"preview={len(preview)}"
     )
     for idx, (inp, out, score) in enumerate(preview):
-        inp_text = str(inp)[:160].replace("\n", "\\n")
-        out_text = str(out)[:160].replace("\n", "\\n")
+        inp_text = str(inp).replace("\n", "\\n")
+        out_text = str(out).replace("\n", "\\n")
         print(f"[val_generations][{idx}] score={score} input='{inp_text}' output='{out_text}'")
 
 
