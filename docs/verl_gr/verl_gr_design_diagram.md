@@ -6,7 +6,7 @@ runtime after the recipe refactor. The main path is:
 1. `verl_gr.trainers.main_ppo` selects a task runtime and builds datasets.
 2. `RecipeTaskRuntime` or a recipe task prepares tokenizer, processor, worker class, and rollout registration.
 3. `RLTrainer` delegates recipe-specific generation and validation through `TrainerTaskAdapter`.
-4. Custom beam workloads register rollout replicas and async agent loops under `verl_gr.workers.rollout`.
+4. Custom rollout workloads register recipe-specific async agent loops and vLLM server adapters.
 
 ```mermaid
 flowchart LR
@@ -20,7 +20,7 @@ flowchart LR
     RecipeTaskRuntime["RecipeTaskRuntime\n- FSDP wrap cleanup\n- tokenizer/processor setup\n- rollout hooks"]
     OneRecTask["OneRecTask\nOpenOneRec two-stage rollout"]
     MiniOneRecTask["MiniOneRecTask\nconstrained-beam rollout"]
-    RankGRPOTask["RankGRPOTask\nvanilla vLLM rollout\nRank-GRPO tokenizer"]
+    RankGRPOTask["RankGRPOTask\nRank-GRPO tokenizer\nbatched vLLM agent loop"]
     Datasets["Recipe datasets\nOneRecDataset\nMiniOneRecDataset\nRankGRPODataset"]
     RankGRPOTokenizer["rankgrpo_tokenizer\nbuild tokenizer / processor"]
   end
@@ -43,7 +43,8 @@ flowchart LR
     BeamBackend["BeamBackend / BeamCandidate\nshared async beam ranking"]
     OpenOneRecLoop["OpenOneRecTwoStageAgentLoop\nWorker / Manager"]
     MiniOneRecLoop["MiniOneRecConstrainedBeamAgentLoop\nWorker / Manager"]
-    VanillaVLLM["Upstream vanilla vLLM\nused by Rank-GRPO"]
+    RankGRPOAgentLoop["rankgrpo_agent_loop.py\nRankGRPOAgentLoopManager\nRankGRPOAgentLoopWorker"]
+    RankGRPOBatchedVLLM["RankGRPOvLLMHttpServer\nRankGRPOvLLMReplica\ngenerate_many(n=rollouts)"]
   end
 
   TaskRunner -.->|registry| TaskSpec
@@ -69,7 +70,8 @@ flowchart LR
   MiniOneRecTask -.->|register constrained beam| RolloutRegistration
   OneRecTask --> TwoStageRollout
   MiniOneRecTask --> ConstrainedRollout
-  RankGRPOTask --> VanillaVLLM
+  RankGRPOTask --> RankGRPOAgentLoop
+  RankGRPOAgentLoop --> RankGRPOBatchedVLLM
   TwoStageRollout -.->|stage2 beams| BeamBackend
   ConstrainedRollout -.->|constrained beams| BeamBackend
   OneRecTask --> OpenOneRecLoop
@@ -87,9 +89,17 @@ flowchart LR
   `MiniOneRecActorRolloutRefWorker`, and wire `MiniOneRecConstrainedBeamAgentLoopManager`.
   Dataset, reward, format helpers, worker shim, agent loop, and trainer adapter
   are separate recipe modules under `verl_gr/recipes/minionerec`.
-- Rank-GRPO keeps rollout on the upstream vanilla `vllm` path. Its recipe code is
-  now split across `rankgrpo_dataset.py`, `rankgrpo_task.py`,
-  `rankgrpo_algorithm.py`, `rankgrpo_trainer.py`, `rankgrpo_reward.py`, and
+- Rank-GRPO now keeps the logical rollout type as upstream `vllm`, but installs
+  `rankgrpo_agent_loop.RankGRPOAgentLoopManager` through
+  `actor_rollout_ref.rollout.agent.agent_loop_manager_class`. This manager uses a
+  recipe-local `RankGRPOAgentLoopWorker`, `RankGRPOAsyncLLMServerManager`,
+  `RankGRPOvLLMHttpServer`, and `RankGRPOvLLMReplica` to collapse contiguous
+  repeated prompt rollouts into a single vLLM request with `n=<rollouts>`.
+  The output is expanded back into the normal `DataProto` shape, including
+  optional rollout logprobs for bypassing old-log-prob recomputation.
+- Rank-GRPO recipe code is split across `rankgrpo_dataset.py`,
+  `rankgrpo_task.py`, `rankgrpo_algorithm.py`, `rankgrpo_trainer.py`,
+  `rankgrpo_reward.py`, `rankgrpo_agent_loop.py`, and
   `rankgrpo_tokenizer.py`, while `rankgrpo_recipe.py` remains a compatibility
   export module for existing config overrides. Reward computation is
   reference-aligned through `gt_catalog.pkl`; both validation and advantage
@@ -116,7 +126,10 @@ flowchart LR
   does not inflate the displayed training-step rate.
 - `verl_gr.workers.rollout` contains the reusable beam-search infrastructure:
   registration helpers, two async vLLM server subclasses, rollout adapter classes,
-  and the shared async beam backend used by both beam-search recipes.
+  and the shared async beam backend used by both beam-search recipes. Rank-GRPO's
+  fast path intentionally lives in `verl_gr/recipes/rankgrpo/rankgrpo_agent_loop.py`
+  because it depends on Rank-GRPO's text-only, contiguous repeated-prompt batch
+  layout rather than a reusable beam-search rollout primitive.
 
 ## Diagram Legend
 

@@ -83,7 +83,7 @@ actor_rollout_ref:
     name: vllm
     n: 8
     dtype: bfloat16
-    tensor_model_parallel_size: 2
+    tensor_model_parallel_size: 1
     temperature: 1.0
     top_p: 1.0
     do_sample: true
@@ -92,8 +92,13 @@ actor_rollout_ref:
     max_num_seqs: 512
     log_prob_max_token_len_per_gpu: 40960
     enable_chunked_prefill: true
-    calculate_log_probs: false
+    calculate_log_probs: true
     layered_summon: false
+    enforce_eager: false
+    agent:
+      num_workers: 8
+      default_agent_loop: single_turn_agent
+      agent_loop_manager_class: verl_gr.recipes.rankgrpo.rankgrpo_agent_loop.RankGRPOAgentLoopManager
     val_kwargs:
       n: 8
       do_sample: true
@@ -109,9 +114,9 @@ actor_rollout_ref:
       ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
 
   model:
-    enable_activation_offload: true
+    enable_activation_offload: false
     enable_gradient_checkpointing: true
-    use_remove_padding: false
+    use_remove_padding: true
     use_fused_kernels: false
     fused_kernel_options:
       impl_backend: torch
@@ -128,7 +133,12 @@ algorithm:
     year_tolerance: 2
     exclude_seen: true
     gt_catalog_path: null
-    importance_sampling_level: token
+    importance_sampling_level: item
+  rollout_correction:
+    rollout_is: null
+    rollout_rs: null
+    bypass_mode: true
+    loss_type: ppo_clip
 
 trainer:
   project_name: RankGRPO

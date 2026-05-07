@@ -50,9 +50,9 @@ ACTOR_MAX_TOKENS_PER_GPU="${ACTOR_MAX_TOKENS_PER_GPU:-${MAX_TOKENS_PER_GPU}}"
 LOG_PROB_MAX_TOKENS_PER_GPU="${LOG_PROB_MAX_TOKENS_PER_GPU:-${MAX_TOKENS_PER_GPU}}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${MAX_TOKENS_PER_GPU}}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-512}"
-ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-True}"
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-False}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
-DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE="${DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE:-${N_GPUS}}"
+DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE="${DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE:-1}"
 if (( DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE > N_GPUS )); then
   DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE="${N_GPUS}"
 fi
@@ -62,6 +62,11 @@ if (( N_GPUS % ROLLOUT_TENSOR_PARALLEL_SIZE != 0 )); then
   exit 2
 fi
 ROLLOUT_DATA_PARALLEL_SIZE="$((N_GPUS / ROLLOUT_TENSOR_PARALLEL_SIZE))"
+ROLLOUT_CALCULATE_LOG_PROBS="${ROLLOUT_CALCULATE_LOG_PROBS:-True}"
+RANKGRPO_BYPASS_OLD_LOG_PROB="${RANKGRPO_BYPASS_OLD_LOG_PROB:-True}"
+USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
+USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-False}"
+ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-False}"
 # vLLM sleep-mode memory release can crash in CUDA/cumem after long runs on this
 # stack. Keep rollout memory resident by default; override both to True if needed.
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-False}"
@@ -157,6 +162,9 @@ echo "Log-prob max tokens/GPU: ${LOG_PROB_MAX_TOKENS_PER_GPU}"
 echo "Rollout max batched tokens: ${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
 echo "Rollout max sequences: ${ROLLOUT_MAX_NUM_SEQS}"
 echo "Rollout GPU memory utilization: ${ROLLOUT_GPU_MEMORY_UTILIZATION}"
+echo "Rollout calculate log probs: ${ROLLOUT_CALCULATE_LOG_PROBS}"
+echo "Rank-GRPO bypass old log prob: ${RANKGRPO_BYPASS_OLD_LOG_PROB}"
+echo "Remove padding/fused kernels/activation offload: ${USE_REMOVE_PADDING}/${USE_FUSED_KERNELS}/${ENABLE_ACTIVATION_OFFLOAD}"
 echo "Training data parallel size: ${N_GPUS}"
 echo "Learning rate: ${LEARNING_RATE}"
 echo "Save/test freq: ${SAVE_FREQ}/${TEST_FREQ}"
@@ -220,10 +228,14 @@ done
   actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}" \
   actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TENSOR_PARALLEL_SIZE}" \
+  actor_rollout_ref.rollout.calculate_log_probs="${ROLLOUT_CALCULATE_LOG_PROBS}" \
   actor_rollout_ref.rollout.free_cache_engine="${ROLLOUT_FREE_CACHE_ENGINE}" \
   +actor_rollout_ref.rollout.enable_sleep_mode="${ROLLOUT_ENABLE_SLEEP_MODE}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
+  actor_rollout_ref.model.enable_activation_offload="${ENABLE_ACTIVATION_OFFLOAD}" \
   actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING}" \
+  actor_rollout_ref.model.use_remove_padding="${USE_REMOVE_PADDING}" \
+  actor_rollout_ref.model.use_fused_kernels="${USE_FUSED_KERNELS}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.val_kwargs.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.val_kwargs.do_sample=True \
@@ -231,6 +243,12 @@ done
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
   actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
+  actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_gr.recipes.rankgrpo.rankgrpo_agent_loop.RankGRPOAgentLoopManager \
+  actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent \
+  algorithm.rollout_correction.bypass_mode="${RANKGRPO_BYPASS_OLD_LOG_PROB}" \
+  algorithm.rollout_correction.rollout_is=null \
+  algorithm.rollout_correction.rollout_rs=null \
+  algorithm.rollout_correction.loss_type=ppo_clip \
   algorithm.rank_grpo.importance_sampling_level=item \
   trainer.n_gpus_per_node="${N_GPUS}" \
   trainer.nnodes="${N_NODES}" \

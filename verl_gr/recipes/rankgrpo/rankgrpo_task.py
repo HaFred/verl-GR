@@ -4,11 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from omegaconf import open_dict
 from verl.single_controller.ray import RayWorkerGroup
 from verl.utils.fs import copy_to_local
-from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
+from verl.workers.engine_workers import TrainingWorker
 
 from verl_gr.recipes.rankgrpo.rankgrpo_tokenizer import build_rankgrpo_tokenizer_and_processor
+from verl_gr.recipes.rankgrpo.rankgrpo_worker import RankGRPOActorRolloutRefWorker
 from verl_gr.recipes.task_runtime import RecipeTaskRuntime
 
 __all__ = ["RankGRPOTask"]
@@ -33,10 +35,13 @@ class RankGRPOTask(RecipeTaskRuntime):
 
         if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2", "megatron"}:
             ray_worker_group_cls = RayWorkerGroup
-            actor_rollout_cls = ActorRolloutRefWorker
+            actor_rollout_cls = RankGRPOActorRolloutRefWorker
             critic_worker = TrainingWorker
         else:
             raise NotImplementedError(f"Unknown strategy: {config.actor_rollout_ref.actor.strategy}")
+
+        with open_dict(config.actor_rollout_ref):
+            config.actor_rollout_ref.rank_grpo = config.algorithm.get("rank_grpo", {}) or {}
 
         return {
             "tokenizer": built["tokenizer"],
