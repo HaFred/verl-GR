@@ -163,10 +163,27 @@ def rankgrpo_validate(trainer):
             config=trainer.config.algorithm,
             tokenizer=trainer.tokenizer,
         )
+        # Capture rank_reward_sum / rank_reward_mean from the advantage
+        # computation as a fallback when extract_reward() didn't provide
+        # them (e.g. reward.reward_model.enable=False).  If extract_reward
+        # already populated these keys we must NOT double-accumulate.
+        rank_sums = test_batch.non_tensor_batch.get("rank_reward_sum")
+        rank_means = test_batch.non_tensor_batch.get("rank_reward_mean")
+        if rank_sums is not None and "rank_reward_sum" not in reward_extra_infos_dict:
+            reward_extra_infos_dict["rank_reward_sum"] = []
+            reward_extra_infos_dict["rank_reward_mean"] = []
+            reward_extra_infos_dict["rank_reward_sum"].extend(
+                rank_sums.tolist() if isinstance(rank_sums, np.ndarray) else list(rank_sums)
+            )
+            if rank_means is not None:
+                reward_extra_infos_dict["rank_reward_mean"].extend(
+                    rank_means.tolist() if isinstance(rank_means, np.ndarray) else list(rank_means)
+                )
+
         eval_actor_metrics = trainer._compute_eval_actor_metrics(test_batch)
         eval_loss = eval_actor_metrics.get("loss")
         if eval_loss is not None and math.isfinite(trainer._as_float(eval_loss, default=float("nan"))):
-            eval_loss_values.append((float(eval_loss), int(reward_tensor.shape[0])))
+            eval_loss_values.append((float(eval_loss), int(len(rank_sums) if rank_sums is not None else reward_tensor.shape[0])))
         trainer.checkpoint_manager.update_weights(trainer.global_steps)
 
     trainer._rankgrpo_preview_ground_truths = sample_gts

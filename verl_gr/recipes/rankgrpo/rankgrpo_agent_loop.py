@@ -1,9 +1,11 @@
 """Rank-GRPO async rollout fast path.
 
 The upstream single-turn agent loop issues one vLLM request per repeated rollout.
-Rank-GRPO's prompts are text-only and repeated contiguously, so we can collapse
-each prompt group into one vLLM request with ``n=<group size>`` and expand the
-returned completions back into verl's normal DataProto layout.
+Rank-GRPO's prompts are text-only and repeated contiguously, so we fire each
+prompt group as *n* independent ``n=1`` vLLM requests concurrently via
+``asyncio.gather`` — matching TRL's colocated generation behaviour (one
+independent generation per completion).  The results are expanded back into
+verl's normal DataProto layout.
 """
 
 from __future__ import annotations
@@ -14,9 +16,6 @@ from uuid import uuid4
 
 import numpy as np
 import ray
-from vllm import SamplingParams
-from vllm.inputs import TokensPrompt
-from vllm.lora.request import LoRARequest
 
 from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import (
@@ -24,176 +23,22 @@ from verl.experimental.agent_loop.agent_loop import (
     AgentLoopMetrics,
     AgentLoopOutput,
     AgentLoopWorker,
-    AsyncLLMServerManager,
 )
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await
 from verl.utils.tokenizer import normalize_token_ids
 from verl.workers.rollout.replica import TokenOutput
-from verl.workers.rollout.utils import qwen2_5_vl_dedup_image_tokens
-from verl.workers.rollout.vllm_rollout.utils import (
-    VLLM_LORA_INT_ID,
-    VLLM_LORA_NAME,
-    VLLM_LORA_PATH,
-    extract_prompt_logprobs,
-)
-from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMHttpServer, vLLMReplica
-
-
-class RankGRPOvLLMHttpServer(vLLMHttpServer):
-    """vLLM server extension that returns all completions from a batched request."""
-
-    async def generate_many(
-        self,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        request_id: str,
-        n: int,
-        image_data: list[Any] | None = None,
-        video_data: list[Any] | None = None,
-        priority: int = 0,
-    ) -> list[TokenOutput]:
-        prompt_ids = normalize_token_ids(prompt_ids)
-        sampling_params = dict(sampling_params)
-
-        max_possible_tokens = self.config.max_model_len - len(prompt_ids)
-        if max_possible_tokens < 0:
-            raise ValueError(
-                f"Prompt length ({len(prompt_ids)}) exceeds the model's maximum context length "
-                f"({self.config.max_model_len})."
-            )
-
-        if "max_tokens" in sampling_params:
-            max_tokens = sampling_params.pop("max_tokens")
-        elif "max_new_tokens" in sampling_params:
-            max_tokens = sampling_params.pop("max_new_tokens")
-        else:
-            max_tokens = min(
-                self.config.response_length,
-                self.config.prompt_length + self.config.response_length - len(prompt_ids),
-            )
-        max_tokens = max(0, min(max_tokens, max_possible_tokens))
-
-        sampling_params["n"] = max(1, int(n))
-        sampling_params["logprobs"] = 0 if sampling_params.pop("logprobs", False) else None
-        sampling_params.setdefault("repetition_penalty", self.config.get("repetition_penalty", 1.0))
-        sampling = SamplingParams(max_tokens=max_tokens, **sampling_params)
-
-        prompt_ids = qwen2_5_vl_dedup_image_tokens(prompt_ids, self.model_config.processor)
-        multi_modal_data = {}
-        if image_data is not None:
-            multi_modal_data["image"] = image_data
-        if video_data is not None:
-            multi_modal_data["video"] = video_data
-
-        lora_request = None
-        if self.lora_as_adapter and VLLM_LORA_INT_ID in await self.engine.list_loras():
-            lora_request = LoRARequest(
-                lora_name=VLLM_LORA_NAME,
-                lora_int_id=VLLM_LORA_INT_ID,
-                lora_path=VLLM_LORA_PATH,
-            )
-
-        generator = self.engine.generate(
-            prompt=TokensPrompt(prompt_token_ids=prompt_ids, multi_modal_data=multi_modal_data),
-            sampling_params=sampling,
-            request_id=request_id,
-            lora_request=lora_request,
-            priority=priority,
-        )
-
-        final_res = None
-        async for output in generator:
-            final_res = output
-        assert final_res is not None
-
-        prompt_extra_fields = {"global_steps": self.global_steps}
-        extract_prompt_logprobs(
-            output=final_res,
-            num_prompt_logprobs=sampling.prompt_logprobs,
-            result_dict=prompt_extra_fields,
-        )
-
-        results: list[TokenOutput] = []
-        for completion in final_res.outputs:
-            token_ids = normalize_token_ids(completion.token_ids)
-            log_probs = None
-            if sampling.logprobs is not None and completion.logprobs is not None:
-                log_probs = []
-                for token_id, token_logprobs in zip(token_ids, completion.logprobs, strict=False):
-                    entry = token_logprobs[token_id]
-                    log_probs.append(entry.logprob if hasattr(entry, "logprob") else float(entry))
-
-            finish_reason = completion.finish_reason
-            if finish_reason == "abort":
-                stop_reason = "aborted"
-            elif finish_reason in ("stop", "length"):
-                stop_reason = "completed"
-            else:
-                stop_reason = finish_reason
-
-            results.append(
-                TokenOutput(
-                    token_ids=token_ids,
-                    log_probs=log_probs,
-                    routed_experts=getattr(completion, "routed_experts", None)
-                    if self.config.enable_rollout_routing_replay
-                    else None,
-                    stop_reason=stop_reason,
-                    num_preempted=getattr(completion, "num_preempted", None),
-                    extra_fields=dict(prompt_extra_fields),
-                )
-            )
-        return results
-
-
-class RankGRPOvLLMReplica(vLLMReplica):
-    """vLLM replica using the Rank-GRPO server extension."""
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.server_class = ray.remote(RankGRPOvLLMHttpServer)
-
-
-class RankGRPOAsyncLLMServerManager(AsyncLLMServerManager):
-    """Server manager with a batched token-in/token-out request method."""
-
-    async def generate_many(
-        self,
-        request_id: str,
-        *,
-        prompt_ids: list[int],
-        sampling_params: dict[str, Any],
-        n: int,
-        image_data: list[Any] | None = None,
-        video_data: list[Any] | None = None,
-        **kwargs: Any,
-    ) -> list[TokenOutput]:
-        server_id, server = await self._acquire_server(request_id)
-        try:
-            return await server.generate_many.remote(
-                request_id=uuid4().hex,
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                n=n,
-                image_data=image_data,
-                video_data=video_data,
-                **kwargs,
-            )
-        finally:
-            self._release_server(server_id)
+from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 
 class RankGRPOAgentLoopWorker(AgentLoopWorker):
-    """Batch repeated Rank-GRPO single-turn rollouts before calling vLLM."""
+    """Batch repeated Rank-GRPO single-turn rollouts before calling vLLM.
 
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self.server_manager = RankGRPOAsyncLLMServerManager(
-            self.config,
-            [(sid, self.server_manager._server_id_to_handle[sid]) for sid in self.server_manager._server_id_to_handle],
-            load_balancer_handle=self.server_manager._load_balancer,
-        )
+    Each prompt group is identified by identical ``raw_prompt_ids`` and gets
+    ``n`` independent ``n=1`` vLLM requests fired concurrently via
+    ``asyncio.gather``, matching TRL's one-independent-generation-per-completion
+    behaviour.
+    """
 
     async def generate_sequences(self, batch: DataProto) -> DataProto:
         if not self._can_use_rankgrpo_fast_path(batch):
@@ -211,7 +56,9 @@ class RankGRPOAgentLoopWorker(AgentLoopWorker):
         outputs_by_position: dict[int, Any] = {}
         for positions, outputs in group_results:
             if len(outputs) != len(positions):
-                raise RuntimeError(f"vLLM returned {len(outputs)} completions for {len(positions)} Rank-GRPO rollouts.")
+                raise RuntimeError(
+                    f"vLLM returned {len(outputs)} completions for {len(positions)} Rank-GRPO rollouts."
+                )
             for position, output in zip(positions, outputs, strict=True):
                 outputs_by_position[position] = output
 
@@ -276,14 +123,19 @@ class RankGRPOAgentLoopWorker(AgentLoopWorker):
         prompt_ids: list[int],
         sampling_params: dict[str, Any],
     ) -> tuple[list[int], list[Any]]:
-        metrics = {}
+        n = len(positions)
+        metrics: dict[str, float] = {}
         with simple_timer("generate_sequences", metrics):
-            token_outputs = await self.server_manager.generate_many(
-                request_id=uuid4().hex,
-                prompt_ids=prompt_ids,
-                sampling_params=sampling_params,
-                n=len(positions),
-            )
+            # Match TRL: n independent n=1 vLLM requests, sent concurrently.
+            tasks = [
+                self.server_manager.generate(
+                    request_id=uuid4().hex,
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                )
+                for _ in range(n)
+            ]
+            token_outputs: list[TokenOutput] = await asyncio.gather(*tasks)
 
         outputs = []
         for token_output in token_outputs:
@@ -322,7 +174,7 @@ class RankGRPOAgentLoopManager(AgentLoopManager):
     """AgentLoopManager that keeps repeated Rank-GRPO rollout groups colocated."""
 
     def __init__(self, *args, **kwargs):
-        self.rollout_replica_class = RankGRPOvLLMReplica
+        self.rollout_replica_class = vLLMReplica
         self.agent_loop_workers_class = ray.remote(RankGRPOAgentLoopWorker)
         super().__init__(*args, **kwargs)
 

@@ -18,12 +18,18 @@ if [[ ! -d "${DEFAULT_VERL_LIB_PATH}/verl" ]]; then
   DEFAULT_VERL_LIB_PATH=""
 fi
 VERL_LIB_PATH="${VERL_LIB_PATH:-${DEFAULT_VERL_LIB_PATH}}"
-VERL_GR_ENV="${VERL_GR_ENV:-/home/dyvm6xra/dyvm6xrauser45/miniconda3/envs/verl_080}"
+VERL_GR_ENV="${VERL_GR_ENV:-/home/dyvm6xra/dyvm6xrauser45/miniconda3/envs/verl_080_vllm_015}"
 PYTHON_BIN="${PYTHON_BIN:-${VERL_GR_ENV}/bin/python}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
 fi
-unset RAY_ADDRESS
+# If the caller set RAY_ADDRESS (for an isolated per-run Ray cluster), keep it.
+# Otherwise clear it so Ray auto-detects or starts a default local cluster.
+if [[ -n "${RAY_ADDRESS:-}" ]]; then
+  echo "Using caller-provided RAY_ADDRESS=${RAY_ADDRESS}"
+else
+  unset RAY_ADDRESS
+fi
 
 N_NODES="${N_NODES:-1}"
 
@@ -40,9 +46,11 @@ ROLLOUT_N="${ROLLOUT_N:-8}"
 REC_NUM="${REC_NUM:-20}"
 
 # verl-GR's train_batch_size is the number of unique prompts per optimizer
-# minibatch. This matches Rank-GRPO's gradient_accumulation_steps=6 with
-# per_device_train_batch_size=4 and 2 GPUs: 4 * 2 * 6 completions / 8 rollouts
-# per prompt = 6 prompts.
+# minibatch. TRL's reference uses per_device_train_batch_size=4 (4 prompts
+# per GPU) × gradient_accumulation_steps=6 × 2 GPUs = 48 prompts/step with
+# 8 rollouts each = 384 completions. verl cannot match 48 prompts directly
+# (OOM without gradient accumulation), so we use 6 prompts/step. The GRPO
+# group-advantage normalization operates per-prompt regardless of batch size.
 TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-6}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-$((16 * N_GPUS))}"
 MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
@@ -63,7 +71,7 @@ if (( N_GPUS % ROLLOUT_TENSOR_PARALLEL_SIZE != 0 )); then
 fi
 ROLLOUT_DATA_PARALLEL_SIZE="$((N_GPUS / ROLLOUT_TENSOR_PARALLEL_SIZE))"
 ROLLOUT_CALCULATE_LOG_PROBS="${ROLLOUT_CALCULATE_LOG_PROBS:-True}"
-RANKGRPO_BYPASS_OLD_LOG_PROB="${RANKGRPO_BYPASS_OLD_LOG_PROB:-True}"
+RANKGRPO_BYPASS_OLD_LOG_PROB="${RANKGRPO_BYPASS_OLD_LOG_PROB:-False}"
 USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
 USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-False}"
 ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-False}"
@@ -72,14 +80,28 @@ ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-False}"
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-False}"
 ROLLOUT_ENABLE_SLEEP_MODE="${ROLLOUT_ENABLE_SLEEP_MODE:-${ROLLOUT_FREE_CACHE_ENGINE}}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.001}"
+# verl's low_var_kl = k3 estimator = exp(ref-log)- (ref-log) - 1.
+# This matches the reference Rank-GRPO trainer's KL computation exactly.
+KL_LOSS_TYPE="${KL_LOSS_TYPE:-low_var_kl}"
+# seq-mean-token-mean = equal weight per sequence (reference behavior).
+# token-mean = longer sequences dominate. Match the reference TRL trainer.
+LOSS_AGG_MODE="${LOSS_AGG_MODE:-seq-mean-token-mean}"
+APPLY_EXTRA_LENGTH_SHAPING="${APPLY_EXTRA_LENGTH_SHAPING:-True}"
+END_OF_LIST_REWARD="${END_OF_LIST_REWARD:-0.1}"
+EXTRA_TOKEN_PENALTY="${EXTRA_TOKEN_PENALTY:--0.1}"
+EARLY_STOP_PENALTY="${EARLY_STOP_PENALTY:--0.1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 ADAM_BETA1="${ADAM_BETA1:-0.9}"
 ADAM_BETA2="${ADAM_BETA2:-0.99}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
-PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.06}"
-PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
-FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp}"
+PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.2}"
+PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
+# Match TRL's default epsilon=0.2 (clip range [0.8, 1.2]). The reference
+# trainer does not use dual-clip PPO. Set clip_ratio_c to a large value so
+# the min() always picks the standard PPO clip branch.
+PPO_CLIP_RATIO_C="${PPO_CLIP_RATIO_C:-1e6}"
+FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp2}"
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-False}"
 SEED="${SEED:-3407}"
@@ -127,6 +149,7 @@ VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-1600}"
 LOGGER_BACKENDS="${LOGGER_BACKENDS:-[tensorboard]}"
 REMOVE_PREVIOUS_CKPT_IN_SAVE="${REMOVE_PREVIOUS_CKPT_IN_SAVE:-False}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
+VERL_GR_DEBUG="${VERL_GR_DEBUG:-0}"
 
 mkdir -p "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 
@@ -167,10 +190,12 @@ echo "Rank-GRPO bypass old log prob: ${RANKGRPO_BYPASS_OLD_LOG_PROB}"
 echo "Remove padding/fused kernels/activation offload: ${USE_REMOVE_PADDING}/${USE_FUSED_KERNELS}/${ENABLE_ACTIVATION_OFFLOAD}"
 echo "Training data parallel size: ${N_GPUS}"
 echo "Learning rate: ${LEARNING_RATE}"
+echo "Length shaping (apply/end/overflow/early): ${APPLY_EXTRA_LENGTH_SHAPING}/${END_OF_LIST_REWARD}/${EXTRA_TOKEN_PENALTY}/${EARLY_STOP_PENALTY}"
 echo "Save/test freq: ${SAVE_FREQ}/${TEST_FREQ}"
 echo "Logging steps: ${LOGGING_STEPS}"
 echo "Validation generations to log: ${VAL_LOG_GENERATIONS}"
 echo "Best checkpoint pruning: enable=${BEST_CKPT_PRUNE_ENABLE}, keep=${BEST_CKPTS_TO_KEEP}, metric=${BEST_CKPT_METRIC}"
+echo "Debug mode: ${VERL_GR_DEBUG}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray temp dir: ${RAY_TMPDIR}"
 echo "Ray CPUs/object store/dashboard: ${RAY_NUM_CPUS}/${RAY_OBJECT_STORE_MEMORY}/${RAY_INCLUDE_DASHBOARD}"
@@ -216,6 +241,7 @@ done
   actor_rollout_ref.actor.clip_ratio="${PPO_CLIP_RATIO}" \
   actor_rollout_ref.actor.clip_ratio_low="${PPO_CLIP_RATIO}" \
   actor_rollout_ref.actor.clip_ratio_high="${PPO_CLIP_RATIO_HIGH}" \
+  actor_rollout_ref.actor.clip_ratio_c="${PPO_CLIP_RATIO_C}" \
   actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
   actor_rollout_ref.actor.optim.lr_warmup_steps="${LR_WARMUP_STEPS}" \
   actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
@@ -243,6 +269,8 @@ done
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
   actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
+  actor_rollout_ref.actor.kl_loss_type="${KL_LOSS_TYPE}" \
+  actor_rollout_ref.actor.loss_agg_mode="${LOSS_AGG_MODE}" \
   actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_gr.recipes.rankgrpo.rankgrpo_agent_loop.RankGRPOAgentLoopManager \
   actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent \
   algorithm.rollout_correction.bypass_mode="${RANKGRPO_BYPASS_OLD_LOG_PROB}" \
@@ -250,6 +278,10 @@ done
   algorithm.rollout_correction.rollout_rs=null \
   algorithm.rollout_correction.loss_type=ppo_clip \
   algorithm.rank_grpo.importance_sampling_level=item \
+  algorithm.rank_grpo.apply_extra_length_shaping="${APPLY_EXTRA_LENGTH_SHAPING}" \
+  algorithm.rank_grpo.end_of_list_reward="${END_OF_LIST_REWARD}" \
+  algorithm.rank_grpo.extra_token_penalty="${EXTRA_TOKEN_PENALTY}" \
+  algorithm.rank_grpo.early_stop_penalty="${EARLY_STOP_PENALTY}" \
   trainer.n_gpus_per_node="${N_GPUS}" \
   trainer.nnodes="${N_NODES}" \
   trainer.project_name="${PROJECT_NAME}" \
@@ -268,13 +300,18 @@ done
   trainer.best_ckpt_metric="${BEST_CKPT_METRIC}" \
   trainer.logger="${LOGGER_BACKENDS}" \
   trainer.remove_previous_ckpt_in_save="${REMOVE_PREVIOUS_CKPT_IN_SAVE}" \
-  ray_kwargs.ray_init.num_cpus="${RAY_NUM_CPUS}" \
-  +ray_kwargs.ray_init.object_store_memory="${RAY_OBJECT_STORE_MEMORY}" \
-  +ray_kwargs.ray_init.include_dashboard="${RAY_INCLUDE_DASHBOARD}" \
-  +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
-  +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD="'${VLLM_WORKER_MULTIPROC_METHOD}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE="'${NCCL_IB_DISABLE:-1}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_DEBUG="'${VERL_GR_DEBUG}'" \
+  $(  # Ray cluster-creation args — only when we aren't connecting to a pre-existing cluster
+    if [[ -z "${RAY_ADDRESS:-}" ]]; then
+      echo "ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS}"
+      echo "+ray_kwargs.ray_init.object_store_memory=${RAY_OBJECT_STORE_MEMORY}"
+      echo "+ray_kwargs.ray_init.include_dashboard=${RAY_INCLUDE_DASHBOARD}"
+      echo "+ray_kwargs.ray_init._temp_dir=${RAY_TMPDIR}"
+      echo "+ray_kwargs.ray_init.object_spilling_directory=${RAY_SPILL_DIR}"
+    fi
+  ) \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \
   actor_rollout_ref.ref.strategy="${FSDP_STRATEGY}" \
   actor_rollout_ref.actor.strategy="${FSDP_STRATEGY}" \

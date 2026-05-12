@@ -13,6 +13,7 @@ from verl import DataProto
 from verl.trainer.ppo import core_algos
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
+
 from verl.utils import tensordict_utils as tu
 from verl.utils.torch_functional import masked_mean
 from verl.workers.utils.padding import left_right_2_no_padding
@@ -324,9 +325,28 @@ class RLTrainer(RayPPOTrainerBase):
         if expected_lr is not None:
             metrics["actor/lr"] = expected_lr
 
+    _drift_checked_at = set()
+
     def _update_actor(self, batch: DataProto) -> DataProto:
         actor_output = super()._update_actor(batch)
         self._add_actor_lr_metrics(actor_output.meta_info["metrics"])
+
+        # Measure parameter drift from SFT at milestones 10, 50, 150, 300.
+        # Controlled by VERL_GR_DEBUG=1 (off by default).
+        if os.environ.get("VERL_GR_DEBUG", "0") == "1":
+            step = self.global_steps
+            if step in {10, 50, 150, 300} and step not in self._drift_checked_at:
+                self._drift_checked_at.add(step)
+                try:
+                    result = self.actor_rollout_wg.debug_param_drift_from_init()
+                    drift = result.get("total_drift_l2", -1)
+                    rel = result.get("relative_drift", -1)
+                    print(f"[PARAM_DRIFT] step={step} total_drift_l2={drift:.6f} relative_drift={rel:.8f}")
+                    for layer in result.get("top_layers", []):
+                        print(f"[PARAM_DRIFT] step={step} layer={layer['layer']} drift_l2={layer['drift_l2']:.6f}")
+                except Exception as e:
+                    print(f"[PARAM_DRIFT] step={step} check failed: {e}")
+
         return actor_output
 
     def _compute_eval_actor_metrics(self, batch: DataProto) -> dict[str, Any]:

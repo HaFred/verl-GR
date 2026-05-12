@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
+import numpy as np
 import torch
 from verl import DataProto
 
@@ -77,6 +78,13 @@ def _segment_rank_tokens(
     return seg_ids, rank_token_mask
 
 
+def _compute_eos_mask(responses: torch.Tensor, response_mask: torch.Tensor, tokenizer) -> torch.Tensor:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        return torch.zeros_like(response_mask, dtype=torch.bool)
+    return response_mask.bool() & responses.eq(int(eos_token_id))
+
+
 def compute_rank_grpo_advantage(
     data: DataProto,
     *,
@@ -94,6 +102,10 @@ def compute_rank_grpo_advantage(
     exclude_seen = bool(_cfg_get(rank_cfg, "exclude_seen", True))
     normalize_by_std = bool(_cfg_get(rank_cfg, "normalize_by_std", norm_adv_by_std_in_grpo))
     gt_catalog_path = _cfg_get(rank_cfg, "gt_catalog_path", None)
+    apply_extra_length_shaping = bool(_cfg_get(rank_cfg, "apply_extra_length_shaping", True))
+    end_of_list_reward = float(_cfg_get(rank_cfg, "end_of_list_reward", 0.1))
+    extra_token_penalty = float(_cfg_get(rank_cfg, "extra_token_penalty", -0.1))
+    early_stop_penalty = float(_cfg_get(rank_cfg, "early_stop_penalty", -0.1))
 
     responses = data.batch["responses"]
     response_mask = data.batch["response_mask"]
@@ -142,9 +154,41 @@ def compute_rank_grpo_advantage(
     clamped_seg_ids = seg_ids.clamp(min=0, max=rec_num - 1)
     token_advantages = rank_advantages.gather(1, clamped_seg_ids)
     token_advantages = token_advantages * rank_token_mask.float()
+    overflow_token_mask = response_mask.bool() & (seg_ids >= rec_num)
+
+    # Zero out EOS token base advantages — reference rank_grpo_trainer L1868.
+    # EOS tokens receive explicit reward/penalty via length shaping instead of
+    # carrying the per-item advantage of the position they happen to land on.
+    eos_mask = _compute_eos_mask(responses, response_mask, tokenizer)
+    token_advantages = token_advantages * (~eos_mask).float()
+
+    if apply_extra_length_shaping:
+        valid_seg_ids = seg_ids.masked_fill(~response_mask.bool(), -1)
+        items_emitted = valid_seg_ids.max(dim=1).values.add(1).clamp(min=0)
+
+        terminated_with_eos = eos_mask.any(dim=1)
+        has_overflow = overflow_token_mask.any(dim=1)
+        exact_len = (items_emitted >= rec_num) & (~has_overflow) & terminated_with_eos
+        early_stop = (items_emitted < rec_num) & terminated_with_eos
+
+        token_advantages = token_advantages + extra_token_penalty * overflow_token_mask.float()
+        if exact_len.any():
+            token_advantages = token_advantages + exact_len.float().unsqueeze(1) * (
+                end_of_list_reward * eos_mask.float()
+            )
+        if early_stop.any():
+            token_advantages = token_advantages + early_stop.float().unsqueeze(1) * (
+                early_stop_penalty * eos_mask.float()
+            )
 
     data.batch["advantages"] = token_advantages
     data.batch["returns"] = token_advantages
     data.batch["rank_token_mask"] = rank_token_mask
+    data.batch["item_token_mask"] = rank_token_mask | overflow_token_mask
     data.batch["rank_seg_ids"] = seg_ids
+
+    # ---- Reward statistics for metrics ----
+    data.non_tensor_batch["rank_reward_sum"] = np.array(rank_rewards.sum(dim=1).cpu().tolist())
+    data.non_tensor_batch["rank_reward_mean"] = np.array(rank_rewards.mean(dim=1).cpu().tolist())
+
     return data

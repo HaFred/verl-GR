@@ -57,14 +57,16 @@ actor_rollout_ref:
       ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
 
   actor:
+    entropy_coeff: 0.0  # TRL Rank-GRPO reference uses no entropy bonus (PPO default is also 0)
     entropy_checkpointing: true
-    clip_ratio_high: 0.08
+    clip_ratio_high: 0.2
     use_dynamic_bsz: true
     ppo_mini_batch_size: 6
     ppo_max_token_len_per_gpu: 40960
     use_kl_loss: true
     kl_loss_coef: 0.001
-    kl_loss_type: low_var_kl
+    kl_loss_type: low_var_kl  # verl's k3 estimator: exp(ref-log) - (ref-log) - 1, same as reference TRL
+    loss_agg_mode: seq-mean-token-mean  # match reference: equal weight per sequence, not per token
     optim:
       lr: 1e-6
       lr_warmup_steps: 0
@@ -132,12 +134,17 @@ algorithm:
     normalize_by_std: true
     year_tolerance: 2
     exclude_seen: true
+    apply_extra_length_shaping: true
+    end_of_list_reward: 0.1
+    extra_token_penalty: -0.1
+    early_stop_penalty: -0.1
     gt_catalog_path: null
     importance_sampling_level: item
+    loss_mode: trl_match  # trl_match = matches TRL reference; verl_default = dual-clip PPO path
   rollout_correction:
     rollout_is: null
     rollout_rs: null
-    bypass_mode: true
+    bypass_mode: false
     loss_type: ppo_clip
 
 trainer:
