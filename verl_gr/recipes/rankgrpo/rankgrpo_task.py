@@ -18,6 +18,12 @@ class RankGRPOTask(RecipeTaskRuntime):
     def prepare(self, config) -> dict[str, Any]:
         with open_dict(config.actor_rollout_ref):
             config.actor_rollout_ref.rank_grpo = config.algorithm.get("rank_grpo", {}) or {}
+
+        actor_strategy = self._ensure_role_strategy(config, "actor")
+        if actor_strategy == "ddp":
+            # Side-effect: register DDP engine with verl's EngineRegistry
+            import verl_gr.workers.engine.ddp  # noqa: F401
+
         return super().prepare(config)
 
     def get_actor_rollout_ref_worker(self, config):

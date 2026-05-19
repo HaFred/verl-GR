@@ -40,6 +40,30 @@ class RecipeTaskRuntime:
         self._rollout_counts_expanded = False
 
     @staticmethod
+    def _cfg_keys(node) -> list[str]:
+        if node is None or not hasattr(node, "keys"):
+            return []
+        try:
+            return sorted(str(key) for key in node.keys())
+        except Exception:
+            return []
+
+    @staticmethod
+    def _strategy_debug_snapshot(role_name: str, role_cfg) -> dict[str, Any]:
+        engine_cfg = None
+        if role_cfg is not None:
+            engine_cfg = role_cfg.get("engine_config") or role_cfg.get("engine") or {}
+        return {
+            "role": role_name,
+            "role_target": None if role_cfg is None else role_cfg.get("_target_", None),
+            "role_strategy": None if role_cfg is None else role_cfg.get("strategy", None),
+            "engine_target": None if not engine_cfg else engine_cfg.get("_target_", None),
+            "engine_strategy": None if not engine_cfg else engine_cfg.get("strategy", None),
+            "role_keys": RecipeTaskRuntime._cfg_keys(role_cfg),
+            "engine_keys": RecipeTaskRuntime._cfg_keys(engine_cfg),
+        }
+
+    @staticmethod
     def _normalize_layer_wrap_value(value):
         if isinstance(value, str):
             return [value]
@@ -59,13 +83,53 @@ class RecipeTaskRuntime:
             return None
         return value
 
+    @staticmethod
+    def _infer_role_strategy(role_cfg) -> str:
+        """Infer backend strategy from explicit field, engine config, or target."""
+        if role_cfg is None:
+            return ""
+        strategy = str(role_cfg.get("strategy", "") or "").lower()
+        if strategy:
+            return strategy
+
+        engine_cfg = role_cfg.get("engine_config") or role_cfg.get("engine") or {}
+        strategy = str(engine_cfg.get("strategy", "") or "").lower()
+        if strategy:
+            return strategy
+
+        engine_target = str(engine_cfg.get("_target_", "") or "").lower()
+        if "ddpengineconfig" in engine_target:
+            return "ddp"
+        if "fsdpengineconfig" in engine_target:
+            return "fsdp"
+
+        target = str(role_cfg.get("_target_", "") or "").lower()
+        if "ddpactorconfig" in target:
+            return "ddp"
+        if "fsdpactorconfig" in target:
+            return "fsdp"
+        if "mcoreactorconfig" in target or "megatron" in target:
+            return "megatron"
+        return ""
+
+    def _ensure_role_strategy(self, config, role_name: str) -> str:
+        actor_rollout_ref = config.get("actor_rollout_ref")
+        if actor_rollout_ref is None:
+            return ""
+        role_cfg = actor_rollout_ref.get(role_name)
+        strategy = self._infer_role_strategy(role_cfg)
+        if role_cfg is not None and strategy and role_cfg.get("strategy") is None:
+            with open_dict(role_cfg):
+                role_cfg.strategy = strategy
+        return strategy
+
     def sanitize_fsdp2_wrap_policy(self, config) -> None:
         actor_rollout_ref = config.get("actor_rollout_ref")
         if actor_rollout_ref is None:
             return
         for role_name in ("actor", "ref"):
             role_cfg = actor_rollout_ref.get(role_name)
-            if role_cfg is None or str(role_cfg.get("strategy", "")) != "fsdp2":
+            if role_cfg is None or self._ensure_role_strategy(config, role_name) != "fsdp2":
                 continue
             fsdp_cfg = role_cfg.get("fsdp_config")
             if fsdp_cfg is None:
@@ -112,7 +176,7 @@ class RecipeTaskRuntime:
             return
         for role_name in ("actor", "ref"):
             role_cfg = actor_rollout_ref.get(role_name)
-            if role_cfg is None or str(role_cfg.get("strategy", "fsdp")) not in {"fsdp", "fsdp2"}:
+            if role_cfg is None or self._ensure_role_strategy(config, role_name) not in {"fsdp", "fsdp2"}:
                 continue
             with open_dict(role_cfg):
                 fsdp_cfg = role_cfg.get("fsdp_config")
@@ -143,16 +207,54 @@ class RecipeTaskRuntime:
             trust_remote_code=trust_remote_code,
         )
 
-        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
+        actor_strategy = self._ensure_role_strategy(config, "actor")
+        if actor_strategy in {"fsdp", "fsdp2", "ddp"}:
+            # Side-effect: register DDP engine with verl's EngineRegistry
+            if actor_strategy == "ddp":
+                import verl_gr.workers.engine.ddp  # noqa: F401
+                # DDPActorConfig has engine_config, not fsdp_config.
+                # Strip fsdp_config and ref-specific log_prob fields inherited
+                # from the base ppo_trainer config so Hydra instantiation
+                # doesn't pass them as unexpected kwargs.
+                # The actor and ref inherit log_prob_* fields from the base
+                # ppo_trainer config, but DDPActorConfig doesn't know about
+                # these legacy keys.  Strip them from the actor to avoid
+                # unexpected-kwarg errors at instantiation.  Keep them on
+                # the ref because init_model pops them to populate
+                # use_dynamic_bsz / ppo_max_token_len_per_gpu etc.
+                _ddp_strip_actor_keys = (
+                    "fsdp_config",
+                    "log_prob_micro_batch_size",
+                    "log_prob_micro_batch_size_per_gpu",
+                    "log_prob_use_dynamic_bsz",
+                    "log_prob_max_token_len_per_gpu",
+                )
+                _ddp_strip_ref_keys = (
+                    "fsdp_config",
+                    "log_prob_micro_batch_size",
+                    "log_prob_micro_batch_size_per_gpu",
+                )
+                _ddp_strip_map = {"actor": _ddp_strip_actor_keys, "ref": _ddp_strip_ref_keys}
+                for role_name in ("actor", "ref"):
+                    role_cfg = config.actor_rollout_ref.get(role_name)
+                    if role_cfg is not None:
+                        with open_dict(role_cfg):
+                            for key in _ddp_strip_map[role_name]:
+                                if key in role_cfg:
+                                    del role_cfg[key]
             ray_worker_group_cls = RayWorkerGroup
             actor_rollout_cls = self.get_actor_rollout_ref_worker(config)
             critic_worker = TrainingWorker
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
+        elif actor_strategy == "megatron":
             ray_worker_group_cls = RayWorkerGroup
             actor_rollout_cls = self.get_actor_rollout_ref_worker(config)
             critic_worker = TrainingWorker
         else:
-            raise NotImplementedError(f"Unknown strategy: {config.actor_rollout_ref.actor.strategy}")
+            snapshot = self._strategy_debug_snapshot("actor", config.actor_rollout_ref.get("actor"))
+            raise NotImplementedError(
+                f"Unknown strategy: {actor_strategy or '<missing>'}. "
+                f"actor_rollout_ref.actor signals={snapshot}"
+            )
 
         return {
             "tokenizer": tokenizer,

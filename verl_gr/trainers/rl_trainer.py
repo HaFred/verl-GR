@@ -172,6 +172,50 @@ class RLTrainer(RayPPOTrainerBase):
 
             ray_trainer_mod.compute_advantage = compute_advantage
 
+    def _compute_old_log_prob(self, batch: DataProto):
+        from verl import DataProto as DP
+        from verl.utils import tensordict_utils as tu
+        from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
+
+        batch_td = batch.to_tensordict()
+        batch_td = left_right_2_no_padding(batch_td)
+        calculate_entropy = self.config.actor_rollout_ref.actor.get("calculate_entropy", False) or (
+            self.config.actor_rollout_ref.actor.entropy_coeff != 0.0
+        )
+        tu.assign_non_tensor(batch_td, calculate_entropy=calculate_entropy, compute_loss=False)
+        output = self.actor_rollout_wg.compute_log_prob(batch_td)
+        entropy = tu.get(output, "entropy")
+        log_probs = tu.get(output, "log_probs")
+        routed_experts = tu.get(output, "routed_experts")
+
+        old_log_prob_mfu = tu.get(output, "metrics")["mfu"]
+        if entropy is not None:
+            entropy = no_padding_2_padding(entropy, batch_td)
+        log_probs = no_padding_2_padding(log_probs, batch_td)
+        if routed_experts is not None:
+            routed_experts = no_padding_2_padding(routed_experts, batch_td)
+
+        if entropy is not None and routed_experts is not None:
+            old_log_prob = tu.get_tensordict({
+                "old_log_probs": log_probs.float(),
+                "entropys": entropy.float(),
+                "routed_experts": routed_experts,
+            })
+        elif entropy is not None:
+            old_log_prob = tu.get_tensordict({
+                "old_log_probs": log_probs.float(),
+                "entropys": entropy.float(),
+            })
+        elif routed_experts is not None:
+            old_log_prob = tu.get_tensordict({
+                "old_log_probs": log_probs.float(),
+                "routed_experts": routed_experts,
+            })
+        else:
+            old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float()})
+        old_log_prob = DP.from_tensordict(old_log_prob)
+        return old_log_prob, old_log_prob_mfu
+
     def fit(self):
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
         ray_trainer_mod, original_tqdm, progress_tqdm_cls = self._install_latency_adjusted_tqdm()

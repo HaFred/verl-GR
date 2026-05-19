@@ -102,6 +102,20 @@ PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
 # the min() always picks the standard PPO clip branch.
 PPO_CLIP_RATIO_C="${PPO_CLIP_RATIO_C:-1e6}"
 FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp2}"
+ENGINE_FAMILY="${ENGINE_FAMILY:-}"
+_NON_DEFAULT_ENGINE_FAMILY=0
+if [[ -n "${ENGINE_FAMILY}" ]]; then
+  _NON_DEFAULT_ENGINE_FAMILY=1
+fi
+if [[ "${_NON_DEFAULT_ENGINE_FAMILY}" == "0" ]]; then
+  ENGINE_FAMILY="${FSDP_STRATEGY}"
+fi
+# DDP backend defaults: no remove-padding (padding-based batching), no fused
+# kernels (fused kernels are FSDP-specific).
+if [[ "${ENGINE_FAMILY}" == "ddp" ]]; then
+  : "${USE_REMOVE_PADDING:=False}"
+  : "${USE_FUSED_KERNELS:=False}"
+fi
 USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-False}"
 SEED="${SEED:-3407}"
@@ -316,5 +330,21 @@ done
   actor_rollout_ref.ref.strategy="${FSDP_STRATEGY}" \
   actor_rollout_ref.actor.strategy="${FSDP_STRATEGY}" \
   critic.enable=False \
+  $(if [[ "${ENGINE_FAMILY}" == "ddp" ]]; then
+      echo "++actor_rollout_ref.actor._target_=verl_gr.workers.config.ddp_engine.DDPActorConfig"
+      echo "++actor_rollout_ref.actor.strategy=ddp"
+      echo "++actor_rollout_ref.actor.engine_config._target_=verl_gr.workers.config.ddp_engine.DDPEngineConfig"
+      echo "++actor_rollout_ref.model.external_lib=verl_gr.workers.engine.ddp"
+      echo "actor_rollout_ref.ref.strategy=ddp"
+      echo "actor_rollout_ref.ref._target_=verl_gr.workers.config.ddp_engine.DDPActorConfig"
+      echo "++actor_rollout_ref.ref.engine_config._target_=verl_gr.workers.config.ddp_engine.DDPEngineConfig"
+      echo "++actor_rollout_ref.ref.engine_config.forward_only=true"
+      echo "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true"
+      if [[ -n "${GRADIENT_ACCUMULATION_STEPS:-}" && "${GRADIENT_ACCUMULATION_STEPS}" -gt 1 ]]; then
+        echo "++actor_rollout_ref.actor.engine_config.gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
+        echo "++actor_rollout_ref.ref.engine_config.gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
+      fi
+    fi
+  ) \
   "$@"
 
