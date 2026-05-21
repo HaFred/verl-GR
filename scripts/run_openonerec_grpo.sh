@@ -7,7 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
 PROJECT_ROOT="$(dirname "${VERL_GR_ROOT}")"
-OPENONEREC_RECIPE_PATH="${PROJECT_ROOT}/verl-GR/verl_gr/recipes/openonerec/onerec_recipe.py"
+# Prefer an explicit override so that forked repos (like verl_gr_fork_static_integra)
+# can use their own in-tree recipe without requiring a sibling verl-GR checkout.
+OPENONEREC_RECIPE_PATH="${OPENONEREC_RECIPE_PATH:-${VERL_GR_ROOT}/verl_gr/recipes/openonerec/onerec_recipe.py}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
@@ -101,9 +103,11 @@ export WANDB_MODE
 export RAY_TMPDIR
 export TMPDIR="${RAY_TMPDIR}"
 export VERL_ZMQ_SOCKET_PREFIX
+export GMV_REWARD="${GMV_REWARD:-0}"
 
 echo "==================================="
 echo "OpenOneRec GRPO (verl-GR runtime)"
+echo "  GMV scoring: $([ "${GMV_REWARD:-0}" = "1" ] && echo 'ENABLED (price×funnel NDCG)' || echo 'disabled (legacy SID matching)')"
 echo "==================================="
 echo "Cluster: ${N_NODES} node(s) x ${N_GPUS} GPU(s)"
 echo "Model: ${BASE_MODEL}"

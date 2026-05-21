@@ -317,6 +317,7 @@ done
   +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD="'${VLLM_WORKER_MULTIPROC_METHOD}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE="'${NCCL_IB_DISABLE:-1}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_DEBUG="'${VERL_GR_DEBUG}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="'${PYTHONPATH:-}'" \
   $(  # Ray cluster-creation args — only when we aren't connecting to a pre-existing cluster
     if [[ -z "${RAY_ADDRESS:-}" ]]; then
       echo "ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS}"

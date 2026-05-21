@@ -86,7 +86,30 @@ def extract_prompt_fields(
 
     ground_truth_message = clean_chats[-1]["content"]
     row[prompt_key] = prompt_messages
-    row["reward_model"] = {"ground_truth": ground_truth_message, "style": "rule"}
+
+    reward = {"ground_truth": ground_truth_message, "style": "rule"}
+
+    # GMV-enriched metadata passthrough: parse task type and reward annotations
+    # from the metadata JSON column (set by the data curation pipeline).
+    meta_raw = row.get("metadata", "{}")
+    try:
+        import json as _json
+
+        meta = _json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+    except (_json.JSONDecodeError, TypeError):
+        meta = {}
+    if meta.get("task"):
+        reward["task"] = meta["task"]
+    if meta.get("rank_labels"):
+        reward["rank_labels"] = meta["rank_labels"]
+    if meta.get("price") is not None:
+        reward["price"] = meta["price"]
+    if meta.get("price_tier"):
+        reward["price_tier"] = meta["price_tier"]
+    if meta.get("label") is not None:
+        reward["label"] = meta["label"]
+
+    row["reward_model"] = reward
     return row
 
 
@@ -363,6 +386,21 @@ class OneRecDataset(Dataset):
         row["index"] = extra_info.get("index", index)
         row["tools_kwargs"] = extra_info.get("tools_kwargs", {})
         row["interaction_kwargs"] = extra_info.get("interaction_kwargs", {})
+
+        # GMV metadata passthrough: surface task/price/funnel fields from the
+        # parquet `metadata` column so that compute_score can dispatch on them.
+        meta_raw = row.get("metadata", "{}")
+        try:
+            import json as _json
+
+            meta = _json.loads(meta_raw) if isinstance(meta_raw, str) else (meta_raw or {})
+        except (_json.JSONDecodeError, TypeError):
+            meta = {}
+        for key in ("task", "rank_labels", "price", "price_tier", "label"):
+            if key in meta:
+                extra_info[key] = meta[key]
+        row["extra_info"] = extra_info
+
         if "source" not in row and "data_source" not in row:
             row["data_source"] = "unknown"
             logger.warning("No source/data_source field found for index %s, set to 'unknown'", row["index"])
@@ -548,7 +586,20 @@ def compute_score(
     ground_truth: str,
     extra_info: dict[str, Any],  # noqa: ARG001
 ) -> dict[str, float]:
+    task = extra_info.get("task")
     prediction = solution_str
+
+    # GMV_REWARD=1 enables price×funnel NDCG rewards for enriched data.
+    # Without it, even GMV-annotated samples fall through to legacy SID matching.
+    if os.environ.get("GMV_REWARD", "0") == "1":
+        if task == "ranked_product":
+            return _compute_ndcg_score(prediction, ground_truth, extra_info)
+        if task == "purchase_pred":
+            return _compute_purchase_score(prediction, ground_truth, extra_info)
+        if task == "cot_reason":
+            return _compute_cot_score(prediction, ground_truth, extra_info)
+
+    # Legacy path — pure SID matching (current RecIF_ProductRec data)
     format_reward_value = think_format_reward(prediction)
     partial_hit_reward_value = partial_hit_reward(prediction, ground_truth)
     hit_reward_value = hit_reward(prediction, ground_truth)
@@ -562,5 +613,155 @@ def compute_score(
         "hit_reward": hit_reward_value,
         "pass_rate": pass_rate_value,
         "pass_at_1": pass_at_1_value,
+    }
+
+
+def _extract_sids_ordered(text: str) -> list[str]:
+    """Extract SID strings in order of first appearance (for NDCG ranking)."""
+    seen: set[str] = set()
+    sids: list[str] = []
+    for match in SLOT_PATTERN.finditer(text):
+        sid = f"<|sid_begin|>{match.group(0)}<|sid_end|>"
+        if sid not in seen:
+            seen.add(sid)
+            sids.append(sid)
+    return sids
+
+
+def _ndcg_at_k(
+    pred_sids: list[str],
+    gt_sids: list[str],
+    rank_labels: list[dict[str, Any]],
+    k: int,
+) -> float:
+    """NDCG@K with price×funnel relevance.
+
+    rank_labels are aligned with gt_sids: rank_labels[i] is the metadata for gt_sids[i].
+    relevance = funnel_score × log(1 + price) / log(1 + max_price)
+    """
+    import math
+
+    if not pred_sids or not gt_sids or not rank_labels:
+        return 0.0
+
+    # Build gt_sid → relevance mapping
+    max_price = max(
+        (label.get("price", 0) or 0) for label in rank_labels
+    )
+    if max_price <= 0:
+        max_price = 10000.0
+
+    gt_relevance: dict[str, float] = {}
+    for sid, label in zip(gt_sids, rank_labels):
+        price = label.get("price", 0) or 0
+        funnel = label.get("funnel", 0) or 0
+        pw = math.log(1 + price) / math.log(1 + max_price) if price > 0 else 0.0
+        gt_relevance[sid] = funnel * pw
+
+    gt_set = set(gt_sids)
+
+    # DCG: sum of relevance at each position, discounted
+    dcg = 0.0
+    for i, sid in enumerate(pred_sids[:k]):
+        rel = gt_relevance.get(sid, 0.0)
+        dcg += rel / math.log2(i + 2)
+
+    # IDCG: ideal ordering (sorted by relevance descending)
+    ideal_rels = sorted(gt_relevance.values(), reverse=True)[:k]
+    idcg = sum(rel / math.log2(i + 2) for i, rel in enumerate(ideal_rels))
+
+    return dcg / idcg if idcg > 0 else 0.0
+
+
+def _compute_ndcg_score(
+    prediction: str,
+    ground_truth: str,
+    extra_info: dict[str, Any],
+) -> dict[str, float]:
+    rank_labels = extra_info.get("rank_labels", [])
+    pred_sids = _extract_sids_ordered(_extract_sid_region(prediction))
+    gt_sids = _extract_sids_ordered(ground_truth)
+
+    if not pred_sids or not gt_sids or not rank_labels:
+        return {
+            "score": 0.0,
+            "format_reward": think_format_reward(prediction),
+            "hit_reward": 0.0,
+            "pass_at_1": 0.0,
+            "ndcg@16": 0.0,
+            "ndcg@32": 0.0,
+        }
+
+    format_r = think_format_reward(prediction)
+    hit_r = hit_reward(prediction, ground_truth)
+    pass1_r = first_sid_hit_reward(prediction, ground_truth)
+    ndcg_16 = _ndcg_at_k(pred_sids, gt_sids, rank_labels, k=16)
+    ndcg_32 = _ndcg_at_k(pred_sids, gt_sids, rank_labels, k=32)
+
+    # Composite score: 0.2 × pass@1 + 0.8 × NDCG@32
+    score = 0.2 * pass1_r + 0.8 * ndcg_32
+
+    return {
+        "score": score,
+        "format_reward": format_r,
+        "hit_reward": hit_r,
+        "pass_at_1": pass1_r,
+        "ndcg@16": ndcg_16,
+        "ndcg@32": ndcg_32,
+    }
+
+
+def _compute_purchase_score(
+    prediction: str,
+    ground_truth: str,
+    extra_info: dict[str, Any],
+) -> dict[str, float]:
+    """Binary purchase prediction reward weighted by item price."""
+    import math
+
+    label = extra_info.get("label", 0)
+    price = extra_info.get("price", 0) or 0
+
+    # Parse prediction: check if model says "会购买" vs "不会购买"
+    pred_text = prediction.strip()
+    predicted_no = "不购买" in pred_text or "不会购买" in pred_text or "不买" in pred_text
+    predicted_yes = ("会购买" in pred_text or "购买" in pred_text[:100]) and not predicted_no
+
+    correct = (predicted_yes and label == 1) or (not predicted_yes and label == 0)
+
+    # Price-weighted score
+    max_price = 10000.0
+    pw = math.log(1 + price) / math.log(1 + max_price) if price > 0 else 0.3
+    score = pw if correct else 0.0
+
+    return {
+        "score": score,
+        "format_reward": think_format_reward(prediction),
+        "purchase_accuracy": float(correct),
+        "price_weight": pw,
+    }
+
+
+def _compute_cot_score(
+    prediction: str,
+    ground_truth: str,
+    extra_info: dict[str, Any],
+) -> dict[str, float]:
+    """CoT reasoning reward: think format + SID-correct weighted by price."""
+    import math
+
+    price = extra_info.get("price", 0) or 0
+    max_price = 10000.0
+    pw = math.log(1 + price) / math.log(1 + max_price) if price > 0 else 0.3
+
+    format_r = think_format_reward(prediction)
+    hit_r = hit_reward(prediction, ground_truth)
+    score = 0.3 * format_r + 0.7 * hit_r * pw
+
+    return {
+        "score": score,
+        "format_reward": format_r,
+        "hit_reward": hit_r,
+        "price_weight": pw,
     }
 
