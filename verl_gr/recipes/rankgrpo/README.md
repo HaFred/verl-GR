@@ -113,4 +113,4 @@ The fork achieves ~2.74s/step on 2× H800 (2,240 tokens/step) at convergence. Th
 | Implementation | Eval runtime | Frequency |
 |---------------|-------------|-----------|
 | Original | ~412s (mean) | Every 200 steps |
-| Fork | — | Only 1 eval point (step 40) |
+| Fork | ~364s (mean) | Every 200 steps (87 eval points over 17,570 steps) |
