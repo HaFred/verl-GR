@@ -341,6 +341,11 @@ done
       echo "++actor_rollout_ref.ref.engine_config._target_=verl_gr.workers.config.ddp_engine.DDPEngineConfig"
       echo "++actor_rollout_ref.ref.engine_config.forward_only=true"
       echo "actor_rollout_ref.ref.log_prob_use_dynamic_bsz=true"
+      # EngineConfig.infer_max_token_len_per_gpu defaults to None, which causes
+      # infer_batch to process the whole batch without splitting → OOM.
+      # Wire it to the same per-GPU token limit used everywhere else.
+      echo "++actor_rollout_ref.actor.engine_config.infer_max_token_len_per_gpu=${LOG_PROB_MAX_TOKENS_PER_GPU}"
+      echo "++actor_rollout_ref.ref.engine_config.infer_max_token_len_per_gpu=${LOG_PROB_MAX_TOKENS_PER_GPU}"
       if [[ -n "${GRADIENT_ACCUMULATION_STEPS:-}" && "${GRADIENT_ACCUMULATION_STEPS}" -gt 1 ]]; then
         echo "++actor_rollout_ref.actor.engine_config.gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"
         echo "++actor_rollout_ref.ref.engine_config.gradient_accumulation_steps=${GRADIENT_ACCUMULATION_STEPS}"

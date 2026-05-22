@@ -143,6 +143,8 @@ done
 
 # avoid conflicts: trainer.val_before_train=False needs to be false to avoid 2nd run of val_in_train, as now we have a built-in val run for keeping the ckpt top-k
 "${PYTHON_BIN}" -u -m verl_gr.trainers.main_ppo \
+  --config-path "${VERL_GR_ROOT}/configs/verl_gr/openonerec" \
+  --config-name grpo_trainer \
   data.train_files="${TRAIN_FILES}" \
   data.val_files="${VAL_FILES}" \
   data.enable_think="${ENABLE_THINK}" \

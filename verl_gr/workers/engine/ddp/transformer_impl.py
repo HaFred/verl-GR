@@ -293,6 +293,9 @@ class DDPEngine(FSDPEngine):
             return outputs
 
         # --- gradient accumulation path ---
+        from verl.utils.py_functional import append_to_dict
+        from verl.utils.tensordict_utils import chunk_tensordict
+
         batch_size = data.shape[0]
         if batch_size % accum_steps != 0:
             raise ValueError(
@@ -302,41 +305,33 @@ class DDPEngine(FSDPEngine):
 
         self.optimizer_zero_grad()
 
-        chunk_size = batch_size // accum_steps
-        all_metrics: dict[str, list[torch.Tensor]] = {}
-        total_loss = 0.0
-        total_count = 0
+        chunks = chunk_tensordict(data, chunks=accum_steps)
+        all_metrics: dict = {}
+        all_losses: list = []
+        model_output: dict = {}
 
-        for step_idx in range(accum_steps):
-            start = step_idx * chunk_size
-            chunk = data[start : start + chunk_size]
-
+        for chunk in chunks:
             outputs = self.forward_backward_batch(chunk, loss_function, forward_only=False)
 
-            # Accumulate metrics (sum or mean as appropriate)
-            for key, value in outputs.get("metrics", {}).items():
-                all_metrics.setdefault(key, []).append(value)
+            # Merge metrics using the same append_to_dict that postprocess_batch_func uses,
+            # which correctly handles Metric objects (includes Metric.extend for aggregation).
+            if "metrics" in outputs:
+                append_to_dict(all_metrics, outputs["metrics"])
 
-            # Accumulate loss for logging
             loss_vals = outputs.get("loss", [])
             if loss_vals:
-                total_loss += sum(l.item() if hasattr(l, "item") else l for l in loss_vals)
-                total_count += len(loss_vals)
+                all_losses.extend(loss_vals)
+
+            # Preserve model_output from the first chunk so the caller can pop it.
+            if not model_output:
+                model_output = outputs.get("model_output", {})
 
         grad_norm = self.optimizer_step()
 
-        # Merge metrics across accumulation chunks (mean)
-        merged_metrics: dict[str, torch.Tensor] = {}
-        for key, values in all_metrics.items():
-            stacked = torch.stack([v.detach() if isinstance(v, torch.Tensor) else v for v in values])
-            merged_metrics[key] = stacked.mean()
-
         if self.is_mp_src_rank_with_outputs():
-            merged_metrics["grad_norm"] = grad_norm
+            all_metrics["grad_norm"] = grad_norm
 
-        # Mean loss across accumulation steps for logging
-        loss_value = total_loss / max(total_count, 1)
-        return {"metrics": merged_metrics, "loss": [loss_value]}
+        return {"model_output": model_output, "metrics": all_metrics, "loss": all_losses}
 
     # ------------------------------------------------------------------
     # Overrides — optimizer
