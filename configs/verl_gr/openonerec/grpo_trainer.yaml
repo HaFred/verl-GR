@@ -95,7 +95,14 @@ actor_rollout_ref:
       top_k: 50
       n: 1
     custom:
+      score_sid_only: true
       beam_width: 32
+      progressive_cot:
+        enabled: true
+        start_max_tokens: 1024
+        end_max_tokens: 256
+        schedule: "linear"
+        total_steps: 2000
       two_stage_max_inflight_requests: 16  # Increased from default 8 for parallel stage-2
       validation_adaptive_concurrency: true
       validation_min_concurrent_requests: 64
@@ -103,6 +110,7 @@ actor_rollout_ref:
       validation_target_gpu_utilization: 85.0
       validation_gpu_util_tolerance: 7.5
       validation_concurrency_step: 32
+      weight_sync_interval: 4
       beam_search_params:
         max_tokens: 3
       decode_config:

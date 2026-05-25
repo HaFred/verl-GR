@@ -14,6 +14,7 @@ from verl_gr.third_party.vllm import BeamSearchParams, LoRARequest
 from verl_gr.workers.rollout.zmq_utils import build_zmq_handle
 from verl_gr.workers.rollout.beam_config import (
     BeamSearchConfig,
+    get_rollout_custom_value,
     resolve_beam_search_config,
     resolve_two_stage_decode_config,
 )
@@ -32,6 +33,8 @@ ServerAdapter = getattr(import_module("verl.workers.rollout.vllm_rollout.vllm_ro
 
 class TwoStagevLLMRollout(ServerAdapter):
     """Generate CoT first, then beam-search item outputs."""
+
+    _DEFAULT_WEIGHT_SYNC_INTERVAL = 4
 
     def __init__(self, *args, **kwargs):
         if {"config", "model_config", "device_mesh"}.issubset(kwargs):
@@ -52,6 +55,11 @@ class TwoStagevLLMRollout(ServerAdapter):
                 replica_rank=self.replica_rank,
                 local_rank=local_rank,
             )
+            self._weight_sync_interval = self._DEFAULT_WEIGHT_SYNC_INTERVAL
+            self._steps_since_sync = 0
+            ws_interval = get_rollout_custom_value(self.config, "weight_sync_interval", None)
+            if ws_interval is not None:
+                self._weight_sync_interval = max(1, int(ws_interval))
             return
 
         raise RuntimeError(
@@ -194,6 +202,11 @@ class TwoStagevLLMRollout(ServerAdapter):
 
     async def update_weights(self, weights, global_steps: int = None, **kwargs):
         """Abort two-stage requests before syncing weights through ServerAdapter."""
+        self._steps_since_sync += 1
+        if self._steps_since_sync < self._weight_sync_interval:
+            return
+
+        self._steps_since_sync = 0
         await self._execute_server_method("abort_all_requests", reset_prefix_cache=True)
         try:
             await super().update_weights(weights=weights, global_steps=global_steps, **kwargs)

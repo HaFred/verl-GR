@@ -29,6 +29,10 @@ from verl_gr.workers.rollout.beam_config import (
     get_rollout_custom_nested_value,
     get_rollout_custom_value,
 )
+from verl_gr.workers.rollout.progressive_cot import (
+    ProgressiveCoTConfig,
+    compute_current_cot_max_tokens,
+)
 
 
 @register("openonerec_two_stage_agent")
@@ -94,6 +98,28 @@ class OpenOneRecTwoStageAgentLoop(SingleTurnAgentLoop):
         result.extra_fields["extra_info"] = extra_info
         if "generated_items" in result.extra_fields:
             result.extra_fields["extra_info"]["generated_items"] = result.extra_fields["generated_items"]
+
+        # Track SID token count for selective log-prob scoring
+        if "generated_items" in result.extra_fields:
+            sid_token_ids = result.extra_fields["generated_items"]
+            if isinstance(sid_token_ids, list) and sid_token_ids:
+                result.extra_fields["sid_token_count"] = len(sid_token_ids)
+            else:
+                result.extra_fields["sid_token_count"] = 0
+        else:
+            result.extra_fields["sid_token_count"] = 0
+
+        # Provide CoT token count and length penalty coefficient for reward
+        cot_length_penalty_coef = sampling_params.get("cot_length_penalty_coef", 0.0)
+        result.extra_fields["extra_info"]["cot_length_penalty_coef"] = cot_length_penalty_coef
+
+        if "generated_items" in result.extra_fields:
+            sid_count = len(result.extra_fields["generated_items"])
+            response_len = len(output.token_ids)
+            cot_token_count = max(0, response_len - sid_count)
+        else:
+            cot_token_count = 0
+        result.extra_fields["extra_info"]["cot_token_count"] = cot_token_count
 
         result.extra_fields.update({"turn_scores": [], "tool_rewards": []})
         return result
@@ -231,6 +257,19 @@ class OpenOneRecAgentLoopWorker(AgentLoopWorker):
                 get_rollout_custom_value(config, "stage1_max_tokens", config.response_length),
             ),
         )
+        prog_cot_raw = get_rollout_custom_value(config, "progressive_cot", {})
+        if isinstance(prog_cot_raw, dict) and prog_cot_raw.get("enabled", False):
+            prog_config = ProgressiveCoTConfig(
+                enabled=True,
+                start_max_tokens=int(prog_cot_raw.get("start_max_tokens", reasoning_max_tokens)),
+                end_max_tokens=int(prog_cot_raw.get("end_max_tokens", 256)),
+                schedule=str(prog_cot_raw.get("schedule", "linear")),
+                total_steps=int(prog_cot_raw.get("total_steps", 2000)),
+            )
+            global_steps = int(batch.meta_info.get("global_steps", 0))
+            reasoning_max_tokens = compute_current_cot_max_tokens(global_steps, prog_config)
+        cot_length_penalty_coef = float(prog_cot_raw.get("length_penalty_coef", 0.0)) if isinstance(prog_cot_raw, dict) else 0.0
+        sampling_params["cot_length_penalty_coef"] = cot_length_penalty_coef
         beam_width = int(
             batch.meta_info.get(
                 BEAM_WIDTH_KEY,

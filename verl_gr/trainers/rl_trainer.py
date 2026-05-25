@@ -180,6 +180,24 @@ class RLTrainer(RayPPOTrainerBase):
         from verl.utils import tensordict_utils as tu
         from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
+        # SID-only scoring: mask non-SID tokens from response for OpenOneRec
+        custom_config = self.config.actor_rollout_ref.rollout.get("custom") or {}
+        score_sid_only = custom_config.get("score_sid_only", False)
+        if score_sid_only:
+            if batch.meta_info is None:
+                batch.meta_info = {}
+            batch.meta_info["score_sid_only"] = True
+            sid_token_counts = (
+                batch.non_tensor_batch.get("sid_token_count", None)
+                if hasattr(batch, "non_tensor_batch")
+                else None
+            )
+            if sid_token_counts is not None:
+                from verl_gr.trainers.sid_scoring import apply_sid_only_scoring_mask
+
+                response_len = batch.batch["responses"].shape[1]
+                batch = apply_sid_only_scoring_mask(batch, list(sid_token_counts), response_len)
+
         batch_td = batch.to_tensordict()
         batch_td = left_right_2_no_padding(batch_td)
         calculate_entropy = self.config.actor_rollout_ref.actor.get("calculate_entropy", False) or (
@@ -642,6 +660,7 @@ class RLTrainer(RayPPOTrainerBase):
             )
             if beam_search_params.get("constraint") is not None:
                 gen_batch.meta_info["constraint"] = beam_search_params.get("constraint")
+        gen_batch.meta_info["global_steps"] = getattr(self, "global_steps", 0)
         return gen_batch
 
     def _validate(self):

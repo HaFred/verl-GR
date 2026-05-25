@@ -606,8 +606,16 @@ def compute_score(
     pass_rate_value = pass_rate(prediction, ground_truth)
     pass_at_1_value = first_sid_hit_reward(prediction, ground_truth)
 
+    score = pass_at_1_value
+
+    length_penalty_coef = extra_info.get("cot_length_penalty_coef", 0.0)
+    if length_penalty_coef > 0:
+        cot_token_count = extra_info.get("cot_token_count", 0)
+        length_penalty = -length_penalty_coef * (cot_token_count / 1024.0)
+        score = score + length_penalty
+
     return {
-        "score": pass_at_1_value,
+        "score": score,
         "format_reward": format_reward_value,
         "partial_hit_reward": partial_hit_reward_value,
         "hit_reward": hit_reward_value,
