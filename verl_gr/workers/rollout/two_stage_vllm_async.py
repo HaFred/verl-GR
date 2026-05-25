@@ -64,7 +64,6 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
         super().__init__(*args, **kwargs)
         self._two_stage_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._two_stage_build_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._two_stage_stage2_lock = None  # No longer needed; kept for backward compat
         # vLLM V1 can become unstable when too many short-lived async requests hit the
         # engine core at once. Two-stage beam search multiplies request fan-out, so we
         # cap in-flight engine requests per server to keep IPC pressure bounded.
