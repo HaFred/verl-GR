@@ -173,6 +173,9 @@ class RLTrainer(RayPPOTrainerBase):
             ray_trainer_mod.compute_advantage = compute_advantage
 
     def _compute_old_log_prob(self, batch: DataProto):
+        profiler = getattr(self, "_step_profiler", None)
+        t0 = time.monotonic() if profiler is not None else 0.0
+
         from verl import DataProto as DP
         from verl.utils import tensordict_utils as tu
         from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
@@ -214,9 +217,17 @@ class RLTrainer(RayPPOTrainerBase):
         else:
             old_log_prob = tu.get_tensordict({"old_log_probs": log_probs.float()})
         old_log_prob = DP.from_tensordict(old_log_prob)
+        if profiler is not None:
+            elapsed = time.monotonic() - t0
+            if not hasattr(self, "_phase_times"):
+                self._phase_times = {}
+            self._phase_times["old_log_prob"] = elapsed
         return old_log_prob, old_log_prob_mfu
 
     def fit(self):
+        from verl_gr.trainers.profiling import StepProfiler
+        self._step_profiler = StepProfiler(log_every_n=10)
+
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
         ray_trainer_mod, original_tqdm, progress_tqdm_cls = self._install_latency_adjusted_tqdm()
         self._progress_tqdm_cls = progress_tqdm_cls
@@ -374,6 +385,14 @@ class RLTrainer(RayPPOTrainerBase):
     def _update_actor(self, batch: DataProto) -> DataProto:
         actor_output = super()._update_actor(batch)
         self._add_actor_lr_metrics(actor_output.meta_info["metrics"])
+
+        # Profile logging at step completion
+        profiler = getattr(self, "_step_profiler", None)
+        if profiler is not None:
+            summary = profiler.step_done()
+            if summary is not None:
+                from verl.utils.tracking import Tracking
+                Tracking.log(summary, step=self.global_steps)
 
         # Measure parameter drift from SFT at milestones 10, 50, 150, 300.
         # Controlled by VERL_GR_DEBUG=1 (off by default).
