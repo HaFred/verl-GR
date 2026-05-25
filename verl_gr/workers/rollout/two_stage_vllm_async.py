@@ -64,7 +64,7 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
         super().__init__(*args, **kwargs)
         self._two_stage_cache: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._two_stage_build_tasks: dict[str, asyncio.Task[dict[str, Any]]] = {}
-        self._two_stage_stage2_lock = asyncio.Lock()
+        self._two_stage_stage2_lock = None  # No longer needed; kept for backward compat
         # vLLM V1 can become unstable when too many short-lived async requests hit the
         # engine core at once. Two-stage beam search multiplies request fan-out, so we
         # cap in-flight engine requests per server to keep IPC pressure bounded.
@@ -251,15 +251,14 @@ class TwoStagevLLMHttpServer(vLLMHttpServer):
             add_special_tokens=False,
         )
         stage2_prompt_ids = prompt_ids + stage1_token_ids + prefix_ids
-        async with self._two_stage_stage2_lock:
-            stage2_candidates = await self._run_stage2_beam_search(
-                prompt_token_ids=stage2_prompt_ids,
-                multi_modal_data=multi_modal_data,
-                request_id=f"{request_id}:stage2",
-                lora_request=lora_request,
-                priority=priority,
-                beam_config=beam_config,
-            )
+        stage2_candidates = await self._run_stage2_beam_search(
+            prompt_token_ids=stage2_prompt_ids,
+            multi_modal_data=multi_modal_data,
+            request_id=f"{request_id}:stage2",
+            lora_request=lora_request,
+            priority=priority,
+            beam_config=beam_config,
+        )
 
         extra_fields = {"global_steps": self.global_steps}
         extract_prompt_logprobs(
