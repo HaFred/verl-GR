@@ -239,6 +239,7 @@ class RLTrainer(RayPPOTrainerBase):
         from verl.utils.tracking import Tracking
 
         original_log = Tracking.log
+        self._original_tracking_log = original_log
 
         def log_every_n_steps(tracking_self, data, step, backend=None):
             if step == 0 or step % logging_steps == 0:
@@ -389,8 +390,7 @@ class RLTrainer(RayPPOTrainerBase):
         if profiler is not None:
             summary = profiler.step_done()
             if summary is not None:
-                from verl.utils.tracking import Tracking
-                Tracking.log(summary, step=self.global_steps)
+                self._original_tracking_log(summary, step=self.global_steps)
 
         # Measure parameter drift from SFT at milestones 10, 50, 150, 300.
         # Controlled by VERL_GR_DEBUG=1 (off by default).

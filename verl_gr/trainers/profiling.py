@@ -1,10 +1,7 @@
 """Per-phase profiling for verl-GR training steps."""
 
-from __future__ import annotations
-
 import time
 from contextlib import contextmanager
-from typing import Any
 
 
 class StepProfiler:
