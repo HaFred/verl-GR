@@ -219,9 +219,7 @@ class RLTrainer(RayPPOTrainerBase):
         old_log_prob = DP.from_tensordict(old_log_prob)
         if profiler is not None:
             elapsed = time.monotonic() - t0
-            if not hasattr(self, "_phase_times"):
-                self._phase_times = {}
-            self._phase_times["old_log_prob"] = elapsed
+            profiler.record("old_log_prob", elapsed)
         return old_log_prob, old_log_prob_mfu
 
     def fit(self):

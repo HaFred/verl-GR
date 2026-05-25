@@ -15,6 +15,12 @@ class StepProfiler:
         self._phases: dict[str, list[float]] = {}
         self._step_count = 0
 
+    def record(self, name: str, elapsed: float) -> None:
+        """Record a manual phase timing (for code that can't use the context manager)."""
+        if name not in self._phases:
+            self._phases[name] = []
+        self._phases[name].append(elapsed)
+
     @contextmanager
     def phase(self, name: str):
         start = time.monotonic()
@@ -22,9 +28,7 @@ class StepProfiler:
             yield
         finally:
             elapsed = time.monotonic() - start
-            if name not in self._phases:
-                self._phases[name] = []
-            self._phases[name].append(elapsed)
+            self.record(name, elapsed)
 
     def step_done(self) -> dict[str, float] | None:
         self._step_count += 1
