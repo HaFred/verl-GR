@@ -169,7 +169,30 @@ def rankgrpo_ppo_loss(
     data: TensorDict,
     dp_group=None,  # noqa: ARG001
 ):
-    """PPO loss with Rank-GRPO item-level importance sampling support."""
+    """PPO loss with Rank-GRPO item-level importance sampling support.
+
+    This is the entry point called by verl's ``train_mini_batch`` loop once
+    per (mini-batch, epoch).  The epoch count is controlled by
+    ``actor_rollout_ref.actor.ppo_epochs`` (Hydra → ``ActorConfig`` →
+    ``ray_trainer._update_actor`` → ``train_mini_batch``).
+
+    Why ppo_epochs > 1 is safe (and helps convergence):
+    ──────────────────────────────────────────────────
+    The clipping ratio (coef_2 = clamp(coef_1, 1-ε, 1+ε)) in
+    ``_trl_clipped_pg_loss`` acts as a per-token trust-region relative to
+    π_old (the rollout policy, frozen before any updates).  In early epochs
+    most tokens are within the clip window and receive full gradient.  In
+    later epochs, tokens that have already reached the clip boundary produce
+    ZERO gradient — they cannot drift further from π_old.  Extra epochs are
+    therefore *self-limiting*: they extract residual gradient from tokens
+    still within bounds without overfitting those that have converged.
+
+    With small batch sizes (e.g. 6 prompts × 8 rollouts = 48 seq vs TRL's
+    384), GRPO advantage estimates are high-variance.  A single epoch leaves
+    usable gradient on the table.  ppo_epochs=12 saturates most tokens at
+    the clip boundary, maximizing per-batch signal extraction while the
+    trust-region prevents policy collapse.
+    """
 
     log_prob = no_padding_2_padding(model_output["log_probs"], data)
     entropy = model_output.get("entropy", None)

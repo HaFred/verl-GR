@@ -147,7 +147,7 @@ def install_grad_hooks():
 
     from verl.workers.engine.fsdp.transformer_impl import FSDPEngine, FSDPEngineWithLMHead
 
-    # --- Debug-only: gradient diagnostics ---
+    # --- Debug-only: gradient diagnostics and FSDP2 div_ autograd fix ---
     if os.environ.get("VERL_GR_DEBUG", "0") == "1":
         if _original_train_batch is None:
             os.environ["DEBUG_LAYER_GRAD"] = "1"
@@ -155,8 +155,7 @@ def install_grad_hooks():
             FSDPEngine.train_batch = _patched_train_batch
             print("[grad_hooks] patched FSDPEngine.train_batch (VERL_GR_DEBUG=1)", flush=True)
 
-    # --- Always-on: FSDP2 div_ autograd fix ---
-    if _original_prepare_model_outputs is None:
-        _original_prepare_model_outputs = FSDPEngineWithLMHead.prepare_model_outputs
-        FSDPEngineWithLMHead.prepare_model_outputs = _patched_prepare_model_outputs
-        print("[grad_hooks] patched FSDPEngineWithLMHead.prepare_model_outputs (fixed div_)", flush=True)
+        if _original_prepare_model_outputs is None:
+            _original_prepare_model_outputs = FSDPEngineWithLMHead.prepare_model_outputs
+            FSDPEngineWithLMHead.prepare_model_outputs = _patched_prepare_model_outputs
+            print("[grad_hooks] patched FSDPEngineWithLMHead.prepare_model_outputs (fixed div_)", flush=True)
