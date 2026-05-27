@@ -45,14 +45,13 @@ VAL_FILES="${VAL_FILES:-[${VAL_DATASET_DIR}]}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 REC_NUM="${REC_NUM:-20}"
 
-# verl-GR's train_batch_size is the number of unique prompts per optimizer
-# minibatch. TRL's reference uses per_device_train_batch_size=4 (4 prompts
-# per GPU) × gradient_accumulation_steps=6 × 2 GPUs = 48 prompts/step with
-# 8 rollouts each = 384 completions. verl cannot match 48 prompts directly
-# (OOM without gradient accumulation), so we use 6 prompts/step. The GRPO
-# group-advantage normalization operates per-prompt regardless of batch size.
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-8}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
+# verl-GR's train_batch_size and gen_batch_size are measured in unique prompts.
+# TRL's RankGRPO generation_batch_size is measured in repeated generation slots:
+# per_device_train_batch_size × num_processes × gradient_accumulation_steps.
+# With the 2-GPU TRL reference, 4 × 2 × 6 = 48 slots, and num_generations=8
+# means 48 / 8 = 6 unique prompts per optimizer update.
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-6}"
 GEN_BATCH_SIZE="$((TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
 # When gradient accumulation is active, force fixed micro-batching so the engine
 # creates exactly GRADIENT_ACCUMULATION_STEPS micro-batches, accumulating gradients.
@@ -67,7 +66,7 @@ else
   ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-32}"
 fi
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-$((16 * N_GPUS))}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-49152}"
 ACTOR_MAX_TOKENS_PER_GPU="${ACTOR_MAX_TOKENS_PER_GPU:-${MAX_TOKENS_PER_GPU}}"
 LOG_PROB_MAX_TOKENS_PER_GPU="${LOG_PROB_MAX_TOKENS_PER_GPU:-${MAX_TOKENS_PER_GPU}}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${MAX_TOKENS_PER_GPU}}"
@@ -87,7 +86,7 @@ ROLLOUT_DATA_PARALLEL_SIZE="$((N_GPUS / ROLLOUT_TENSOR_PARALLEL_SIZE))"
 ROLLOUT_CALCULATE_LOG_PROBS="${ROLLOUT_CALCULATE_LOG_PROBS:-True}"
 RANKGRPO_BYPASS_OLD_LOG_PROB="${RANKGRPO_BYPASS_OLD_LOG_PROB:-False}"
 USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
-USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-False}"
+USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-True}"
 ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-False}"
 # vLLM sleep-mode memory release can crash in CUDA/cumem after long runs on this
 # stack. Keep rollout memory resident by default; override both to True if needed.
@@ -115,6 +114,7 @@ PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
 # trainer does not use dual-clip PPO. Set clip_ratio_c to a large value so
 # the min() always picks the standard PPO clip branch.
 PPO_CLIP_RATIO_C="${PPO_CLIP_RATIO_C:-1e6}"
+PPO_EPOCHS="${PPO_EPOCHS:-1}"
 FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp2}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-False}"
 SEED="${SEED:-3407}"
@@ -150,8 +150,8 @@ RAY_NUM_CPUS="${RAY_NUM_CPUS:-$((N_GPUS * 24))}"
 RAY_OBJECT_STORE_MEMORY="${RAY_OBJECT_STORE_MEMORY:-$((N_GPUS * 32 * 1024 * 1024 * 1024))}"
 RAY_INCLUDE_DASHBOARD="${RAY_INCLUDE_DASHBOARD:-False}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
-SAVE_FREQ="${SAVE_FREQ:-200}"
-TEST_FREQ="${TEST_FREQ:-${SAVE_FREQ}}"
+SAVE_FREQ="${SAVE_FREQ:-50}"
+TEST_FREQ="${TEST_FREQ:-200}"
 LOGGING_STEPS="${LOGGING_STEPS:-10}"
 VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-4}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
@@ -264,6 +264,7 @@ done
   ++actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${ACTOR_MAX_TOKENS_PER_GPU}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \
+  actor_rollout_ref.actor.ppo_epochs="${PPO_EPOCHS}" \
   actor_rollout_ref.actor.clip_ratio="${PPO_CLIP_RATIO}" \
   actor_rollout_ref.actor.clip_ratio_low="${PPO_CLIP_RATIO}" \
   actor_rollout_ref.actor.clip_ratio_high="${PPO_CLIP_RATIO_HIGH}" \

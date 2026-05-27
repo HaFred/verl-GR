@@ -21,7 +21,10 @@ The verl-gr implementation is **slower per unit of training progress** and **con
 
 ### 1.1 Effective Batch Size (Unique Prompts per Optimizer Step)
 
-This is the single most impactful structural difference.
+**Status: finished / aligned as of 2026-05-27.** Earlier revisions of this
+document treated TRL's `generation_batch_size=48` as 48 unique prompts. That was
+incorrect for the current TRL RankGRPO code path. TRL counts repeated generation
+slots here; with `num_generations=8`, 48 slots correspond to 6 unique prompts.
 
 **TRL:**
 
@@ -31,9 +34,10 @@ num_processes                    = 2   (GPUs)
 gradient_accumulation_steps      = 6
 num_generations (rollouts/prompt)= 8
 
-Unique prompts per optimizer step = 4 × 2 × 6 = 48
-Total sequences per optimizer step = 48 × 8 = 384
-Sequences per micro-batch          = (4 × 2) × 8 = 64
+generation_batch_size             = 4 × 2 × 6 = 48 repeated generation slots
+Unique prompts per optimizer step = 48 / 8 = 6
+Total sequences per optimizer step = 6 × 8 = 48
+Sequences per micro-batch          = 48 / 6 = 8 global = 4/GPU
 ```
 
 The dataloader is controlled by `RepeatSampler` at [rank_grpo_trainer.py:1056-1090]:
@@ -49,46 +53,50 @@ RepeatSampler(
 
 Where `steps_per_generation` defaults to `gradient_accumulation_steps=6` (see `grpo_config.py:590-591`), and `generation_batch_size = per_device_train_batch_size × num_processes × steps_per_generation = 4 × 2 × 6 = 48`.
 
-The generation batch contains 48 unique prompts × 8 rollouts = 384 completions. It is split into 6 micro-batches of 64 completions (8 unique prompts × 8 rollouts) each. After 6 gradient accumulation steps (one full optimizer update), new completions are generated.
+The generation batch contains 6 unique prompts × 8 rollouts = 48 generated
+sequences. It is split into 6 micro-batches of 8 sequences each. After 6
+gradient-accumulation micro-batches, one optimizer update is applied.
 
-**verl-gr current `.match_rankgrpo.sh` status (2026-05-26): aligned for 1.1**
+**verl-gr current status (2026-05-27): aligned for 1.1**
 
-The current match launcher now uses the same effective batch structure as the TRL reference:
+`scripts/run_rankgrpo.sh` now owns the TRL-alignment defaults so every wrapper
+gets the same behavior:
 
 ```
-TRAIN_BATCH_SIZE              = 8   (unique prompts per micro-batch across 2 GPUs)
+TRAIN_BATCH_SIZE              = 1   (unique prompts per micro-batch)
 GRADIENT_ACCUMULATION_STEPS   = 6
-GEN_BATCH_SIZE                = 8 × 6 = 48
+GEN_BATCH_SIZE                = 1 × 6 = 6
 ROLLOUT_N (n)                 = 8
-ppo_mini_batch_size           = 8
-ppo_micro_batch_size_per_gpu  = 32  (8 prompts × 8 rollouts / 2 GPUs)
+ppo_mini_batch_size           = 1
+ppo_micro_batch_size_per_gpu  = 4
 use_dynamic_bsz               = False when GRADIENT_ACCUMULATION_STEPS > 1
 
-Unique prompts per optimizer step = 48
-Total sequences per optimizer step = 48 × 8 = 384
-Sequences per micro-batch          = 8 × 8 = 64 total = 32/GPU
+Unique prompts per optimizer step = 6
+Total sequences per optimizer step = 6 × 8 = 48
+Sequences per micro-batch          = 8 total = 4/GPU
 ```
 
-`scripts/.match_rankgrpo.sh` computes:
+`scripts/run_rankgrpo.sh` computes:
 
 ```bash
-TRAIN_BATCH_SIZE=8
+TRAIN_BATCH_SIZE=1
 GRADIENT_ACCUMULATION_STEPS=6
-GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))  # 48
+GEN_BATCH_SIZE=$((TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))  # 6
 ```
 
-and passes `++data.gen_batch_size="${GEN_BATCH_SIZE}"` into `scripts/run_rankgrpo.sh`. When `GRADIENT_ACCUMULATION_STEPS > 1`, `run_rankgrpo.sh` forces fixed micro-batching:
+and passes `++data.gen_batch_size="${GEN_BATCH_SIZE}"` to Hydra. When
+`GRADIENT_ACCUMULATION_STEPS > 1`, it forces fixed micro-batching:
 
 ```bash
 USE_DYNAMIC_BSZ=False
-ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=$((TRAIN_BATCH_SIZE * ROLLOUT_N / N_GPUS))  # 32
+ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=$((TRAIN_BATCH_SIZE * ROLLOUT_N / N_GPUS))  # 4
 ```
 
 Inside `_update_actor`, the current verl patch uses `gen_batch_size × rollout.n` as the global actor batch and sets the mini-batch equal to that full global batch:
 
 ```python
 gen_batch_size = self.config.data.get("gen_batch_size", self.config.data.train_batch_size)
-global_batch_size = gen_batch_size * self.config.actor_rollout_ref.rollout.n  # 48 × 8 = 384
+global_batch_size = gen_batch_size * self.config.actor_rollout_ref.rollout.n  # 6 × 8 = 48
 tu.assign_non_tensor(
     batch_td,
     global_batch_size=global_batch_size,
@@ -97,11 +105,14 @@ tu.assign_non_tensor(
 )
 ```
 
-This creates one actor mini-batch containing all 384 sequences. The FSDP engine then splits that mini-batch into fixed micro-batches of 32 sequences/GPU, producing exactly 6 gradient accumulation micro-batches before `optimizer.step()`.
+This creates one actor mini-batch containing all 48 sequences. The FSDP engine
+then splits that mini-batch into fixed micro-batches of 4 sequences/GPU,
+producing exactly 6 gradient-accumulation micro-batches before
+`optimizer.step()`.
 
-**Conclusion for 1.1:** when launched through the current `scripts/.match_rankgrpo.sh`, verl-gr is aligned with TRL on effective batch size: both use 48 unique prompts and 384 generated sequences per optimizer step. The previous 8× mismatch (48 vs 6 prompts/update) is resolved for this launcher path.
-
-**Caveat:** this statement applies to the match launcher. Calling `scripts/run_rankgrpo.sh` directly still defaults `GRADIENT_ACCUMULATION_STEPS=1` unless the caller exports or overrides it.
+**Conclusion for 1.1:** verl-gr is now aligned with TRL on batching and
+optimizer-update behavior: both use 6 unique prompts, 8 rollouts per prompt, 48
+generated sequences, 6 accumulation micro-batches, and 1 optimizer step.
 
 #### Why This Matters for GRPO
 
@@ -115,10 +126,11 @@ for indices in uid_to_indices.values():  # each uid = one prompt
         centered = centered / (std + 1e-4)
 ```
 
-- **TRL**: 48 prompt groups × 8 rollouts each → group mean/std estimated from 8 samples, distribution over 48 groups.
-- **verl-gr current match launcher**: 48 prompt groups × 8 rollouts each → same group count and rollout count as TRL.
+- **TRL**: 6 prompt groups × 8 rollouts each → group mean/std estimated from 8 samples.
+- **verl-gr current default**: 6 prompt groups × 8 rollouts each → same group count and rollout count as TRL.
 
-The standard error concern from the earlier 6-prompt configuration no longer applies to the current match launcher. If verl-gr is run with `GEN_BATCH_SIZE=6` or `GRADIENT_ACCUMULATION_STEPS=1`, then the old √(48/6) ≈ 2.8× noisier group-level estimate concern returns.
+The previous "48 vs 6 prompt groups" concern is resolved because it came from
+misinterpreting TRL's `generation_batch_size` as unique prompts.
 
 ### 1.2 PPO Clip Ratio — The Critical Mismatch (3.3×)
 
@@ -173,16 +185,16 @@ coef_2 = torch.clamp(coef_1, 1 - clip_ratio_low, 1 + clip_ratio_high)
 The clip ratio defines a trust region around the frozen rollout policy π_old. TRL allows the per-token importance ratio to deviate at most ±6-8% from 1.0 before being clipped; verl allows ±20%.
 
 - **TRL's tight clip**: Each optimizer step makes small, conservative policy changes. Even with imperfect advantage estimates, the damage per step is bounded. Trade-off: requires more steps to move the policy a given distance.
-- **verl's wide clip**: Each optimizer step can make large policy changes. With noisy advantages (only 6 groups), some tokens receive large-magnitude but wrongly-signed gradients, pushing the policy in counterproductive directions that must be corrected later.
+- **verl's wide clip**: Each optimizer step can make larger policy changes from the same 6-prompt / 48-generation-slot update. This remains an active mismatch after batching alignment.
 
-The combination of noisy advantages + wide clip is particularly harmful because the clip is wide enough to allow substantial policy drift based on unreliable advantage signals.
+The batch-size mismatch is resolved, so the current clip-ratio question is no longer "wide clip plus 8x fewer prompt groups." It is now a cleaner trust-region mismatch: verl-gr still allows a substantially larger per-step ratio movement than TRL.
 
 ### 1.3 PPO Epochs (Sequence Reuse Strategy)
 
 | Parameter | TRL | verl-gr |
 |---|---|---|
-| Reuse strategy | `mu=1` (`num_iterations`) | `ppo_epochs=12` |
-| Passes per generated sequence | 1 forward+backward | 12 forward+backward |
+| Reuse strategy | `mu=1` (`num_iterations`) | `ppo_epochs=1` |
+| Passes per generated sequence | 1 forward+backward | 1 forward+backward |
 | Generation cadence | Once per `steps_per_generation=6` micro-batches | Once per global step |
 
 **TRL** — `mu=1` at `run_rl.sh:26`:
@@ -193,41 +205,34 @@ The combination of noisy advantages + wide clip is particularly harmful because 
 
 means `num_iterations=1`. Every generated sequence is used for exactly one forward+backward pass. New completions are generated after `steps_per_generation × num_iterations = 6 × 1 = 6` micro-batches (one full optimizer step).
 
-**verl-gr** — `ppo_epochs=12` at `.match_rankgrpo.sh:108`:
+**verl-gr** — `ppo_epochs=1` via `run_rankgrpo.sh`:
 
 ```bash
-actor_rollout_ref.actor.ppo_epochs=12
+PPO_EPOCHS="${PPO_EPOCHS:-1}"
+actor_rollout_ref.actor.ppo_epochs="${PPO_EPOCHS}"
 ```
 
-The same 48 completions are reused for 12 PPO epochs. This is controlled at [ray_trainer.py:1208-1219]:
+The same 48 completions are used for one PPO epoch. This is controlled at [ray_trainer.py:1208-1219]:
 
 ```python
-ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs  # 12
+ppo_epochs = self.config.actor_rollout_ref.actor.ppo_epochs  # 1
 # ...
 tu.assign_non_tensor(
     batch_td,
     global_batch_size=ppo_mini_batch_size,
     mini_batch_size=ppo_mini_batch_size,
-    epochs=ppo_epochs,  # 12
+    epochs=ppo_epochs,  # 1
     # ...
 )
 ```
 
-#### Why 12 Epochs Doesn't Compensate for Small Batch
+#### Status
 
-The verl-gr code at `rankgrpo_loss.py:179-195` argues that ppo_epochs=12 is safe because:
-
-> "The clipping ratio acts as a per-token trust-region relative to π_old... In later epochs, tokens that have already reached the clip boundary produce ZERO gradient... Extra epochs are therefore self-limiting."
-
-This reasoning is theoretically correct but breaks down in practice for two reasons:
-
-1. **With clip=0.2 (wide)**: The trust region is so wide that by epoch ~6-8, most tokens have already reached the [0.8, 1.2] boundary. The remaining epochs (9-12) generate **near-zero gradient** — they consume compute without contributing learning. The "self-limiting" property kicks in too late.
-
-2. **With only 6 prompts**: Even in early epochs where tokens are within the clip window, the gradient signal is based on noisy advantage estimates. The extra epochs amplify noise rather than signal.
-
-The contrast with TRL is stark:
-- TRL: tight clip [0.94, 1.08] + 1 pass per seq → small but accurate updates, never wastes compute
-- verl-gr: wide clip [0.8, 1.2] + 12 passes → large initial updates (potentially wrong), then wasted compute
+The earlier `ppo_epochs=12` concern is resolved for the current aligned default.
+verl-gr now uses one pass per generated sequence, matching TRL's `mu=1`
+optimizer-update behavior. Historical runs with `ppo_epochs=12` can still show
+the gradient-starvation/wasted-compute pattern described below, but that is no
+longer the default alignment target.
 
 ### 1.4 Aligned Hyperparameters
 
@@ -294,19 +299,19 @@ With TP=2, both GPUs form one vLLM instance, generating completions cooperativel
 
 ### 2.1 Per-Optimizer-Step Work Breakdown
 
-**TRL** — one optimizer update (6 micro-batches, 384 seq total):
+**TRL** — one optimizer update (6 micro-batches, 48 seq total):
 
 ```
 Phase 1: Generation (once per 6 micro-batches)
-├── vLLM.generate on 48 unique prompts × 8 = 384 completions (TP=2, colocated)
-├── _get_per_token_logps_and_entropies on policy model (forward, 384 seq)
+├── vLLM.generate on 6 unique prompts × 8 = 48 completions (TP=2, colocated)
+├── _get_per_token_logps_and_entropies on policy model (forward, 48 seq)
 │   └── old_per_token_logps computed inline, no separate pass
-└── _get_per_token_logps_and_entropies on ref model (forward, 384 seq)
+└── _get_per_token_logps_and_entropies on ref model (forward, 48 seq)
     └── ref_per_token_logps computed inline
 
-Phase 2: Training (6× micro-batches, 64 seq each)
-├── _compute_loss (forward + backward on model, 64 seq)
-│   ├── Per-token log probs on current model (mini-batch of 64 seq)
+Phase 2: Training (6× micro-batches, 8 seq each)
+├── _compute_loss (forward + backward on model, 8 seq)
+│   ├── Per-token log probs on current model (mini-batch of 8 seq)
 │   ├── Item-level importance weights
 │   ├── Clipped PG loss with coef_1/coef_2
 │   ├── KL divergence (from stored ref_per_token_logps)
@@ -314,10 +319,10 @@ Phase 2: Training (6× micro-batches, 64 seq each)
 └── Optimizer step (after 6 accumulations)
 
 Total per optimizer step:
-  1 large generate (384 seq)
-  + 1 policy log_prob forward (384 seq, during generation)
-  + 1 ref log_prob forward (384 seq, during generation)
-  + 6 train forward+backward (64 seq each)
+  1 generate (48 seq)
+  + 1 policy log_prob forward (48 seq, during generation)
+  + 1 ref log_prob forward (48 seq, during generation)
+  + 6 train forward+backward (8 seq each)
 ```
 
 Key efficiency: old_log_probs and ref_log_probs are computed **during generation** in a single consolidated pass — no separate forward passes needed.
@@ -337,9 +342,9 @@ Phase 3: ref_log_prob (separate forward pass, every step)
 └── _compute_ref_log_prob → ref_policy_wg.compute_ref_log_prob (Ray RPC)
     └── Full forward pass through ref model on 48 seq
 
-Phase 4: Training (12 epochs, 48 seq each)
+Phase 4: Training (1 epoch, 48 seq)
 ├── _update_actor → actor_rollout_wg.update_actor (Ray RPC)
-│   └── train_mini_batch × 12 epochs on 48 seq
+│   └── train_mini_batch × 1 epoch on 48 seq
 │       ├── Forward + backward through actor
 │       ├── rankgrpo_ppo_loss (trl_match path)
 │       │   ├── _compute_item_mean_log_ratio (scatter/gather on GPU)
@@ -351,7 +356,7 @@ Total per optimizer step:
   1 small generate (48 seq)
   + 1 old_log_prob forward (48 seq, separate RPC call)
   + 1 ref_log_prob forward (48 seq, separate RPC call)
-  + 12 train forward+backward (48 seq each)
+  + 6 accumulated train micro-batches (4 seq/GPU each)
 ```
 
 ### 2.2 Why verl-gr Is Slower Per Unit of Training Progress
@@ -371,13 +376,15 @@ Each of these involves:
 
 In contrast, TRL computes old_log_probs and ref_log_probs **inline during generation** (lines 1754-1804 of `rank_grpo_trainer.py`), amortizing the forward pass cost.
 
-#### 2.2.2 ppo_epochs=12: Effective Compute Waste
+#### 2.2.2 ppo_epochs alignment status
 
-While TRL does **6 forward+backward** passes per optimizer step on 64 seq each (384 seq·passes total), verl-gr does **12 forward+backward** passes on 48 seq each (576 seq·passes total).
+The previous `ppo_epochs=12` compute-waste issue is resolved in the current
+default: both TRL and verl-gr use one pass over the generated sequences per
+optimizer update. If a historical run overrides `PPO_EPOCHS=12`, the old
+analysis still applies: repeated passes can hit the clip boundary and produce
+diminishing or zero gradient.
 
-So verl-gr actually does **50% more** training F+B work per optimizer step (576 vs 384 seq·passes) despite processing **8× fewer unique prompts**.
-
-Furthermore, with clip=0.2, by epoch ~6-8 most tokens have hit the [0.8, 1.2] clip boundary. At the boundary:
+At the boundary:
 
 ```python
 # rankgrpo_loss.py:96-98
@@ -387,7 +394,9 @@ per_token_loss = -torch.min(pg1, pg2)
 # When coef_1 is outside [1-ε, 1+ε]: pg2 is always chosen, gradient = 0
 ```
 
-This means epochs 9-12 produce **diminishing or zero gradient**, consuming GPU compute without contributing to learning. The "self-limiting" property cited in the code comments is real but kicks in at the wrong time — most epochs are wasted.
+This means extra PPO epochs can produce **diminishing or zero gradient**,
+consuming GPU compute without contributing to learning. The current aligned
+default avoids that by using `PPO_EPOCHS=1`.
 
 #### 2.2.3 Ray RPC Overhead
 
@@ -436,22 +445,20 @@ if self.state.global_step != self._last_loaded_step:
 
 | Phase | TRL (per opt step) | verl-gr (per opt step) |
 |---|---|---|
-| vLLM generation | ~6-8s (384 seq, TP=2) | ~1-2s (48 seq, TP=1×2) |
-| Policy log_prob forward | ~0.2s (384 seq, inline) | ~0.3s (48 seq + RPC overhead) |
-| Ref log_prob forward | ~0.2s (384 seq, inline) | ~0.3s (48 seq + RPC overhead) |
-| Training F+B (×N) | ~0.6s (6× 0.1s on 64 seq) | ~0.6s (12× 0.05s on 48 seq) |
-| **Total per opt step** | **~7-9s** | **~2-3s** |
-| **Unique prompts processed** | **48** | **6** |
-| **Time per unique prompt** | **~0.17s** | **~0.42s** |
-| **Relative efficiency** | **1× (baseline)** | **~2.5× slower per prompt** |
+| vLLM generation | 48 seq, TP=2 | 48 seq, TP=1×2 |
+| Policy log_prob forward | 48 seq, inline | 48 seq + RPC overhead |
+| Ref log_prob forward | 48 seq, inline | 48 seq + RPC overhead |
+| Training F+B | 6×8 seq micro-batches | 6×4 seq/GPU micro-batches |
+| **Unique prompts processed** | **6** | **6** |
+| **Active structural concern** | colocated/inlined work | Ray RPC + separate log-prob passes |
 
-> Note: Exact timings depend on GPU model, CUDA version, vLLM version, and sequence lengths. These are order-of-magnitude estimates to illustrate the structural differences.
+> Note: Exact timings depend on GPU model, CUDA version, vLLM version, and sequence lengths. After batching alignment, this table should be treated as structural rather than a numeric timing estimate until rerun logs are collected.
 
 ---
 
 ## 3. Training Convergence Analysis
 
-### 3.1 Advantage Noise: 6 Groups vs 48 Groups
+### 3.1 Advantage Noise: Resolved Batch-Size Mismatch
 
 GRPO advantage normalization is per-prompt-group. The key code path in verl-gr at [rankgrpo_algorithm.py:130-145]:
 
@@ -475,7 +482,7 @@ And the equivalent in TRL at [rank_grpo_trainer.py:1831-1843]:
 
 ```python
 G = self.num_generations  # 8
-Bglob = rewards_items.size(0) // G  # 48
+Bglob = rewards_items.size(0) // G  # 6
 group_means_items = rewards_items.view(Bglob, G, rec_num).mean(dim=1)
 group_stds_items  = rewards_items.view(Bglob, G, rec_num).std(dim=1)
 mean_rep = group_means_items.repeat_interleave(G, dim=0)
@@ -485,15 +492,15 @@ if self.scale_rewards:
     advantages_items = advantages_items / (std_rep + 1e-4)
 ```
 
-**Statistical implications:**
+**Current statistical implications:**
 
 - **Within-group variance**: Both systems have 8 rollouts per prompt, so the within-group mean/std estimation quality is identical.
-- **Between-group variance**: TRL computes advantages over 48 independent groups; verl over 6 groups. The distribution of group-level statistics is much wider for verl.
-- **Standard error of group mean**: σ_group / √(N_groups). For verl, this is √(48/6) = √8 ≈ **2.8× larger** than TRL.
+- **Between-group variance**: Both systems now compute one optimizer update from 6 independent prompt groups.
+- **Standard error of group mean**: The previous √(48/6) ≈ 2.8× gap was based on the incorrect assumption that TRL had 48 unique prompt groups per update.
 
-Concretely: with 6 groups, it's common for one or two groups to have extreme mean rewards (by random chance), which then dominate the normalized advantages. The policy update disproportionately responds to these outlier groups rather than the typical case.
+The remaining convergence questions should therefore be attributed to other mismatches, such as clip range, rollout/log-prob plumbing, vLLM topology, or distributed backend differences.
 
-### 3.2 Interaction of Wide Clip + Noisy Advantages
+### 3.2 Interaction of Wide Clip + Same-Sized Advantages
 
 The policy gradient loss in both implementations is:
 
@@ -505,44 +512,37 @@ per_token_loss = -torch.min(coef_1 * adv, coef_2 * adv)
 
 The gradient flows through `coef_1` when it's within the clip range. When `coef_1` exceeds the clip boundary, the gradient is determined by `coef_2` (constant), giving zero gradient for the ratio.
 
-With **noisy advantages** (verl, 6 groups):
-1. Some prompts get advantages with wrong sign or inflated magnitude
-2. With ε=0.2 (wide clip), tokens from these prompts can have `coef_1` as high as 1.2 or as low as 0.8 before clipping
-3. The large permissable ratio range means the policy can move substantially based on noisy signals
-4. The model takes steps that partially cancel out — one step pushes weights in direction A (based on noise), the next step pushes in direction B (based on different noise)
-5. Net effect: **slow, inefficient convergence** — the policy wanders rather than progressing
+With the batch-size mismatch resolved, both implementations receive similarly
+sized advantage samples per optimizer update. The active difference is clip
+range:
 
-With **clean advantages** (TRL, 48 groups):
-1. Advantages are more reliably estimated
-2. With ε=0.06 (tight clip), policy changes are small and well-directed
-3. Each step moves the policy incrementally in the right direction
-4. Net effect: **steady, monotonic convergence** — each step contributes meaningfully
+1. TRL clips item-level importance ratios to `[0.94, 1.08]`.
+2. verl-gr currently clips to `[0.8, 1.2]` unless overridden.
+3. The larger ratio range means verl-gr can move farther from the rollout policy in a single update.
+4. This should be evaluated by comparing reward curves, KL, and `actor/pg_clipfrac` after the aligned batching run.
 
-### 3.3 ppo_epochs=12 and Gradient Starvation
+### 3.3 ppo_epochs: Resolved for Current Default
 
 In standard PPO, extra epochs help when the clip ratio prevents overfitting. With small ε, tokens stay within the clip window for many epochs, allowing the policy to extract more signal per batch.
 
-In verl-gr's configuration:
+The current verl-gr default uses `PPO_EPOCHS=1`, matching TRL's `mu=1`.
+Historical runs with `ppo_epochs=12` may still exhibit:
+
 - **Epochs 1-3**: Most tokens within clip window [0.8, 1.2] → full gradient, policy moves substantially
 - **Epochs 4-6**: ~50% of tokens hit clip boundary → half gradient, diminishing returns
 - **Epochs 7-9**: ~80% of tokens at boundary → mostly zero gradient
 - **Epochs 10-12**: ~95% at boundary → negligible gradient
 
-The wide clip (0.2) means tokens reach the boundary faster. If the clip were 0.06 (matching TRL), tokens would stay within bounds longer, making the extra epochs genuinely useful.
-
-**Evidence**: The `actor/pg_clipfrac` metric (logged at [rankgrpo_loss.py:303]) should show progressively higher clip fractions across epochs. With clip=0.2, this likely reaches >0.8 by epoch 6, confirming gradient starvation.
+For the current aligned run, verify the single-epoch behavior with `actor/pg_clipfrac` and KL metrics instead of expecting across-epoch starvation.
 
 ### 3.4 Sample Diversity and Generalization
 
 With a finite training dataset, the rate at which the model sees unique data points matters for generalization.
 
-- **TRL**: 48 new unique prompts per optimizer step. If the training dataset has N prompts, TRL covers the dataset in N/48 optimizer steps.
-- **verl-gr**: 6 new unique prompts per optimizer step. Covers the dataset in N/6 steps — 8× more steps needed just to see the same data.
+- **TRL**: 6 new unique prompts per optimizer step. If the training dataset has N prompts, TRL covers the dataset in about N/6 optimizer steps.
+- **verl-gr**: 6 new unique prompts per optimizer step. Covers the dataset in about N/6 optimizer steps as well.
 
-Over the same number of optimizer steps, verl-gr sees 8× fewer unique training examples. This directly impacts:
-- How quickly the model adapts to the full data distribution
-- The variance of the stochastic gradient over the data distribution
-- Validation performance (evaluated on held-out data)
+The previous 8× sample-diversity gap is resolved by the corrected batching default.
 
 ### 3.5 KL Divergence Dynamics
 
@@ -567,9 +567,9 @@ TRL's tight clip naturally constrains KL growth. Each step can only move the pol
 
 | # | Root Cause | TRL Value | verl-gr Value | Impact |
 |---|---|---|---|---|
-| 1 | **Clip epsilon** (too wide) | 0.06/0.08 | 0.2/0.2 | Allows 3.3× larger per-step policy drift; combines destructively with noisy advantages |
-| 2 | **Unique prompts/step** (too few) | 48 | 6 | 8× fewer; GRPO group normalization has 2.8× larger standard error |
-| 3 | **ppo_epochs** (too many for wide clip) | 1 (μ=1) | 12 | ~50% of epochs produce near-zero gradient due to clip saturation |
+| 1 | **Clip epsilon** (too wide) | 0.06/0.08 | 0.2/0.2 | Allows 3.3× larger per-step policy drift |
+| 2 | **Unique prompts/step** | 6 | 6 | **Resolved** — batching/optimizer-update behavior is aligned |
+| 3 | **ppo_epochs** | 1 (mu=1) | 1 | **Resolved** — one pass per generated sequence |
 
 ### 4.2 Secondary Root Causes (Speed)
 
@@ -587,32 +587,26 @@ TRL's tight clip naturally constrains KL growth. Each step can only move the pol
 │                    verl-gr Convergence Problem                    │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                   │
-│  Small batch (6 prompts)           Wide clip (ε=0.2)             │
+│  Batching aligned (6 prompts)       Wide clip (ε=0.2)            │
 │         │                                │                        │
 │         ▼                                ▼                        │
 │  ┌──────────────┐              ┌──────────────────┐              │
-│  │ Noisy GRPO   │──────────────▶ Large per-step   │              │
-│  │ advantages   │              │ policy updates    │              │
-│  │ (2.8× noisier)│             │ based on noise    │              │
+│  │ Same prompt  │              │ Larger per-step  │              │
+│  │ groups as TRL│              │ policy movement  │              │
 │  └──────────────┘              └────────┬─────────┘              │
 │                                         │                        │
 │                                         ▼                        │
 │                               ┌──────────────────┐              │
-│                      ┌────────│ 12 ppo_epochs    │────────┐     │
-│                      │        │ re-amplify noise │        │     │
-│                      ▼        └──────────────────┘        ▼     │
-│            ┌──────────────┐                      ┌────────────┐ │
-│            │ Early epochs │                      │ Late epochs│ │
-│            │ (1-6): noisy │                      │ (7-12):    │ │
-│            │ gradients    │                      │ clip-bound │ │
-│            │ cause drift  │                      │ zero grad  │ │
-│            └──────────────┘                      └────────────┘ │
-│                      │                                    │      │
-│                      └────────────┬───────────────────────┘      │
-│                                   ▼                               │
+│                               │ Need rerun with  │              │
+│                               │ aligned batching │              │
+│                               │ to isolate clip, │              │
+│                               │ backend, RPC, TP │              │
+│                               └────────┬─────────┘              │
+│                                        ▼                         │
 │                         ┌──────────────────┐                      │
-│                         │ Slow, inefficient│                      │
-│                         │ convergence      │                      │
+│                         │ Compare reward,  │                      │
+│                         │ KL, clipfrac,    │                      │
+│                         │ wall-clock       │                      │
 │                         └──────────────────┘                      │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -623,10 +617,10 @@ TRL's tight clip naturally constrains KL growth. Each step can only move the pol
 
 ### Priority 1: Align Clip Ratio (Highest Impact, One-Line Change)
 
-In `.match_rankgrpo.sh`, change:
+In `run_rankgrpo.sh`, change:
 
 ```bash
-# Current (lines 98-99)
+# Current
 PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.2}"
 PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
 
@@ -636,39 +630,10 @@ PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
 ```
 
 This single change addresses root cause #1. The tighter clip:
-- Prevents destructive updates from noisy advantages
-- Makes ppo_epochs > 1 genuinely useful (tokens stay within clip window longer)
+- Limits per-update policy movement to TRL's trust region
 - Matches TRL's proven configuration
 
-### Priority 2: Reduce ppo_epochs
-
-In `.match_rankgrpo.sh`, change:
-
-```bash
-# Current (line 108)
-actor_rollout_ref.actor.ppo_epochs=12
-
-# Recommended (with tighter clip, 3-4 epochs is sufficient)
-actor_rollout_ref.actor.ppo_epochs=4
-```
-
-With ε=0.06, 4 epochs will extract most of the available gradient without wasting compute on saturated tokens. This also improves speed: 4 F+B passes instead of 12.
-
-### Priority 3: Increase Unique Prompts per Step
-
-Increase `TRAIN_BATCH_SIZE` as GPU memory permits:
-
-```bash
-# Current (line 55)
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-6}"
-
-# Recommended: increase to 12-24 if memory allows
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-12}"
-```
-
-Or add proper gradient accumulation. This reduces advantage noise and improves sample diversity.
-
-### Priority 4: Optimize Forward Passes
+### Priority 2: Optimize Forward Passes
 
 Enable bypass mode to use rollout log probs directly (avoid separate old_log_prob computation):
 
@@ -679,7 +644,7 @@ RANKGRPO_BYPASS_OLD_LOG_PROB="${RANKGRPO_BYPASS_OLD_LOG_PROB:-True}"  # change f
 
 This saves one forward pass per step (the `_compute_old_log_prob` call).
 
-### Priority 5: Align vLLM TP Configuration
+### Priority 3: Align vLLM TP Configuration
 
 ```bash
 # In run_rankgrpo.sh (line 67)
@@ -692,13 +657,11 @@ This improves generation throughput by using both GPUs cooperatively for vLLM in
 
 | Fix | Expected Convergence Improvement | Expected Speed Improvement |
 |---|---|---|
-| Clip to 0.06/0.08 | **Major** — eliminates destructive updates | Minor (fewer wasted epochs) |
-| ppo_epochs to 4 | Moderate — prevents gradient starvation | **Major** — 3× fewer F+B passes |
-| Batch size increase | **Major** — reduces advantage noise | Minor (more efficient GPU utilization) |
+| Clip to 0.06/0.08 | TBD after aligned-batch rerun | Minor |
 | Bypass old_log_prob | None | Moderate — saves one forward pass |
 | vLLM TP=2 | None | Moderate — faster generation |
 
-After applying priorities 1-3, the verl-gr implementation should match or approach TRL's convergence rate while being competitive in wall-clock time.
+Batching and `ppo_epochs` are already aligned. The next run should isolate the remaining clip/backend/RPC/TP differences.
 
 ---
 
