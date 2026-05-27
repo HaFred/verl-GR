@@ -274,7 +274,7 @@ The following are correctly aligned between both implementations:
 | Strategy | **DeepSpeed ZeRO-3** | **FSDP2** |
 | Accelerate config | `configs/qwen25_0.5b_grpo.yaml` | N/A (Ray-based) |
 | vLLM integration | **Colocated** (same process) | **Hybrid engine** (separate Ray actors) |
-| vLLM TP size | **2** (both GPUs in one TP group) | **2** by default for the matched Rank-GRPO run |
+| vLLM TP size | **2** (both GPUs in one TP group) | **1** in the confirmed good `fp32opt` run (DP=2 rollout workers) |
 
 **TRL** (`qwen25_0.5b_grpo.yaml`):
 
@@ -298,7 +298,7 @@ if self.state.global_step != self._last_loaded_step:
 
 With TP=2, both GPUs form one vLLM instance, generating completions cooperatively. All prompts across GPUs are gathered, generated jointly, then scattered back.
 
-**verl-gr**: Uses FSDP2 (PyTorch native) via the `fsdp2` strategy flag. The hybrid engine runs vLLM, actor, and reference policy as separate Ray actors communicating via RPC. The matched Rank-GRPO launcher now defaults `ROLLOUT_TENSOR_PARALLEL_SIZE=2`, so both GPUs form one rollout TP group like TRL.
+**verl-gr**: Uses FSDP2 (PyTorch native) via the `fsdp2` strategy flag. The hybrid engine runs vLLM, actor, and reference policy as separate Ray actors communicating via RPC. The confirmed good `fp32opt` run kept `ROLLOUT_TENSOR_PARALLEL_SIZE=1`, so rollout topology remains a known backend difference from TRL.
 
 ---
 
@@ -339,7 +339,7 @@ Key efficiency: old_log_probs and ref_log_probs are computed **during generation
 ```
 Phase 1: Generation (every step)
 └── async_rollout_manager.generate_sequences on 6 prompts × 8 = 48 completions
-    └── vLLM generate (TP=2, hybrid engine via Ray RPC)
+    └── vLLM generate (TP=1, DP=2, hybrid engine via Ray RPC)
 
 Phase 2: old_log_prob (separate forward pass, every step)
 └── _compute_old_log_prob → actor_rollout_wg.compute_log_prob (Ray RPC)
@@ -441,7 +441,7 @@ if self.state.global_step != self._last_loaded_step:
 
 **TRL**: TP=2 means both GPUs form one vLLM instance. With `vllm_mode=colocate`, all prompts across GPUs are gathered, processed jointly, then scattered. This is efficient for generation throughput.
 
-**verl-gr**: now defaults to TP=2 for the matched Rank-GRPO launcher, so both GPUs form one vLLM tensor-parallel group instead of TP=1/DP=2 independent rollout workers.
+**verl-gr**: the confirmed good `fp32opt` run used TP=1/DP=2, so each GPU ran an independent vLLM rollout worker. This remains less aligned with TRL's TP=2 colocated generation topology and should be tested separately.
 
 #### 2.2.6 Memory Layout
 
@@ -452,7 +452,7 @@ if self.state.global_step != self._last_loaded_step:
 
 | Phase | TRL (per opt step) | verl-gr (per opt step) |
 |---|---|---|
-| vLLM generation | 48 seq, TP=2 | 48 seq, TP=2 |
+| vLLM generation | 48 seq, TP=2 | 48 seq, TP=1×2 in the good `fp32opt` run |
 | Policy log_prob forward | 48 seq, inline | 48 seq + RPC overhead |
 | Ref log_prob forward | 48 seq, inline | 48 seq + RPC overhead |
 | Training F+B | 6×8 seq micro-batches | 6×4 seq/GPU micro-batches |
@@ -583,22 +583,23 @@ keeping FSDP mixed precision and rollout bf16 behavior.
 | 1 | **Clip epsilon** | 0.06/0.08 | 0.06/0.08 | **Resolved** — trust region is aligned |
 | 2 | **Unique prompts/step** | 6 | 6 | **Resolved** — batching/optimizer-update behavior is aligned |
 | 3 | **ppo_epochs** | 1 (mu=1) | 1 | **Resolved** — one pass per generated sequence |
-| 4 | **Actor update precision** | fp32 master/mixed bf16 | fp32 actor load + mixed bf16 | **Resolved for next run** — avoids bf16 quantization of `lr=1e-6` updates |
+| 4 | **Actor update precision** | fp32 master/mixed bf16 | fp32 actor load + mixed bf16 | **Resolved for KL** — good `fp32opt` run no longer has flat KL |
 
 ### 4.2 Secondary Root Causes (Speed)
 
 | # | Root Cause | TRL | verl-gr | Impact |
 |---|---|---|---|---|
 | 4 | **Separate forward passes** | 1 consolidated | 3 separate (RPC) | Extra latency from Ray serialization and redundant computation |
-| 5 | **vLLM TP configuration** | TP=2 | TP=2 by default in matched launcher | **Resolved for next run** — rollout topology is aligned |
+| 5 | **vLLM TP configuration** | TP=2 | TP=1, DP=2 in good `fp32opt` run | Pending separate TP=2 experiment |
 | 6 | **Distributed backend** | DeepSpeed ZeRO-3 | FSDP2 | ZeRO-3 has better memory efficiency for small models |
 | 7 | **Ray RPC overhead** | None (colocated) | Present (hybrid engine) | Serialization, scheduling, dispatch latency at every data boundary |
 
-### 4.3 KL Follow-Up Queue if the Fresh Run Still Diverges
+### 4.3 KL Follow-Up Queue After the Confirmed fp32 Actor Run
 
-The next verl-gr run should start cleanly with `ACTOR_MODEL_DTYPE=fp32`. If
-`actor/kl_loss` still does not grow in the same direction as TRL's `train/kl`,
-tackle the remaining structural/backend differences one by one:
+The good `fp32opt` run starts cleanly with `ACTOR_MODEL_DTYPE=fp32` and confirms
+that `actor/kl_loss` now grows in the same direction and range as TRL's
+`train/kl`. If future reward, throughput, or longer-horizon KL behavior still
+diverges, tackle the remaining structural/backend differences one by one:
 
 Fresh-run update: `g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt` confirms
 that the fp32 actor change fixed the flat-KL failure. `actor/kl_loss` increased
@@ -609,16 +610,15 @@ backend/sample-path alignment.
 
 1. **Old/ref log-prob plumbing**: TRL computes policy and reference log-probs
    inline during generation, while verl-gr runs separate `old_log_prob` and
-   `ref_log_prob` forward passes through Ray workers. First test whether using
-   TRL's aligned-generation old-logprob behavior changes KL/update drift. In
-   TRL, when `gradient_accumulation_steps` is divisible by
-   `steps_per_generation * num_iterations`, `old_per_token_logps` is not
-   recomputed; the loss uses `per_token_logps.detach()`. verl-gr now exposes
-   `algorithm.rank_grpo.old_log_prob_mode=current` for `loss_mode=trl_match`,
-   and `.match_rankgrpo.sh` starts a fresh `_currentold` experiment by default.
+   `ref_log_prob` forward passes through Ray workers. If further convergence
+   gaps remain, test TRL's aligned-generation old-logprob behavior separately:
+   when `gradient_accumulation_steps` is divisible by
+   `steps_per_generation * num_iterations`, TRL uses
+   `per_token_logps.detach()` as the PPO anchor instead of a separate
+   recomputed old-logprob tensor.
 2. **vLLM topology**: TRL uses colocated vLLM with tensor parallel size 2. The
-   matched verl-gr launcher now defaults `ROLLOUT_TENSOR_PARALLEL_SIZE=2` and
-   starts a fresh `_tp2` experiment by default.
+   good verl-gr `fp32opt` run kept TP=1/DP=2, so test
+   `ROLLOUT_TENSOR_PARALLEL_SIZE=2` only as a separate follow-up run.
 3. **Distributed backend**: TRL uses DeepSpeed ZeRO-3 with fp32 optimizer/master
    state; verl-gr uses FSDP2 with Ray-managed actor/ref/rollout workers. Compare
    checkpoint parameter drift and optimizer-state dtypes after the fresh run.
@@ -662,34 +662,42 @@ backend/sample-path alignment.
 
 ## 5. Recommended Fixes (Prioritized)
 
-### Priority 1: Match TRL Old-Logprob Semantics
+### Priority 1: Keep the Confirmed fp32 Actor Baseline
 
-Use the current policy log-probs as the detached PPO anchor in the TRL-matched
-loss path:
-
-```bash
-RANKGRPO_OLD_LOG_PROB_MODE="${RANKGRPO_OLD_LOG_PROB_MODE:-current}"
-```
-
-This matches TRL's aligned-generation path exactly: when generation and optimizer
-steps are aligned, TRL sets `old_per_token_logps = per_token_logps.detach()`
-inside the loss instead of training against a separate recomputed old-logprob
-tensor.
-
-### Priority 2: Align vLLM TP Configuration
+The confirmed good run is:
 
 ```bash
-ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-2}"
+EXPERIMENT_NAME=g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt
+ACTOR_MODEL_DTYPE=fp32
+PPO_CLIP_RATIO=0.06
+PPO_CLIP_RATIO_HIGH=0.08
+DATA_SHUFFLE=True
+VALIDATION_SHUFFLE=False
+ROLLOUT_TENSOR_PARALLEL_SIZE=1
 ```
 
-This improves generation throughput by using both GPUs cooperatively for vLLM inference.
+This is the baseline that fixed the flat-KL failure. Preserve it before testing
+additional structural/backend changes.
+
+### Priority 2: Follow-Up Experiments
+
+```bash
+# Test separately, not as part of the confirmed fp32opt baseline:
+ROLLOUT_TENSOR_PARALLEL_SIZE=2
+# Optional later experiment:
+# old_log_prob_mode=current
+```
+
+These changes may further align backend behavior, but they were not responsible
+for the good `fp32opt` KL result.
 
 ### Expected Impact Summary
 
 | Fix | Expected Convergence Improvement | Expected Speed Improvement |
 |---|---|---|
-| `old_log_prob_mode=current` | Small but direct — exact TRL PPO anchor semantics | None yet — still computes old log-probs for diagnostics |
-| vLLM TP=2 | Possible — closer sample/backend topology | Moderate — faster generation |
+| `ACTOR_MODEL_DTYPE=fp32` | Confirmed — fixed flat KL in `fp32opt` run | Neutral |
+| `old_log_prob_mode=current` | Unknown — not part of good run | None yet — still computes old log-probs for diagnostics |
+| vLLM TP=2 | Unknown — not part of good run | Possible generation speedup |
 
 Batching, clip ratio, `ppo_epochs`, training shuffle, and validation no-shuffle behavior are now aligned. The next run should isolate the remaining backend/RPC/TP differences.
 

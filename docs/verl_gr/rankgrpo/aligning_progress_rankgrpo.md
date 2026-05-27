@@ -22,14 +22,14 @@ Status legend:
 
 | Target item | Status | Current state | Remaining work |
 |---|---|---|---|
-| 1.1 Effective batch size | **Done** | verl-gr now uses 6 unique prompts, 8 rollouts, 48 generated sequences, 6 accumulation micro-batches, 1 optimizer step | Verify config dump/logs in a fresh run |
+| 1.1 Effective batch size | **Done** | good `fp32opt` run uses 6 unique prompts, 8 rollouts, 48 generated sequences, 6 accumulation micro-batches, 1 optimizer step | Continue using this as baseline |
 | 1.2 PPO clip ratio | **Done** | verl-gr defaults to `[0.94, 1.08]`, matching TRL | Monitor `actor/pg_clipfrac` |
-| 1.3 PPO epochs / sequence reuse | **Done** | verl-gr defaults to `PPO_EPOCHS=1`, matching TRL `mu=1` | Confirm no override in launched runs |
-| 1.4 Other aligned hparams | **Done** | LR, KL coefficient, Adam betas, shuffle behavior, rollout count, seed, and actor dtype defaults are aligned | Confirm Hydra dump for each run |
-| 1.5 Distributed backend | **Partial / known difference** | TRL uses DeepSpeed ZeRO-3 + colocated vLLM TP=2; verl-gr still uses FSDP2 + Ray hybrid engine, but matched rollout TP now defaults to 2 | Compare backend/RPC effects after TP=2 run |
+| 1.3 PPO epochs / sequence reuse | **Done** | good `fp32opt` run shows `ppo_epochs=1`, matching TRL `mu=1` | Keep no override in future runs |
+| 1.4 Other aligned hparams | **Done** | LR, KL coefficient, Adam betas, shuffle behavior, rollout count, seed, and actor dtype defaults are aligned in `fp32opt` | Keep these fixed for follow-ups |
+| 1.5 Distributed backend | **Pending / known difference** | TRL uses DeepSpeed ZeRO-3 + colocated vLLM TP=2; the good verl-gr run still uses FSDP2 + Ray hybrid engine with rollout TP=1/DP=2 | Test TP=2 separately if needed |
 | 2. Compute performance | **Pending** | Batch work per optimizer step is aligned; structural overhead remains | Measure wall-clock and phase timing |
-| 3. Convergence analysis | **Partial** | batch, clip, epochs, sample diversity, and actor dtype are addressed | Rerun and compare reward/KL/clipfrac |
-| 5. Recommended fixes | **Partial** | alignment fixes, current old-logprob semantics, and vLLM TP=2 are in defaults | backend/RPC differences remain |
+| 3. Convergence analysis | **Done for KL** | good run `g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt` shows `actor/kl_loss` growing in the same range as TRL | Continue reward/throughput comparisons |
+| 5. Recommended fixes | **Partial** | confirmed-good defaults are in place through `fp32opt`; old-logprob and TP=2 experiments are not part of the good run | Keep follow-ups separate |
 | 6. Verification plan | **Pending** | checklist exists below | Run and record evidence |
 
 ## 1. Hyperparameter Analysis
@@ -218,9 +218,12 @@ Accomplished:
 - The trainable actor now defaults to fp32 loading to avoid quantizing
   `lr=1e-6` AdamW updates into bf16 parameters.
 
-Remaining verification:
+Confirmed in the good `fp32opt` run:
 
-- Confirm each value in the Hydra config dump for every comparison run.
+- Log shows `Train/validation shuffle: True/False`.
+- Hydra dump shows actor `model_dtype: 'fp32'`.
+- Hydra dump shows `ppo_epochs: 1`.
+- Hydra dump shows `validation_shuffle: False`.
 
 ### 1.5 Distributed Backend Differences: Pending / Known Difference
 
@@ -231,17 +234,17 @@ Not aligned yet:
 | Training backend | DeepSpeed ZeRO-3 | FSDP2 |
 | Runtime topology | Accelerate trainer process | Ray hybrid engine |
 | vLLM integration | colocated | Ray rollout workers |
-| vLLM tensor parallelism | TP=2 | TP=2 by default in matched launcher |
+| vLLM tensor parallelism | TP=2 | TP=1, DP=2 in the confirmed good `fp32opt` run |
 
 Current decision:
 
-- The matched launcher now defaults `ROLLOUT_TENSOR_PARALLEL_SIZE=2` to match
-  TRL's rollout topology more closely.
+- Keep the confirmed good `fp32opt` run as the baseline. Do not fold TP=2 into
+  that baseline until a separate TP=2 run proves it preserves KL/reward behavior.
 
 Remaining verification:
 
-- Compare the new TP=2 run against the previous TP=1/DP=2 run under the same
-  batch/clip/epoch settings.
+- Compare a future TP=2 run against the confirmed TP=1/DP=2 `fp32opt` run under
+  the same batch/clip/epoch/dtype settings.
 - Compare checkpoint parameter drift and optimizer-state dtypes between TRL and
   verl-gr.
 
@@ -280,8 +283,8 @@ Known remaining speed differences:
 - Separate `old_log_prob` forward pass.
 - Separate `ref_log_prob` forward pass.
 - Ray RPC/DataProto boundaries between phases.
-- vLLM defaults to TP=2 for the matched run, but still runs through the Ray
-  hybrid engine rather than TRL's colocated path.
+- vLLM remains TP=1/DP=2 in the confirmed good run, unlike TRL's colocated TP=2
+  group.
 - FSDP2/Ray memory layout differs from DeepSpeed ZeRO-3.
 
 No fix is marked done for these structural speed items yet. The batch fix makes
@@ -346,7 +349,7 @@ Remaining verification:
 
 - Confirm progress-bar denominator near `383013 // 6 = 63835`.
 
-### 3.5 KL Divergence Dynamics: Partial
+### 3.5 KL Divergence Dynamics: Done for the confirmed fp32 actor run
 
 Accomplished:
 
@@ -355,19 +358,22 @@ Accomplished:
 - `ACTOR_MODEL_DTYPE=fp32` is now the default, addressing the observed flat
   `actor/kl_loss` failure mode caused by bf16 actor parameters and bf16 AdamW
   moments at `lr=1e-6`.
+- The good run `g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt` confirms
+  KL is no longer flat: `actor/kl_loss` went from `0.000167` at step 10 to
+  `0.020529` at step 360. The TRL reference was `0.000064` at step 10 and
+  `0.021844` at step 360.
 
-Still unknown:
+Still open:
 
-- Whether the fresh fp32-actor run now shows KL growth and checkpoint drift
-  comparable to TRL.
-- Whether remaining KL differences come from old/ref log-prob plumbing, vLLM
-  topology, FSDP2 vs ZeRO-3, or Ray boundaries.
+- Reward and throughput still need comparison after accepting the KL behavior.
+- Remaining backend differences still include old/ref log-prob plumbing, vLLM
+  topology, FSDP2 vs ZeRO-3, and Ray boundaries.
 
 Next checks:
 
-- Compare checkpoint parameter drift at the same steps.
-- Compare `actor/kl_loss`, TRL `train/kl`, reward, and clipfrac.
-- If still divergent, test old-log-prob bypass and rollout TP=2 separately.
+- Keep `fp32opt` as the baseline for follow-up experiments.
+- Compare reward, clipfrac, throughput, and checkpoint drift at the same steps.
+- Test old-log-prob semantics and rollout TP=2 only as separate experiments.
 
 ## 4. Root Causes Summary
 
@@ -378,14 +384,14 @@ Next checks:
 | Unique prompts per step | **Done** | `GEN_BATCH_SIZE=6`; actor global/mini batch = 48 seq | Verify fresh logs |
 | Clip epsilon | **Done** | `0.06 / 0.08` defaults | Monitor clipfrac |
 | PPO epochs | **Done** | `PPO_EPOCHS=1` default | Confirm no override |
-| Actor update precision | **Partial** | `ACTOR_MODEL_DTYPE=fp32` default | Rerun and verify KL/checkpoint drift |
+| Actor update precision | **Done for KL** | `ACTOR_MODEL_DTYPE=fp32` default; `fp32opt` run shows KL growth comparable to TRL | Continue reward/drift checks |
 
 ### 4.2 Secondary Speed Causes
 
 | Cause | Status | Current state |
 |---|---|---|
 | Separate forward passes | **Pending** | old/ref log-probs still separate |
-| vLLM TP topology | **Resolved for next run** | matched launcher defaults TP=2 |
+| vLLM TP topology | **Pending** | confirmed good run uses TP=1/DP=2; TP=2 should be tested separately |
 | Distributed backend | **Pending** | FSDP2/Ray remains different from ZeRO-3 |
 | Ray RPC overhead | **Pending** | not optimized yet |
 
@@ -405,13 +411,17 @@ Next checks:
 
 ### Not Applied Yet
 
+- `old_log_prob_mode=current`
+  - Not part of the good `fp32opt` run.
+  - Expected impact: closer TRL PPO-anchor semantics; needs a separate test
+    before being folded into defaults.
 - `RANKGRPO_BYPASS_OLD_LOG_PROB=True`
   - Current default: `False`.
   - Expected impact: speed improvement by avoiding one separate actor forward.
   - Convergence impact: should be tested carefully because it changes which
     old log-prob source is trusted.
 - `ROLLOUT_TENSOR_PARALLEL_SIZE=2`
-  - Current default: `2`.
+  - Current default for the good `fp32opt` run: `1`.
   - Expected impact: closer to TRL's vLLM TP=2 generation topology and possibly
     better rollout throughput.
 
@@ -419,19 +429,22 @@ Next checks:
 
 Fresh aligned run checklist:
 
-- [ ] Hydra dump shows `data.gen_batch_size=6`.
-- [ ] Hydra dump shows `actor_rollout_ref.actor.ppo_epochs=1`.
-- [ ] Hydra dump shows clip low/high `0.06 / 0.08`.
-- [ ] Hydra dump shows `actor_rollout_ref.actor.fsdp_config.model_dtype=fp32`.
-- [ ] Logs show total actor batch of 48 generated sequences per optimizer step.
-- [ ] Logs show 6 fixed micro-batches of 4 seq/GPU per optimizer step.
+- [x] Hydra/logs show `data.gen_batch_size=6`.
+- [x] Hydra dump shows `actor_rollout_ref.actor.ppo_epochs=1`.
+- [x] Hydra dump shows clip low/high `0.06 / 0.08`.
+- [x] Hydra dump shows `actor_rollout_ref.actor.fsdp_config.model_dtype=fp32`.
+- [x] Logs show total actor batch of 48 generated sequences per optimizer step.
+- [x] Logs show 6 fixed micro-batches of 4 seq/GPU per optimizer step.
 - [ ] Progress denominator is about `383013 // 6 = 63835`.
-- [ ] `actor/kl_loss` grows or moves comparably to TRL `train/kl`.
+- [x] `actor/kl_loss` grows comparably to TRL `train/kl` in the good `fp32opt`
+  run.
 - [ ] Checkpoint parameter drift is no longer bf16-quantized away.
 - [ ] `eval/reward_total` slope is compared against the TRL baseline.
 - [ ] Wall-clock time per 100 optimizer steps is recorded.
-- [ ] If convergence still differs, test old-log-prob bypass.
-- [ ] If speed or generation behavior still differs, test rollout TP=2.
+- [ ] If convergence still differs beyond KL, test old-logprob semantics
+  separately.
+- [ ] If speed or generation behavior still differs, test rollout TP=2
+  separately.
 
 ## Implementation Inventory
 
