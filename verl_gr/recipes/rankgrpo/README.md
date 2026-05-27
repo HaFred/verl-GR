@@ -122,17 +122,20 @@ The old table mixed incompatible throughput definitions. TRL's derived throughpu
 
 ### Distribution Analysis
 
-**Key finding:** vLLM rollout takes only ~9% of step time. 62% is spent in `update_actor` (FSDP forward + backward + optimizer step). This is a training-bound workload.
+**Key finding:** the current `fp32opt` trace is still not vLLM-rollout bound. vLLM rollout is ~10% of logged step time, while actor update plus weight synchronization is ~55%. Compared with the older May 26 run, `update_actor` is much lower and `update_weights` is now a major visible component.
 
 | Phase | Mean Time | % of Step |
 |---|---|---|
-| gen (vLLM rollout) | 0.59s | 9% |
-| update_actor (FSDP) | 4.23s | 62% |
-| old_log_prob | 0.42s | 6% |
-| ref | 0.20s | 3% |
-| adv | 0.09s | 1% |
-| Other/overhead | ~1.3s | 19% |
-| **Total** | **~6.81s** | **100%** |
+| gen (vLLM rollout) | 0.53s | 10% |
+| update_actor (FSDP train step) | 1.78s | 34% |
+| update_weights (actor → rollout sync) | 1.06s | 20% |
+| old_log_prob | 0.47s | 9% |
+| ref | 0.44s | 9% |
+| adv | 0.09s | 2% |
+| Other/overhead | ~0.83s | 16% |
+| **Total logged step** | **~5.20s** | **100%** |
+
+These numbers are means from the current `g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt` TensorBoard timing scalars through step 1370. Validation (`timing_s/testing`, ~591s when it runs) and checkpoint saving (`timing_s/save_checkpoint`, ~4.15s when it runs) are logged separately from the regular per-step phase distribution.
 
 ### Eval runtime
 
