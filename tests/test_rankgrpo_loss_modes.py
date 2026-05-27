@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import sys
 from pathlib import Path
 
@@ -21,6 +22,7 @@ from verl_gr.recipes.rankgrpo.rankgrpo_loss import (
     _compute_item_mean_log_ratio,
     _trl_clipped_pg_loss,
 )
+from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import compute_rank_grpo_training_reward_metrics
 
 
 def _dual_clip_pg_losses(
@@ -127,8 +129,23 @@ def test_trl_match_agg_differs_from_dual_clip_when_negative_adv_and_large_ratio(
     )
 
 
+def test_rankgrpo_training_reward_metrics_match_trl_reward_total_semantics():
+    class _Batch:
+        non_tensor_batch = {
+            "rank_reward_sum": [0.0, 2.0, 1.0],
+            "rank_reward_mean": [0.0, 0.1, 0.05],
+        }
+
+    metrics = compute_rank_grpo_training_reward_metrics(_Batch())
+
+    assert metrics["train/rankgrpo/reward_total"] == 1.0
+    assert math.isclose(metrics["train/rankgrpo/reward"], 0.05, rel_tol=1e-6, abs_tol=1e-6)
+    assert math.isclose(metrics["train/rankgrpo/hit_any"], 2 / 3, rel_tol=1e-6, abs_tol=1e-6)
+
+
 if __name__ == "__main__":
     test_trl_clipped_pg_matches_manual_min_formulation()
     test_item_mean_log_ratio_broadcasts_within_segments()
     test_trl_match_agg_differs_from_dual_clip_when_negative_adv_and_large_ratio()
+    test_rankgrpo_training_reward_metrics_match_trl_reward_total_semantics()
     print("test_rankgrpo_loss_modes: all checks passed")

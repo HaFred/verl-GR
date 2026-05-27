@@ -64,6 +64,82 @@ GRPO consistently improves over SFT across all metrics. Gains increase with K, f
 
 ---
 
+## Rank-GRPO Algorithm
+
+The original TRL run uses:
+
+```bash
+--reward_func exp_inf
+```
+
+In `Rank-GRPO/libs/reward_funcs.py`, `exp_inf` calls
+`evaluate_direct_match_aligned(...)` and returns a length-20 vector of binary
+per-rank hits:
+
+```text
+rank_rewards[j] = 1 if recommendation j matches a ground-truth movie
+rank_rewards[j] = 0 otherwise
+```
+
+This is not the paper-style DCG suffix return. The paper's rank-level return is
+closer to TRL's `log_decay` path, where hits are discounted by rank and each
+rank receives the remaining suffix DCG:
+
+```text
+gains = hits * discounts
+reward_at_rank_i = sum(gains[i:])
+```
+
+However, the reference run we align against uses `exp_inf`, so verl-gr matches
+that behavior rather than switching to `log_decay`.
+
+### Training Reward Alignment
+
+TRL computes `rewards_items` from `exp_inf`, normalizes them within each prompt's
+8 generations, and broadcasts each item's advantage to the tokens belonging to
+that recommendation. It also logs:
+
+```text
+train/reward_total = mean(sum(rewards_items per 20-item list))
+```
+
+So for the current TRL run, `train/reward_total` is the average number of matched
+ground-truth items per generated list.
+
+verl-gr mirrors the same training signal in
+`verl_gr/recipes/rankgrpo/rankgrpo_algorithm.py`: it computes `rank_rewards`
+with the same aligned matching logic, normalizes within each prompt group, and
+broadcasts item-level advantages to recommendation tokens. It logs these
+training TensorBoard scalars:
+
+```text
+train/rankgrpo/reward_total = mean(sum(rank_rewards per 20-item list))
+train/rankgrpo/reward       = mean(rank_rewards over 20 positions)
+train/rankgrpo/hit_any      = fraction of generated lists with at least one hit
+```
+
+`train/rankgrpo/reward_total` is the direct verl-gr counterpart for TRL's
+`train/reward_total`. `critic/rewards/mean` is not that metric.
+
+During validation, `eval/reward_total` is an alias for
+`val-aux/rankgrpo/rank_reward_sum/mean@8`, so it is also an average hit count
+per list. `eval/reward` similarly aliases
+`val-aux/rankgrpo/rank_rewards/mean@8`, the per-position mean hit rate. For
+example, `eval/reward_total = 0.4106` means about 0.41 matched ground-truth items
+per 20-item generated list on average. It does not mean NDCG is 0.4106.
+
+`critic/rewards/mean` is different. It is a generic verl PPO metric computed
+from `token_level_rewards.sum(-1)`. In this Rank-GRPO rollout path the scalar
+reward score is `float(any(rank_rewards))`, so `critic/rewards/mean` is closer
+to a "hit-any" rate: the fraction of generated lists with at least one hit. It
+is not the same as TRL `train/reward_total`, and it is not NDCG.
+
+NDCG is computed only by the separate offline evaluation code using
+`ndcg_at_k(...)`, where hits are discounted by rank and normalized by ideal DCG.
+Do not infer NDCG directly from `eval/reward_total` or `critic/rewards/mean`.
+
+---
+
 ## Training Convergence
 
 ### Aligned Trace Comparison

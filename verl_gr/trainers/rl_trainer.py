@@ -11,6 +11,7 @@ import torch
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
+from verl.trainer.ppo.metric_utils import compute_data_metrics as _base_compute_data_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
 
@@ -25,7 +26,11 @@ from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_maybe_log_val_generations,
     openonerec_validate,
 )
-from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import compute_rank_grpo_advantage, rankgrpo_enabled
+from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import (
+    compute_rank_grpo_advantage,
+    compute_rank_grpo_training_reward_metrics,
+    rankgrpo_enabled,
+)
 from verl_gr.recipes.rankgrpo.rankgrpo_trainer import RankGRPOTrainerAdapter
 from verl_gr.trainers.task_adapter import TrainerTaskAdapter
 from verl_gr.workers.rollout.beam_config import (
@@ -157,6 +162,12 @@ def compute_advantage(
     return data
 
 
+def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+    metrics = _base_compute_data_metrics(batch=batch, use_critic=use_critic)
+    metrics.update(compute_rank_grpo_training_reward_metrics(batch))
+    return metrics
+
+
 class RLTrainer(RayPPOTrainerBase):
     """RayPPOTrainer override with different workload helpers."""
 
@@ -171,6 +182,7 @@ class RLTrainer(RayPPOTrainerBase):
             import verl.trainer.ppo.ray_trainer as ray_trainer_mod
 
             ray_trainer_mod.compute_advantage = compute_advantage
+            ray_trainer_mod.compute_data_metrics = compute_data_metrics
 
     def fit(self):
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)

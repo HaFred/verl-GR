@@ -11,7 +11,7 @@ from verl import DataProto
 
 from verl_gr.recipes.rankgrpo.rankgrpo_reward import rank_rewards_from_text
 
-__all__ = ["compute_rank_grpo_advantage", "rankgrpo_enabled"]
+__all__ = ["compute_rank_grpo_advantage", "compute_rank_grpo_training_reward_metrics", "rankgrpo_enabled"]
 
 
 def _cfg_get(config: Any, key: str, default=None):
@@ -25,6 +25,34 @@ def _cfg_get(config: Any, key: str, default=None):
 def rankgrpo_enabled(config: Any) -> bool:
     rank_cfg = _cfg_get(config, "rank_grpo", None)
     return bool(_cfg_get(rank_cfg, "enable", False))
+
+
+def _as_float_array(value: Any) -> np.ndarray:
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    return np.asarray(value, dtype=np.float32)
+
+
+def compute_rank_grpo_training_reward_metrics(data: DataProto) -> dict[str, float]:
+    """Expose TRL-comparable training reward scalars from Rank-GRPO rewards."""
+
+    rank_reward_sum = data.non_tensor_batch.get("rank_reward_sum")
+    rank_reward_mean = data.non_tensor_batch.get("rank_reward_mean")
+    if rank_reward_sum is None or rank_reward_mean is None:
+        return {}
+
+    reward_total = _as_float_array(rank_reward_sum)
+    reward = _as_float_array(rank_reward_mean)
+    if reward_total.size == 0 or reward.size == 0:
+        return {}
+
+    return {
+        # Mean hit count per generated recommendation list; matches TRL train/reward_total.
+        "train/rankgrpo/reward_total": float(np.mean(reward_total)),
+        # Mean binary hit rate over rank positions; equal to reward_total / rec_num.
+        "train/rankgrpo/reward": float(np.mean(reward)),
+        "train/rankgrpo/hit_any": float(np.mean(reward_total > 0.0)),
+    }
 
 
 def _decode_response_texts(responses: torch.Tensor, response_mask: torch.Tensor, tokenizer) -> list[str]:
