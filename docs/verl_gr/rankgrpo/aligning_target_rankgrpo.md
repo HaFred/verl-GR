@@ -132,15 +132,16 @@ for indices in uid_to_indices.values():  # each uid = one prompt
 The previous "48 vs 6 prompt groups" concern is resolved because it came from
 misinterpreting TRL's `generation_batch_size` as unique prompts.
 
-### 1.2 PPO Clip Ratio — The Critical Mismatch (3.3×)
+### 1.2 PPO Clip Ratio — Resolved
 
-This is the most impactful hyperparameter misalignment.
+This was a hyperparameter misalignment in earlier verl-gr runs. It is now
+aligned in the default `run_rankgrpo.sh` launch path.
 
 | Parameter | TRL | verl-gr | Ratio |
 |---|---|---|---|
-| `epsilon` (clip low) | **0.06** | **0.2** | 3.3× |
-| `epsilon_high` (clip high) | **0.08** | **0.2** | 2.5× |
-| Effective clip range | **[0.94, 1.08]** | **[0.8, 1.2]** | — |
+| `epsilon` (clip low) | **0.06** | **0.06** | 1× |
+| `epsilon_high` (clip high) | **0.08** | **0.08** | 1× |
+| Effective clip range | **[0.94, 1.08]** | **[0.94, 1.08]** | — |
 
 **TRL** — defined in `train_rank_grpo.py:308-309`:
 
@@ -157,19 +158,19 @@ coef_2 = torch.clamp(coef_1, 1 - self.epsilon_low, 1 + self.epsilon_high)
 # clamp to [0.94, 1.08]
 ```
 
-**verl-gr** — defined in `run_rankgrpo.sh:98-99`:
+**verl-gr** — aligned in `run_rankgrpo.sh` as of 2026-05-27:
 
 ```bash
-PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.2}"
-PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
+PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.06}"
+PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
 ```
 
-Passed via CLI at `.match_rankgrpo.sh:241-243`:
+Passed via CLI from `run_rankgrpo.sh`:
 
 ```bash
-actor_rollout_ref.actor.clip_ratio="${PPO_CLIP_RATIO}"          # 0.2
-actor_rollout_ref.actor.clip_ratio_low="${PPO_CLIP_RATIO}"      # 0.2
-actor_rollout_ref.actor.clip_ratio_high="${PPO_CLIP_RATIO_HIGH}" # 0.2
+actor_rollout_ref.actor.clip_ratio="${PPO_CLIP_RATIO}"           # 0.06
+actor_rollout_ref.actor.clip_ratio_low="${PPO_CLIP_RATIO}"       # 0.06
+actor_rollout_ref.actor.clip_ratio_high="${PPO_CLIP_RATIO_HIGH}" # 0.08
 ```
 
 Used in `rankgrpo_loss.py:93-102` (trl_match path):
@@ -177,17 +178,20 @@ Used in `rankgrpo_loss.py:93-102` (trl_match path):
 ```python
 coef_1 = torch.exp(log_importance_weights)
 coef_2 = torch.clamp(coef_1, 1 - clip_ratio_low, 1 + clip_ratio_high)
-# clamp to [0.8, 1.2]
+# clamp to [0.94, 1.08]
 ```
 
 #### Impact
 
-The clip ratio defines a trust region around the frozen rollout policy π_old. TRL allows the per-token importance ratio to deviate at most ±6-8% from 1.0 before being clipped; verl allows ±20%.
+The clip ratio defines a trust region around the frozen rollout policy π_old.
+This mismatch is now resolved for the default launch path: both TRL and verl-gr
+use `[0.94, 1.08]`.
 
 - **TRL's tight clip**: Each optimizer step makes small, conservative policy changes. Even with imperfect advantage estimates, the damage per step is bounded. Trade-off: requires more steps to move the policy a given distance.
-- **verl's wide clip**: Each optimizer step can make larger policy changes from the same 6-prompt / 48-generation-slot update. This remains an active mismatch after batching alignment.
+- **verl's current default**: Uses the same tight clip range as TRL.
 
-The batch-size mismatch is resolved, so the current clip-ratio question is no longer "wide clip plus 8x fewer prompt groups." It is now a cleaner trust-region mismatch: verl-gr still allows a substantially larger per-step ratio movement than TRL.
+The previous wide-clip explanation applies only to historical runs launched
+before this default was corrected.
 
 ### 1.3 PPO Epochs (Sequence Reuse Strategy)
 
@@ -259,6 +263,9 @@ The following are correctly aligned between both implementations:
 | Remove padding | implicit (HF) | enabled | — / `run_rankgrpo.sh:76` |
 | vLLM GPU memory util | 0.25 | 0.25 | `run_rl.sh:45` / config yaml |
 | Entropy coefficient | 0.0 | 0.0 | TRL default / config yaml:60 |
+| Train dataset shuffle | True | True | `GRPOConfig.shuffle_dataset` default / `run_rankgrpo.sh` |
+| Validation dataset shuffle | False | False | `run_rl.sh --no-val_shuffle` / `VALIDATION_SHUFFLE=False` |
+| Actor training parameter dtype | fp32 master/mixed bf16 | fp32 actor load + FSDP mixed bf16 | DeepSpeed bf16 / `ACTOR_MODEL_DTYPE=fp32` |
 
 ### 1.5 Distributed Backend Differences
 
@@ -267,7 +274,7 @@ The following are correctly aligned between both implementations:
 | Strategy | **DeepSpeed ZeRO-3** | **FSDP2** |
 | Accelerate config | `configs/qwen25_0.5b_grpo.yaml` | N/A (Ray-based) |
 | vLLM integration | **Colocated** (same process) | **Hybrid engine** (separate Ray actors) |
-| vLLM TP size | **2** (both GPUs in one TP group) | **1** (each GPU independent, data-parallel) |
+| vLLM TP size | **2** (both GPUs in one TP group) | **2** by default for the matched Rank-GRPO run |
 
 **TRL** (`qwen25_0.5b_grpo.yaml`):
 
@@ -291,7 +298,7 @@ if self.state.global_step != self._last_loaded_step:
 
 With TP=2, both GPUs form one vLLM instance, generating completions cooperatively. All prompts across GPUs are gathered, generated jointly, then scattered back.
 
-**verl-gr**: Uses FSDP2 (PyTorch native) via the `fsdp2` strategy flag. The hybrid engine runs vLLM, actor, and reference policy as separate Ray actors communicating via RPC. With `ROLLOUT_TENSOR_PARALLEL_SIZE=1`, each GPU runs an independent vLLM instance (data-parallel rollout).
+**verl-gr**: Uses FSDP2 (PyTorch native) via the `fsdp2` strategy flag. The hybrid engine runs vLLM, actor, and reference policy as separate Ray actors communicating via RPC. The matched Rank-GRPO launcher now defaults `ROLLOUT_TENSOR_PARALLEL_SIZE=2`, so both GPUs form one rollout TP group like TRL.
 
 ---
 
@@ -332,7 +339,7 @@ Key efficiency: old_log_probs and ref_log_probs are computed **during generation
 ```
 Phase 1: Generation (every step)
 └── async_rollout_manager.generate_sequences on 6 prompts × 8 = 48 completions
-    └── vLLM generate (TP=1, DP=2, hybrid engine via Ray RPC)
+    └── vLLM generate (TP=2, hybrid engine via Ray RPC)
 
 Phase 2: old_log_prob (separate forward pass, every step)
 └── _compute_old_log_prob → actor_rollout_wg.compute_log_prob (Ray RPC)
@@ -389,7 +396,7 @@ At the boundary:
 ```python
 # rankgrpo_loss.py:96-98
 pg1 = coef_1 * advantages      # unclipped
-pg2 = coef_2 * advantages      # clipped (clamp to [0.8, 1.2])
+pg2 = coef_2 * advantages      # clipped (historical run: [0.8, 1.2])
 per_token_loss = -torch.min(pg1, pg2)
 # When coef_1 is outside [1-ε, 1+ε]: pg2 is always chosen, gradient = 0
 ```
@@ -434,7 +441,7 @@ if self.state.global_step != self._last_loaded_step:
 
 **TRL**: TP=2 means both GPUs form one vLLM instance. With `vllm_mode=colocate`, all prompts across GPUs are gathered, processed jointly, then scattered. This is efficient for generation throughput.
 
-**verl-gr**: TP=1, DP=2 means each GPU runs an independent vLLM instance, each processing half the prompts. For small batch sizes (3 prompts per GPU), vLLM's batching efficiency is lower than with TP=2 processing 6 prompts jointly.
+**verl-gr**: now defaults to TP=2 for the matched Rank-GRPO launcher, so both GPUs form one vLLM tensor-parallel group instead of TP=1/DP=2 independent rollout workers.
 
 #### 2.2.6 Memory Layout
 
@@ -445,7 +452,7 @@ if self.state.global_step != self._last_loaded_step:
 
 | Phase | TRL (per opt step) | verl-gr (per opt step) |
 |---|---|---|
-| vLLM generation | 48 seq, TP=2 | 48 seq, TP=1×2 |
+| vLLM generation | 48 seq, TP=2 | 48 seq, TP=2 |
 | Policy log_prob forward | 48 seq, inline | 48 seq + RPC overhead |
 | Ref log_prob forward | 48 seq, inline | 48 seq + RPC overhead |
 | Training F+B | 6×8 seq micro-batches | 6×4 seq/GPU micro-batches |
@@ -498,9 +505,9 @@ if self.scale_rewards:
 - **Between-group variance**: Both systems now compute one optimizer update from 6 independent prompt groups.
 - **Standard error of group mean**: The previous √(48/6) ≈ 2.8× gap was based on the incorrect assumption that TRL had 48 unique prompt groups per update.
 
-The remaining convergence questions should therefore be attributed to other mismatches, such as clip range, rollout/log-prob plumbing, vLLM topology, or distributed backend differences.
+The remaining convergence questions should therefore be attributed to other mismatches, such as rollout/log-prob plumbing, vLLM topology, or distributed backend differences.
 
-### 3.2 Interaction of Wide Clip + Same-Sized Advantages
+### 3.2 Clip Range: Resolved for Current Default
 
 The policy gradient loss in both implementations is:
 
@@ -513,13 +520,12 @@ per_token_loss = -torch.min(coef_1 * adv, coef_2 * adv)
 The gradient flows through `coef_1` when it's within the clip range. When `coef_1` exceeds the clip boundary, the gradient is determined by `coef_2` (constant), giving zero gradient for the ratio.
 
 With the batch-size mismatch resolved, both implementations receive similarly
-sized advantage samples per optimizer update. The active difference is clip
-range:
+sized advantage samples per optimizer update. The clip range is now aligned:
 
 1. TRL clips item-level importance ratios to `[0.94, 1.08]`.
-2. verl-gr currently clips to `[0.8, 1.2]` unless overridden.
-3. The larger ratio range means verl-gr can move farther from the rollout policy in a single update.
-4. This should be evaluated by comparing reward curves, KL, and `actor/pg_clipfrac` after the aligned batching run.
+2. verl-gr now defaults to `[0.94, 1.08]`.
+3. The previous `[0.8, 1.2]` behavior applies only to historical runs or explicit overrides.
+4. The next comparison should evaluate reward curves, KL, and `actor/pg_clipfrac` with this aligned default.
 
 ### 3.3 ppo_epochs: Resolved for Current Default
 
@@ -552,12 +558,19 @@ Both systems use the k3 KL estimator (`low_var_kl` in verl, identical to TRL's d
 per_token_kl = torch.exp(ref_log_prob - log_prob) - (ref_log_prob - log_prob) - 1
 ```
 
-With verl-gr's wider clip and more epochs:
-- The KL divergence per token can grow larger per step (wider clip allows more policy drift)
-- 12 epochs on the same data can cause the policy to overfit to those 6 prompts
+With historical verl-gr runs that used wider clip and more epochs:
+- The KL divergence per token could grow larger per step (wider clip allows more policy drift)
+- 12 epochs on the same data could cause the policy to overfit to the current prompt batch
 - The KL penalty (coefficient=1e-3) may be insufficient to regularize against this
 
-TRL's tight clip naturally constrains KL growth. Each step can only move the policy a small amount from π_old, keeping KL small and stable.
+For the current aligned verl-gr run, the observed flat `actor/kl_loss` was not
+caused by the KL formula, clip range, or batch sizing. The actor was loaded
+directly as `bfloat16`, so torch AdamW created bf16 moment tensors and applied
+`lr=1e-6` updates into bf16 parameters. Checkpoint drift from step 50 to 150 was
+only about `1.8e-5` relative on one FSDP shard, while the TRL checkpoint drift
+over comparable early training was an order of magnitude larger. The default is
+now changed to load the trainable actor in fp32 (`ACTOR_MODEL_DTYPE=fp32`) while
+keeping FSDP mixed precision and rollout bf16 behavior.
 
 ---
 
@@ -567,39 +580,73 @@ TRL's tight clip naturally constrains KL growth. Each step can only move the pol
 
 | # | Root Cause | TRL Value | verl-gr Value | Impact |
 |---|---|---|---|---|
-| 1 | **Clip epsilon** (too wide) | 0.06/0.08 | 0.2/0.2 | Allows 3.3× larger per-step policy drift |
+| 1 | **Clip epsilon** | 0.06/0.08 | 0.06/0.08 | **Resolved** — trust region is aligned |
 | 2 | **Unique prompts/step** | 6 | 6 | **Resolved** — batching/optimizer-update behavior is aligned |
 | 3 | **ppo_epochs** | 1 (mu=1) | 1 | **Resolved** — one pass per generated sequence |
+| 4 | **Actor update precision** | fp32 master/mixed bf16 | fp32 actor load + mixed bf16 | **Resolved for next run** — avoids bf16 quantization of `lr=1e-6` updates |
 
 ### 4.2 Secondary Root Causes (Speed)
 
 | # | Root Cause | TRL | verl-gr | Impact |
 |---|---|---|---|---|
 | 4 | **Separate forward passes** | 1 consolidated | 3 separate (RPC) | Extra latency from Ray serialization and redundant computation |
-| 5 | **vLLM TP configuration** | TP=2 (efficient) | TP=1, DP=2 (less batching) | Lower generation throughput per GPU |
+| 5 | **vLLM TP configuration** | TP=2 | TP=2 by default in matched launcher | **Resolved for next run** — rollout topology is aligned |
 | 6 | **Distributed backend** | DeepSpeed ZeRO-3 | FSDP2 | ZeRO-3 has better memory efficiency for small models |
 | 7 | **Ray RPC overhead** | None (colocated) | Present (hybrid engine) | Serialization, scheduling, dispatch latency at every data boundary |
 
-### 4.3 Interaction Diagram
+### 4.3 KL Follow-Up Queue if the Fresh Run Still Diverges
+
+The next verl-gr run should start cleanly with `ACTOR_MODEL_DTYPE=fp32`. If
+`actor/kl_loss` still does not grow in the same direction as TRL's `train/kl`,
+tackle the remaining structural/backend differences one by one:
+
+Fresh-run update: `g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt` confirms
+that the fp32 actor change fixed the flat-KL failure. `actor/kl_loss` increased
+from `0.000167` at step 10 to `0.020529` at step 360. At the same optimizer
+steps, the TRL reference run increased from `0.000064` to `0.021844`, so the
+remaining gap is no longer "flat vs increasing" but early-step trajectory and
+backend/sample-path alignment.
+
+1. **Old/ref log-prob plumbing**: TRL computes policy and reference log-probs
+   inline during generation, while verl-gr runs separate `old_log_prob` and
+   `ref_log_prob` forward passes through Ray workers. First test whether using
+   TRL's aligned-generation old-logprob behavior changes KL/update drift. In
+   TRL, when `gradient_accumulation_steps` is divisible by
+   `steps_per_generation * num_iterations`, `old_per_token_logps` is not
+   recomputed; the loss uses `per_token_logps.detach()`. verl-gr now exposes
+   `algorithm.rank_grpo.old_log_prob_mode=current` for `loss_mode=trl_match`,
+   and `.match_rankgrpo.sh` starts a fresh `_currentold` experiment by default.
+2. **vLLM topology**: TRL uses colocated vLLM with tensor parallel size 2. The
+   matched verl-gr launcher now defaults `ROLLOUT_TENSOR_PARALLEL_SIZE=2` and
+   starts a fresh `_tp2` experiment by default.
+3. **Distributed backend**: TRL uses DeepSpeed ZeRO-3 with fp32 optimizer/master
+   state; verl-gr uses FSDP2 with Ray-managed actor/ref/rollout workers. Compare
+   checkpoint parameter drift and optimizer-state dtypes after the fresh run.
+4. **Ray/RPC boundaries**: verl-gr crosses DataProto/Ray boundaries between
+   generation, log-prob, reference, and actor-update phases; TRL is colocated.
+   If the numerical paths above are aligned, instrument tensors at these
+   boundaries to find where policy/ref/old log-probs diverge.
+
+### 4.4 Interaction Diagram
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                    verl-gr Convergence Problem                    │
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                   │
-│  Batching aligned (6 prompts)       Wide clip (ε=0.2)            │
+│  Batching aligned (6 prompts)       Clip aligned (0.06/0.08)     │
 │         │                                │                        │
 │         ▼                                ▼                        │
 │  ┌──────────────┐              ┌──────────────────┐              │
-│  │ Same prompt  │              │ Larger per-step  │              │
-│  │ groups as TRL│              │ policy movement  │              │
+│  │ Same prompt  │              │ Same trust       │              │
+│  │ groups as TRL│              │ region as TRL    │              │
 │  └──────────────┘              └────────┬─────────┘              │
 │                                         │                        │
 │                                         ▼                        │
 │                               ┌──────────────────┐              │
 │                               │ Need rerun with  │              │
 │                               │ aligned batching │              │
-│                               │ to isolate clip, │              │
+│                               │ to isolate       │              │
 │                               │ backend, RPC, TP │              │
 │                               └────────┬─────────┘              │
 │                                        ▼                         │
@@ -615,40 +662,24 @@ TRL's tight clip naturally constrains KL growth. Each step can only move the pol
 
 ## 5. Recommended Fixes (Prioritized)
 
-### Priority 1: Align Clip Ratio (Highest Impact, One-Line Change)
+### Priority 1: Match TRL Old-Logprob Semantics
 
-In `run_rankgrpo.sh`, change:
+Use the current policy log-probs as the detached PPO anchor in the TRL-matched
+loss path:
 
 ```bash
-# Current
-PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.2}"
-PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
-
-# Recommended
-PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.06}"
-PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
+RANKGRPO_OLD_LOG_PROB_MODE="${RANKGRPO_OLD_LOG_PROB_MODE:-current}"
 ```
 
-This single change addresses root cause #1. The tighter clip:
-- Limits per-update policy movement to TRL's trust region
-- Matches TRL's proven configuration
+This matches TRL's aligned-generation path exactly: when generation and optimizer
+steps are aligned, TRL sets `old_per_token_logps = per_token_logps.detach()`
+inside the loss instead of training against a separate recomputed old-logprob
+tensor.
 
-### Priority 2: Optimize Forward Passes
-
-Enable bypass mode to use rollout log probs directly (avoid separate old_log_prob computation):
-
-```bash
-# In run_rankgrpo.sh (line 75)
-RANKGRPO_BYPASS_OLD_LOG_PROB="${RANKGRPO_BYPASS_OLD_LOG_PROB:-True}"  # change from False
-```
-
-This saves one forward pass per step (the `_compute_old_log_prob` call).
-
-### Priority 3: Align vLLM TP Configuration
+### Priority 2: Align vLLM TP Configuration
 
 ```bash
-# In run_rankgrpo.sh (line 67)
-ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-2}"  # change from 1
+ROLLOUT_TENSOR_PARALLEL_SIZE="${ROLLOUT_TENSOR_PARALLEL_SIZE:-2}"
 ```
 
 This improves generation throughput by using both GPUs cooperatively for vLLM inference.
@@ -657,11 +688,10 @@ This improves generation throughput by using both GPUs cooperatively for vLLM in
 
 | Fix | Expected Convergence Improvement | Expected Speed Improvement |
 |---|---|---|
-| Clip to 0.06/0.08 | TBD after aligned-batch rerun | Minor |
-| Bypass old_log_prob | None | Moderate — saves one forward pass |
-| vLLM TP=2 | None | Moderate — faster generation |
+| `old_log_prob_mode=current` | Small but direct — exact TRL PPO anchor semantics | None yet — still computes old log-probs for diagnostics |
+| vLLM TP=2 | Possible — closer sample/backend topology | Moderate — faster generation |
 
-Batching and `ppo_epochs` are already aligned. The next run should isolate the remaining clip/backend/RPC/TP differences.
+Batching, clip ratio, `ppo_epochs`, training shuffle, and validation no-shuffle behavior are now aligned. The next run should isolate the remaining backend/RPC/TP differences.
 
 ---
 

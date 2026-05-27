@@ -78,7 +78,9 @@ actor_rollout_ref:
       wrap_policy:
         transformer_layer_cls_to_wrap:
           - Qwen2DecoderLayer
-      model_dtype: bfloat16
+      # Keep trainable parameters and Adam states in fp32. Loading the actor
+      # directly as bf16 makes lr=1e-6 updates mostly quantize away.
+      model_dtype: fp32
     profiler:
       enable: false
       all_ranks: false
@@ -88,7 +90,7 @@ actor_rollout_ref:
     name: vllm
     n: 8
     dtype: bfloat16
-    tensor_model_parallel_size: 1
+    tensor_model_parallel_size: 2
     temperature: 1.0
     top_p: 1.0
     do_sample: true
@@ -146,6 +148,7 @@ algorithm:
     gt_catalog_path: null
     importance_sampling_level: item
     loss_mode: trl_match  # trl_match = matches TRL reference; verl_default = dual-clip PPO path
+    old_log_prob_mode: current  # TRL aligned path uses per_token_logps.detach() instead of recomputed old log-probs
   rollout_correction:
     rollout_is: null
     rollout_rs: null

@@ -1,250 +1,445 @@
-# Aligning verl-gr RankGRPO with TRL — Progress Log
+# Aligning verl-gr RankGRPO with TRL — Progress by Target Item
 
-Goal: Make verl-gr RankGRPO match or exceed TRL's convergence rate and compute efficiency.
+Goal: make verl-gr RankGRPO match or exceed TRL's convergence rate and compute
+efficiency.
 
-Reference: `aligning_rankgrpo.md` (root cause analysis).
+Reference target analysis:
+`docs/verl_gr/rankgrpo/aligning_target_rankgrpo.md`.
 
----
+This document is organized in the same order as the target analysis. It tracks
+what has been aligned, what remains different, and what still needs evidence
+from fresh runs.
 
-## Current correction — 2026-05-27: TRL `generation_batch_size` counts generation slots
+Status legend:
 
-**Status: finished.** `run_rankgrpo.sh` now owns the TRL-alignment defaults,
-and `.match_rankgrpo.sh` only keeps endpoint-specific GPU/Ray/output setup.
-The default verl-gr RankGRPO launch now matches TRL's current batching and
-optimizer-update behavior: `6` unique prompts, `8` generations per prompt,
-`48` generated sequences, `6` accumulation micro-batches, and `1` optimizer
-step.
+- **Done**: code/config default has been changed and the target behavior is now
+  represented by the default launch path.
+- **Partial**: a likely cause has been addressed, but the run evidence is not
+  complete yet.
+- **Pending**: known target item is not implemented or not yet tested.
 
-The earlier version of this note treated TRL's `generation_batch_size=48` as
-48 unique prompts. That was wrong for the current TRL RankGRPO code path.
+## Current Status Snapshot
 
-In TRL:
+| Target item | Status | Current state | Remaining work |
+|---|---|---|---|
+| 1.1 Effective batch size | **Done** | verl-gr now uses 6 unique prompts, 8 rollouts, 48 generated sequences, 6 accumulation micro-batches, 1 optimizer step | Verify config dump/logs in a fresh run |
+| 1.2 PPO clip ratio | **Done** | verl-gr defaults to `[0.94, 1.08]`, matching TRL | Monitor `actor/pg_clipfrac` |
+| 1.3 PPO epochs / sequence reuse | **Done** | verl-gr defaults to `PPO_EPOCHS=1`, matching TRL `mu=1` | Confirm no override in launched runs |
+| 1.4 Other aligned hparams | **Done** | LR, KL coefficient, Adam betas, shuffle behavior, rollout count, seed, and actor dtype defaults are aligned | Confirm Hydra dump for each run |
+| 1.5 Distributed backend | **Partial / known difference** | TRL uses DeepSpeed ZeRO-3 + colocated vLLM TP=2; verl-gr still uses FSDP2 + Ray hybrid engine, but matched rollout TP now defaults to 2 | Compare backend/RPC effects after TP=2 run |
+| 2. Compute performance | **Pending** | Batch work per optimizer step is aligned; structural overhead remains | Measure wall-clock and phase timing |
+| 3. Convergence analysis | **Partial** | batch, clip, epochs, sample diversity, and actor dtype are addressed | Rerun and compare reward/KL/clipfrac |
+| 5. Recommended fixes | **Partial** | alignment fixes, current old-logprob semantics, and vLLM TP=2 are in defaults | backend/RPC differences remain |
+| 6. Verification plan | **Pending** | checklist exists below | Run and record evidence |
 
-- `generation_batch_size = per_device_train_batch_size × num_processes × gradient_accumulation_steps`
-- For the current 2-GPU reference: `4 × 2 × 6 = 48`
-- `RepeatSampler` then uses `batch_size = generation_batch_size // num_generations`
-- With `num_generations=8`, that is `48 // 8 = 6` unique prompts
-- Each optimizer update therefore sees `6 unique prompts × 8 generations = 48 generated sequences`
+## 1. Hyperparameter Analysis
 
-In verl-gr:
+### 1.1 Effective Batch Size: Done
 
-- `data.gen_batch_size` is measured in unique prompts, not repeated generation slots
-- To match TRL's current optimizer-update behavior, `data.gen_batch_size` must be `6`, not `48`
-- With `rollout.n=8`, verl-gr also produces `6 × 8 = 48` generated sequences per optimizer update
+Accomplished:
 
-This correction explains the observed progress-bar denominators:
+- Corrected the interpretation of TRL's `generation_batch_size`.
+- Moved TRL-alignment defaults into `scripts/run_rankgrpo.sh`, so
+  `.match_rankgrpo.sh` only keeps endpoint-specific GPU/Ray/output setup.
+- Added `data.gen_batch_size=6` as unique prompts per optimizer step.
+- Set actor `global_batch_size = mini_batch_size = gen_batch_size × rollout.n`
+  in `verl_080_dev/verl/trainer/ppo/ray_trainer.py`, so one actor update uses
+  one mini-batch and lets the engine accumulate gradients across micro-batches.
+- Disabled dynamic actor micro-batching for the aligned run and set
+  `ppo_micro_batch_size_per_gpu=4`, giving 6 micro-batches per optimizer step on
+  2 GPUs.
 
-- TRL: `383013 // 6 = 63835` optimizer updates
-- verl-gr with the previous `gen_batch_size=48`: about `383013 // 48 = 7975` optimizer updates
-- verl-gr with corrected `gen_batch_size=6`: about `383013 // 6 = 63835` optimizer updates
+Current verl-gr defaults:
 
-## Change 1 — 2026-05-26: `use_dynamic_bsz` knob + gradient accumulation support
+```text
+TRAIN_BATCH_SIZE              = 1   unique prompt per micro-batch
+GRADIENT_ACCUMULATION_STEPS   = 6
+GEN_BATCH_SIZE                = 1 × 6 = 6 unique prompts per optimizer step
+ROLLOUT_N                     = 8
+ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU = 4 sequences/GPU
 
-### Motivation
-
-The original goal was to stop verl-gr from taking multiple small optimizer steps
-inside one rollout batch. That remains valid, but the target batch size has been
-corrected: current TRL sees **6 unique prompts per optimizer update**, not 48.
-The desired behavior is:
-
-- 6 unique prompts per optimizer update
-- 8 rollouts per prompt
-- 48 generated sequences per optimizer update
-- 6 gradient-accumulation micro-batches
-- 1 optimizer step after all micro-batches
-- A progress-bar denominator matching TRL's optimizer-step count
-
-### Changes
-
-#### 1a. New env vars (`scripts/run_rankgrpo.sh`)
-
-| Var | Default | Purpose |
-|-----|---------|---------|
-| `USE_DYNAMIC_BSZ` | `False` in `run_rankgrpo.sh` when gradient accumulation is enabled | Knob to disable dynamic token-based micro-batching so fixed micro-batches reproduce TRL-style accumulation |
-| `ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU` | `4` | Fixed micro-batch size (seq/GPU) when `USE_DYNAMIC_BSZ=False`. 4 = 8 rollout sequences split over 2 GPUs |
-| `GRADIENT_ACCUMULATION_STEPS` | `6` | Number of micro-batches per optimizer step. `run_rankgrpo.sh` sets `gen_batch_size = 1 × 6 = 6` unique prompts |
-| `GEN_BATCH_SIZE` | (computed) | `1 × 6 = 6` unique prompts per global step, matching TRL's `generation_batch_size=48` slots with 8 generations |
-
-#### 1b. Wired through `run_rankgrpo.sh`
-
-- Owns the TRL-alignment defaults so all launch wrappers get the same behavior
-- Passes `data.gen_batch_size`, `actor_rollout_ref.actor.use_dynamic_bsz`, and `actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu` to Hydra CLI
-
-#### 1c. Config default (`configs/verl_gr/rankgrpo/rankgrpo_trainer.yaml`)
-
-- Added `ppo_micro_batch_size_per_gpu` under `actor_rollout_ref.actor` and override it from the match script (only effective when `use_dynamic_bsz=False`)
-
-#### 1d. Core change (`verl_080_dev/verl/trainer/ppo/ray_trainer.py:_update_actor`)
-
-- `global_batch_size` now uses `gen_batch_size × rollout.n` (total sequences per optimizer step)
-- `mini_batch_size` is set to `global_batch_size` — creating a single mini-batch containing all data
-- Gradient accumulation happens at the **micro-batch** level inside the FSDP engine, not at the mini-batch level in `train_mini_batch`
-
-### How verl's batch hierarchy maps to TRL's gradient accumulation
-
-verl has a three-level batch hierarchy. Understanding this is critical to see why the implementation correctly aligns with TRL.
-
-#### verl's three-level batch structure
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Global Batch  (global_batch_size)                          │
-│  All sequences processed before one optimizer.step()        │
-│  e.g. 6 prompts × 8 rollouts = 48 sequences                 │
-│                                                             │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  Mini-Batch  (mini_batch_size)                        │  │
-│  │  Subset of global batch processed by train_mini_batch │  │
-│  │  Each mini-batch → one call to engine.train_batch()   │  │
-│  │  Multiple mini-batches → multiple optimizer.step()s   │  │
-│  │  e.g. 48 sequences (1 mini-batch = full global)       │  │
-│  │                                                       │  │
-│  │  ┌─────────────────────────────────────────────────┐  │  │
-│  │  │  Micro-Batch  (micro_batch_size_per_gpu)        │  │  │
-│  │  │  Subset of mini-batch processed by GPU in one   │  │  │
-│  │  │  forward+backward pass.                         │  │  │
-│  │  │  Gradients ACCUMULATE across micro-batches.     │  │  │
-│  │  │  Optimizer steps only after ALL micro-batches.  │  │  │
-│  │  │  e.g. 4 seq/GPU (6 micro-batches per epoch)     │  │  │
-│  │  └─────────────────────────────────────────────────┘  │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
+Total generated sequences per optimizer step = 6 × 8 = 48
 ```
 
-**Key rule**: Only micro-batch boundaries accumulate gradients. Mini-batch boundaries always trigger `optimizer.step()` + `zero_grad()`. Therefore, to get true gradient accumulation, we must have exactly **one mini-batch** and **multiple micro-batches**.
+#### TRL Batch Logic
 
-#### How this maps to TRL
+TRL has three related but different quantities:
 
-TRL's gradient accumulation (`gradient_accumulation_steps=6`) works as follows:
+- `num_generations`: GRPO group size `G`. Each unique prompt is sampled `G`
+  times so rewards can be normalized within the same-prompt group.
+- `per_device_train_batch_size × num_processes`: generated sequence slots
+  processed by one global forward/backward micro-step.
+- `gradient_accumulation_steps`: number of micro-steps accumulated before
+  `optimizer.step()`.
 
+Therefore TRL's `generation_batch_size` is **not** the number of unique prompts.
+It is the number of generated sequence slots consumed before one optimizer step:
+
+```text
+generation_batch_size
+  = per_device_train_batch_size × num_processes × gradient_accumulation_steps
+  = 4 × 2 × 6
+  = 48 generated sequence slots
 ```
-TRL:
-  generation_batch_size=48 repeated generation slots
-  num_generations=8 → 6 unique prompts
-  Generate 6 prompts × 8 = 48 completions
-  Split into 6 chunks of 8 seq (1 prompt × 8 rollouts)
-  For each chunk:
-    forward + backward (accumulate gradients, no optimizer step)
-  After all 6 chunks:
-    optimizer.step() + zero_grad()
-  → 1 optimizer step per 6 unique prompts / 48 generation slots
+
+Because `num_generations=8`, those 48 slots correspond to:
+
+```text
+unique prompts per optimizer step
+  = generation_batch_size / num_generations
+  = 48 / 8
+  = 6 unique prompts
 ```
 
-verl-gr achieves the same with:
+In the current 2-GPU reference run, `gradient_accumulation_steps=6` happens to
+equal the number of unique prompts per optimizer step. That equality is
+incidental:
 
+```text
+per_device_train_batch_size × num_processes
+  = 4 × 2
+  = 8 generated sequence slots per micro-step
+  = num_generations
 ```
+
+So each micro-step contains exactly one prompt group:
+
+```text
+micro-step 1: prompt A × 8 generations
+micro-step 2: prompt B × 8 generations
+...
+micro-step 6: prompt F × 8 generations
+optimizer.step()
+```
+
+If `per_device_train_batch_size` changed to 8 while keeping
+`num_processes=2`, `gradient_accumulation_steps=6`, and `num_generations=8`,
+then:
+
+```text
+generation_batch_size = 8 × 2 × 6 = 96 slots
+unique prompts        = 96 / 8 = 12 prompts
+```
+
+`gradient_accumulation_steps` would still be 6, but each micro-step would
+contain 16 generated sequence slots = 2 unique prompts × 8 generations. This is
+why `gradient_accumulation_steps` cannot be treated as the unique-prompt batch
+size in general.
+
+#### verl-gr Mapping
+
+```text
 verl-gr:
   DataLoader yields gen_batch_size=6 unique prompts
   Generate 6 × 8 = 48 completions
   _update_actor:
     global_batch_size = mini_batch_size = 48
     → train_mini_batch creates 1 mini-batch of 48 seq (24 seq/GPU)
-  Engine.train_batch (FSDP2):
+  Engine.train_batch:
     Splits 24 seq/GPU into micro-batches of 4 seq/GPU
-    → 6 micro-batches per epoch
-    For each micro-batch:
-      forward + backward (accumulate gradients, no optimizer step)
-    After all 6 micro-batches:
-      optimizer.step() + zero_grad()
-  → 1 optimizer step per 6 unique prompts / 48 generation slots
+    → 6 micro-batches per optimizer step when ppo_epochs=1
+    → 1 optimizer.step()
 ```
 
-The mapping is:
+Progress-bar denominator implication:
 
-| TRL concept | verl-gr equivalent | Value |
+```text
+383013 dataset prompts // 6 unique prompts per optimizer step = 63835 steps
+```
+
+The previous `gen_batch_size=48` verl-gr setting meant 48 unique prompts × 8
+rollouts = 384 generated sequences per update, which was not equivalent to TRL.
+
+Remaining verification:
+
+- Confirm `data.gen_batch_size=6` in the Hydra dump.
+- Confirm actor `global_batch_size=48` and `mini_batch_size=48` in debug logs.
+- Confirm one optimizer update per 6 unique prompts.
+
+### 1.2 PPO Clip Ratio: Done
+
+Accomplished:
+
+- `scripts/run_rankgrpo.sh` now defaults:
+
+```bash
+PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.06}"
+PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
+```
+
+- These values are passed to:
+
+```text
+actor_rollout_ref.actor.clip_ratio=0.06
+actor_rollout_ref.actor.clip_ratio_low=0.06
+actor_rollout_ref.actor.clip_ratio_high=0.08
+```
+
+This matches TRL's effective clip range `[0.94, 1.08]`.
+
+Remaining verification:
+
+- Monitor `actor/pg_clipfrac`; it should not immediately saturate under the
+  aligned default.
+
+### 1.3 PPO Epochs / Sequence Reuse: Done
+
+Accomplished:
+
+- `scripts/run_rankgrpo.sh` now defaults `PPO_EPOCHS=1`.
+- This matches TRL's `--mu 1` / `num_iterations=1`.
+- Each generated sequence is used for one forward/backward pass before the next
+  optimizer step.
+
+Remaining verification:
+
+- Confirm launched jobs do not override `PPO_EPOCHS`.
+- Compare `actor/pg_loss`, KL, and reward with one pass per generated batch.
+
+### 1.4 Other Aligned Hyperparameters: Done
+
+Current defaults aligned with TRL:
+
+| Parameter | TRL | verl-gr |
 |---|---|---|
-| Generation batch | `gen_batch_size × rollout.n` | 48 seq |
-| Gradient accumulation steps | Number of micro-batches | 6 |
-| Per-micro-batch (seq/GPU) | `ppo_micro_batch_size_per_gpu` | 4 |
-| Unique prompts per opt step | `gen_batch_size` | 6 |
-| Optimizer steps per generation | 1 mini-batch × 1 epoch | 1 |
+| Learning rate | `1e-6` | `LEARNING_RATE=1e-6` |
+| KL coefficient | `1e-3` | `KL_COEF=1e-3` |
+| Adam beta1/beta2 | `0.9 / 0.99` | `0.9 / 0.99` |
+| Rollouts per prompt | `num_generations=8` | `ROLLOUT_N=8` |
+| Prompt/completion length | `2048 / 1024` | `2048 / 1024` |
+| Seed | `3407` | `SEED=3407` |
+| Train shuffle | enabled | `DATA_SHUFFLE=True` |
+| Validation shuffle | disabled | `VALIDATION_SHUFFLE=False` |
+| Actor train dtype | fp32 master/mixed bf16 | `ACTOR_MODEL_DTYPE=fp32` + FSDP mixed precision |
 
-**Important**: `ppo_epochs` multiplies everything — each epoch does a full forward+backward pass through all micro-batches with its own optimizer step. For strict TRL optimizer-step alignment, keep `ppo_epochs=1` with `num_iterations=1`.
+Accomplished:
 
-#### Why the previous approach (multiple mini-batches) was wrong
+- Validation now follows TRL's `--no-val_shuffle` behavior.
+- The trainable actor now defaults to fp32 loading to avoid quantizing
+  `lr=1e-6` AdamW updates into bf16 parameters.
 
-The initial implementation set `mini_batch_size < global_batch_size`, creating multiple mini-batches. But `train_mini_batch` calls `engine.train_batch()` for **each** mini-batch, and each call does its own `optimizer.step()`. This meant:
+Remaining verification:
 
+- Confirm each value in the Hydra config dump for every comparison run.
+
+### 1.5 Distributed Backend Differences: Pending / Known Difference
+
+Not aligned yet:
+
+| Aspect | TRL | verl-gr current default |
+|---|---|---|
+| Training backend | DeepSpeed ZeRO-3 | FSDP2 |
+| Runtime topology | Accelerate trainer process | Ray hybrid engine |
+| vLLM integration | colocated | Ray rollout workers |
+| vLLM tensor parallelism | TP=2 | TP=2 by default in matched launcher |
+
+Current decision:
+
+- The matched launcher now defaults `ROLLOUT_TENSOR_PARALLEL_SIZE=2` to match
+  TRL's rollout topology more closely.
+
+Remaining verification:
+
+- Compare the new TP=2 run against the previous TP=1/DP=2 run under the same
+  batch/clip/epoch settings.
+- Compare checkpoint parameter drift and optimizer-state dtypes between TRL and
+  verl-gr.
+
+## 2. Compute Performance Analysis
+
+### 2.1 Per-Optimizer-Step Work Breakdown: Partial
+
+Accomplished:
+
+- The amount of training data per optimizer step is now aligned:
+
+```text
+6 unique prompts × 8 rollouts = 48 generated sequences
 ```
-WRONG (previous):
-  global_batch_size=48, mini_batch_size=8
-  → 6 mini-batches, each calls train_batch()
-  → 6 separate optimizer.step() calls
-  → Each step sees only 1 unique prompt (8 seq)
-  → NOT gradient accumulation — just 6 small optimizer steps
+
+Still different:
+
+- TRL computes generation, old policy log-probs, and reference log-probs in a
+  more colocated/inlined path.
+- verl-gr still performs separate Ray phases for generation, old log-prob,
+  reference log-prob, and actor update.
+
+Current verl-gr step shape:
+
+```text
+1. vLLM rollout: 6 prompts × 8 = 48 completions
+2. old_log_prob: separate actor forward over 48 sequences
+3. ref_log_prob: separate ref forward over 48 sequences
+4. actor update: 6 fixed micro-batches, 1 optimizer step
 ```
 
-The corrected approach ensures:
+### 2.2 Why verl-gr Is Slower: Pending
 
-```
-CORRECT (current):
-  global_batch_size=48, mini_batch_size=48
-  → 1 mini-batch, 1 call to train_batch()
-  → Engine splits into 6 micro-batches of 4 seq/GPU
-  → Gradients accumulate, 1 optimizer.step()
-  → Each step sees 6 unique prompts (48 seq)
-  → TRUE gradient accumulation matching TRL
-```
+Known remaining speed differences:
 
-### How to use
+- Separate `old_log_prob` forward pass.
+- Separate `ref_log_prob` forward pass.
+- Ray RPC/DataProto boundaries between phases.
+- vLLM defaults to TP=2 for the matched run, but still runs through the Ray
+  hybrid engine rather than TRL's colocated path.
+- FSDP2/Ray memory layout differs from DeepSpeed ZeRO-3.
 
-**Defaults now match TRL structure (48 generation slots/update):**
+No fix is marked done for these structural speed items yet. The batch fix makes
+the comparison fair, but it does not remove the extra forward/RPC overhead.
 
-```bash
-bash scripts/.match_rankgrpo.sh
-```
+### 2.3 Timing Budget: Pending
 
-With defaults: `TRAIN_BATCH_SIZE=1`, `GRADIENT_ACCUMULATION_STEPS=6` → `GEN_BATCH_SIZE=6` unique prompts/step, matching TRL's `generation_batch_size=48` repeated slots with `num_generations=8`.
+Remaining evidence to collect:
 
-**Full TRL alignment (tight clip, fixed micro-batching):**
+- Wall-clock time per 100 optimizer steps.
+- Rollout generation tokens/sec.
+- old/ref log-prob phase time.
+- Actor update phase time.
+- End-to-end comparison against the TRL run after batching and dtype alignment.
 
-```bash
-USE_DYNAMIC_BSZ=False \
-ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=4 \
-  bash scripts/.match_rankgrpo.sh \
-    actor_rollout_ref.actor.clip_ratio=0.06 \
-    actor_rollout_ref.actor.clip_ratio_low=0.06 \
-    actor_rollout_ref.actor.clip_ratio_high=0.08 \
-    actor_rollout_ref.actor.ppo_epochs=1
-```
+## 3. Training Convergence Analysis
 
-This gives:
-- 6 unique prompts per optimizer step (matches TRL's 48 slots / 8 generations)
-- 6 × 8 = 48 completions generated per step (matches TRL)
-- 1 mini-batch of 48 seq → engine splits into **6 micro-batches** of 4 seq/GPU
-- Gradients accumulate across 6 micro-batches → 1 optimizer step (matches TRL's grad_accum=6)
-- Per GPU per micro-batch: 4 seq
-- clip ratio [0.94, 1.08] (matches TRL)
-- 1 PPO epoch / `num_iterations=1` for strict optimizer-update alignment
+### 3.1 Advantage Noise / Batch-Size Mismatch: Done
 
-### Verification
+Accomplished:
 
-TODO after running:
-- [ ] Confirm `data.gen_batch_size` shows correct value in Hydra config dump
-- [ ] Confirm `global_batch_size` vs `mini_batch_size` in `_update_actor` logs
-- [ ] Compare `eval/reward_total` convergence rate vs TRL baseline
-- [ ] Compare wall-clock time per 100 optimizer steps
-- [ ] Monitor `actor/pg_clipfrac` — should stay < 0.3 with tighter clip
+- Both systems now use 6 prompt groups per optimizer step.
+- Both systems use 8 rollouts per prompt.
+- The previous "TRL has 48 unique prompts while verl-gr has 6" concern is
+  resolved; it came from treating TRL generated slots as unique prompts.
 
-### Files modified
+Remaining verification:
 
-| File | Change |
-|------|--------|
-| `scripts/run_rankgrpo.sh` | Defaults to `TRAIN_BATCH_SIZE=1`, `GRADIENT_ACCUMULATION_STEPS=6`, computed `GEN_BATCH_SIZE=6`; documents that verl-gr batch sizes are unique prompts while TRL `generation_batch_size` is repeated generation slots |
-| `scripts/.match_rankgrpo.sh` | Keeps only endpoint-specific GPU/Ray/output/resume setup; delegates TRL-alignment defaults to `run_rankgrpo.sh` |
-| `configs/verl_gr/rankgrpo/rankgrpo_trainer.yaml` | `ppo_mini_batch_size` 6→8; +`ppo_micro_batch_size_per_gpu: null` |
-| `verl_080_dev/verl/trainer/ppo/ray_trainer.py` | `_update_actor`: `global_batch_size` computed from `gen_batch_size × n`; `mini_batch_size = global_batch_size` (one mini-batch, gradient accumulation via micro-batches in engine) |
+- Compare reward variance and eval reward slope after the fresh aligned run.
 
-### TRL alignment map
+### 3.2 Clip Range: Done
 
-| TRL parameter | TRL value | verl-gr equivalent | verl-gr value |
+Accomplished:
+
+- Both systems now use the same item-level trust region, `[0.94, 1.08]`.
+
+Remaining verification:
+
+- Compare `actor/pg_clipfrac` and KL against TRL.
+
+### 3.3 PPO Epochs: Done
+
+Accomplished:
+
+- verl-gr uses `PPO_EPOCHS=1`, matching TRL `mu=1`.
+- Historical concerns about 12 repeated PPO epochs no longer apply to the
+  default aligned launch.
+
+Remaining verification:
+
+- Confirm no launch-time override.
+
+### 3.4 Sample Diversity and Generalization: Done
+
+Accomplished:
+
+- Both systems now consume 6 new unique prompts per optimizer step.
+- Both systems therefore cover a dataset of `N` prompts in about `N / 6`
+  optimizer steps.
+
+Remaining verification:
+
+- Confirm progress-bar denominator near `383013 // 6 = 63835`.
+
+### 3.5 KL Divergence Dynamics: Partial
+
+Accomplished:
+
+- Batch size, clip range, PPO epochs, shuffle behavior, and actor train dtype
+  have been aligned.
+- `ACTOR_MODEL_DTYPE=fp32` is now the default, addressing the observed flat
+  `actor/kl_loss` failure mode caused by bf16 actor parameters and bf16 AdamW
+  moments at `lr=1e-6`.
+
+Still unknown:
+
+- Whether the fresh fp32-actor run now shows KL growth and checkpoint drift
+  comparable to TRL.
+- Whether remaining KL differences come from old/ref log-prob plumbing, vLLM
+  topology, FSDP2 vs ZeRO-3, or Ray boundaries.
+
+Next checks:
+
+- Compare checkpoint parameter drift at the same steps.
+- Compare `actor/kl_loss`, TRL `train/kl`, reward, and clipfrac.
+- If still divergent, test old-log-prob bypass and rollout TP=2 separately.
+
+## 4. Root Causes Summary
+
+### 4.1 Primary Convergence Causes
+
+| Cause | Status | What changed | Remaining work |
 |---|---|---|---|
-| `per_device_train_batch_size` | 4 | sequences/GPU/micro-batch after rollouts | 4 seq/GPU |
-| `num_processes` | 2 | `N_GPUS` | 2 |
-| `gradient_accumulation_steps` | 6 | `GRADIENT_ACCUMULATION_STEPS` | 6 |
-| Generation slots per opt step | 4×2×6 = 48 | `GEN_BATCH_SIZE × ROLLOUT_N` | 6×8 = 48 |
-| Unique prompts per opt step | 48 / 8 = 6 | `GEN_BATCH_SIZE` = 1×6 | 6 |
-| Rollouts per prompt | 8 | `ROLLOUT_N` | 8 |
-| Seq per micro-batch | 8 global (4/GPU) | `TRAIN_BATCH_SIZE × ROLLOUT_N` | 8 global (4/GPU) |
-| Total seq per opt step | 48 | `GEN_BATCH_SIZE × ROLLOUT_N` | 48 |
-| `num_iterations` (mu) | 1 | `ppo_epochs` | 1 |
+| Unique prompts per step | **Done** | `GEN_BATCH_SIZE=6`; actor global/mini batch = 48 seq | Verify fresh logs |
+| Clip epsilon | **Done** | `0.06 / 0.08` defaults | Monitor clipfrac |
+| PPO epochs | **Done** | `PPO_EPOCHS=1` default | Confirm no override |
+| Actor update precision | **Partial** | `ACTOR_MODEL_DTYPE=fp32` default | Rerun and verify KL/checkpoint drift |
+
+### 4.2 Secondary Speed Causes
+
+| Cause | Status | Current state |
+|---|---|---|
+| Separate forward passes | **Pending** | old/ref log-probs still separate |
+| vLLM TP topology | **Resolved for next run** | matched launcher defaults TP=2 |
+| Distributed backend | **Pending** | FSDP2/Ray remains different from ZeRO-3 |
+| Ray RPC overhead | **Pending** | not optimized yet |
+
+## 5. Recommended Fixes from Target Doc
+
+### Already Applied
+
+- Correct unique-prompt batch size: `GEN_BATCH_SIZE=6`.
+- Fixed micro-batching for gradient accumulation:
+  `ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=4`.
+- Single actor mini-batch per update:
+  `global_batch_size = mini_batch_size = gen_batch_size × rollout.n`.
+- Tight TRL clip range: `0.06 / 0.08`.
+- Single pass per generated sequence: `PPO_EPOCHS=1`.
+- Train shuffle enabled and validation shuffle disabled.
+- fp32 actor load for trainable parameters: `ACTOR_MODEL_DTYPE=fp32`.
+
+### Not Applied Yet
+
+- `RANKGRPO_BYPASS_OLD_LOG_PROB=True`
+  - Current default: `False`.
+  - Expected impact: speed improvement by avoiding one separate actor forward.
+  - Convergence impact: should be tested carefully because it changes which
+    old log-prob source is trusted.
+- `ROLLOUT_TENSOR_PARALLEL_SIZE=2`
+  - Current default: `2`.
+  - Expected impact: closer to TRL's vLLM TP=2 generation topology and possibly
+    better rollout throughput.
+
+## 6. Verification Plan
+
+Fresh aligned run checklist:
+
+- [ ] Hydra dump shows `data.gen_batch_size=6`.
+- [ ] Hydra dump shows `actor_rollout_ref.actor.ppo_epochs=1`.
+- [ ] Hydra dump shows clip low/high `0.06 / 0.08`.
+- [ ] Hydra dump shows `actor_rollout_ref.actor.fsdp_config.model_dtype=fp32`.
+- [ ] Logs show total actor batch of 48 generated sequences per optimizer step.
+- [ ] Logs show 6 fixed micro-batches of 4 seq/GPU per optimizer step.
+- [ ] Progress denominator is about `383013 // 6 = 63835`.
+- [ ] `actor/kl_loss` grows or moves comparably to TRL `train/kl`.
+- [ ] Checkpoint parameter drift is no longer bf16-quantized away.
+- [ ] `eval/reward_total` slope is compared against the TRL baseline.
+- [ ] Wall-clock time per 100 optimizer steps is recorded.
+- [ ] If convergence still differs, test old-log-prob bypass.
+- [ ] If speed or generation behavior still differs, test rollout TP=2.
+
+## Implementation Inventory
+
+| File | Current role |
+|---|---|
+| `scripts/run_rankgrpo.sh` | Owns alignment defaults and passes Hydra overrides |
+| `scripts/.match_rankgrpo.sh` | Endpoint-specific GPU/Ray/output/resume wrapper |
+| `configs/verl_gr/rankgrpo/rankgrpo_trainer.yaml` | RankGRPO base config; actor dtype default is fp32 |
+| `verl_080_dev/verl/trainer/ppo/ray_trainer.py` | Actor update uses `gen_batch_size × rollout.n` and one full mini-batch |
+| `verl_gr/recipes/rankgrpo/rankgrpo_loss.py` | TRL-matched RankGRPO PPO loss path |
+| `verl_gr/recipes/rankgrpo/rankgrpo_algorithm.py` | Per-prompt-group RankGRPO advantage computation |

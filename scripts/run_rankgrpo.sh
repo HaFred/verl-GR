@@ -108,15 +108,18 @@ LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 ADAM_BETA1="${ADAM_BETA1:-0.9}"
 ADAM_BETA2="${ADAM_BETA2:-0.99}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
-PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.2}"
-PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.2}"
-# Match TRL's default epsilon=0.2 (clip range [0.8, 1.2]). The reference
-# trainer does not use dual-clip PPO. Set clip_ratio_c to a large value so
-# the min() always picks the standard PPO clip branch.
+ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-fp32}"
+PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.06}"
+PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
+# Match the Rank-GRPO reference script's epsilon=0.06 / epsilon_high=0.08
+# (clip range [0.94, 1.08]). The reference trainer does not use dual-clip PPO.
+# Set clip_ratio_c to a large value so the min() always picks the standard PPO
+# clip branch.
 PPO_CLIP_RATIO_C="${PPO_CLIP_RATIO_C:-1e6}"
 PPO_EPOCHS="${PPO_EPOCHS:-1}"
 FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp2}"
-DATA_SHUFFLE="${DATA_SHUFFLE:-False}"
+DATA_SHUFFLE="${DATA_SHUFFLE:-True}"
+VALIDATION_SHUFFLE="${VALIDATION_SHUFFLE:-False}"
 SEED="${SEED:-3407}"
 PROJECT_NAME="${PROJECT_NAME:-RankGRPO}"
 LAUNCH_TIMESTAMP="${LAUNCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
@@ -191,6 +194,8 @@ echo "GT catalog: ${GT_CATALOG_PATH}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Rec num: ${REC_NUM}"
 echo "Train batch size: ${TRAIN_BATCH_SIZE}  (gen_batch_size: ${GEN_BATCH_SIZE}, gradient_accumulation_steps: ${GRADIENT_ACCUMULATION_STEPS})"  # unique prompts → completions: GEN_BATCH_SIZE × ROLLOUT_N
+echo "Train/validation shuffle: ${DATA_SHUFFLE}/${VALIDATION_SHUFFLE}"
+echo "Actor model dtype: ${ACTOR_MODEL_DTYPE}"
 if (( GRADIENT_ACCUMULATION_STEPS > 1 )); then
   echo "Micro-batches: ${GRADIENT_ACCUMULATION_STEPS} × ${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU} seq/GPU  (total: $((GEN_BATCH_SIZE * ROLLOUT_N)) seq, $((GEN_BATCH_SIZE * ROLLOUT_N / N_GPUS)) seq/GPU → $((GEN_BATCH_SIZE * ROLLOUT_N / N_GPUS / ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU)) micro-batches)"
 fi
@@ -245,6 +250,7 @@ done
   ++data.gen_batch_size="${GEN_BATCH_SIZE}" \
   data.val_batch_size="${VAL_BATCH_SIZE}" \
   data.shuffle="${DATA_SHUFFLE}" \
+  ++data.validation_shuffle="${VALIDATION_SHUFFLE}" \
   data.seed="${SEED}" \
   data.max_prompt_length=2048 \
   data.max_response_length=1024 \
@@ -263,6 +269,7 @@ done
   ++actor_rollout_ref.rollout.log_prob_use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
   ++actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${ACTOR_MAX_TOKENS_PER_GPU}" \
+  actor_rollout_ref.actor.fsdp_config.model_dtype="${ACTOR_MODEL_DTYPE}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \
   actor_rollout_ref.actor.ppo_epochs="${PPO_EPOCHS}" \
   actor_rollout_ref.actor.clip_ratio="${PPO_CLIP_RATIO}" \
