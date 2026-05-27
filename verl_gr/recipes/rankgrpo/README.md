@@ -120,6 +120,20 @@ The confirmed-good change for this trace is loading the trainable actor in fp32 
 
 The old table mixed incompatible throughput definitions. TRL's derived throughput above is total tokens per wall second unless explicitly divided by 2, while verl's TensorBoard `perf/throughput` is already normalized per GPU as `total_num_tokens / (time_per_step × n_gpus)`. With consistent definitions, verl_gr has both shorter logged step time and higher token throughput on this trace. The KL/reward behavior is comparable by step 400-600; a final speed claim should still use a controlled wall-clock comparison because TRL and verl_gr report timing differently.
 
+### Distribution Analysis
+
+**Key finding:** vLLM rollout takes only ~9% of step time. 62% is spent in `update_actor` (FSDP forward + backward + optimizer step). This is a training-bound workload.
+
+| Phase | Mean Time | % of Step |
+|---|---|---|
+| gen (vLLM rollout) | 0.59s | 9% |
+| update_actor (FSDP) | 4.23s | 62% |
+| old_log_prob | 0.42s | 6% |
+| ref | 0.20s | 3% |
+| adv | 0.09s | 1% |
+| Other/overhead | ~1.3s | 19% |
+| **Total** | **~6.81s** | **100%** |
+
 ### Eval runtime
 
 | Implementation | Eval runtime | Frequency |
