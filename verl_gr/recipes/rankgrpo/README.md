@@ -189,10 +189,10 @@ The confirmed-good change for this trace is loading the trainable actor in fp32 
 
 ### Per-Step Runtime
 
-| Implementation | GPUs | Steps | time_per_step (s) | Total throughput (tok/s) | Per-GPU throughput (tok/s/GPU) | Notes |
-|---------------|------|-------|-------------------|--------------------------|-------------------------------|-------|
-| **Original TRL Rank-GRPO** | 2× H800 | trace to step 820 | ~5.5-5.7 training-only wall sec/step; ~7.15 sec/step in the step 10-600 trace including eval/checkpoint overhead | training-only mean/median ~3,483/~3,485; end-to-end step 10-600 ~2,729 | training-only mean/median ~1,742/~1,743; end-to-end step 10-600 ~1,365 | Derived from adjacent 10-step `num_tokens` deltas; eval runtime is ~442s every 200 steps |
-| **verl_gr Fork (`fp32opt`)** | 2× H800 | trace to step 590 | mean 5.12, median 4.41 | mean ~4,045; median ~4,130 | mean ~2,022; median ~2,065 | TensorBoard `perf/throughput` is per GPU; total throughput is `perf/throughput × 2` |
+| Implementation | GPUs | Steps | time_per_step (s) | Total throughput (tok/s) | Per-GPU throughput (tok/s/GPU) | Notes | Throughput Delta |
+|---------------|------|-------|-------------------|--------------------------|-------------------------------|-------|------|
+| **Original TRL Rank-GRPO** | 2× H800 | trace to step 820 | ~5.5-5.7 training-only wall sec/step; ~7.15 sec/step in the step 10-600 trace including eval/checkpoint overhead | training-only mean/median ~3,483/~3,485; end-to-end step 10-600 ~2,729 | training-only mean/median ~1,742/~1,743; end-to-end step 10-600 ~1,365 | Derived from adjacent 10-step `num_tokens` deltas; eval runtime is ~442s every 200 steps | - |
+| **verl_gr Fork (`fp32opt`)** | 2× H800 | trace to step 590 | mean 5.12, median 4.41 | mean ~4,045; median ~4,130 | mean ~2,022; median ~2,065 | TensorBoard `perf/throughput` is per GPU; total throughput is `perf/throughput × 2` | +16% |
 
 The old table mixed incompatible throughput definitions. TRL's derived throughput above is total tokens per wall second unless explicitly divided by 2, while verl's TensorBoard `perf/throughput` is already normalized per GPU as `total_num_tokens / (time_per_step × n_gpus)`. With consistent definitions, verl_gr has both shorter logged step time and higher token throughput on this trace. The KL/reward behavior is comparable by step 400-600; a final speed claim should still use a controlled wall-clock comparison because TRL and verl_gr report timing differently.
 
