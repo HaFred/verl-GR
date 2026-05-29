@@ -157,7 +157,7 @@ algorithm:
   rollout_correction:
     rollout_is: null
     rollout_rs: null
-    bypass_mode: false
+    bypass_mode: true
     loss_type: ppo_clip
 
 trainer:

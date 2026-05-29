@@ -29,7 +29,7 @@ Status legend:
 | 1.5 Distributed backend | **Partial** | TRL uses DeepSpeed ZeRO-3 + colocated vLLM TP=2; verl-gr now defaults rollout TP=2 but still uses FSDP2 + Ray hybrid engine. vLLM custom all-reduce is disabled after a TP=2 startup failure, so TP topology remains aligned while the collective implementation falls back to NCCL | Backend/runtime remains different |
 | 2. Compute performance | **Pending** | Batch work per optimizer step is aligned; structural overhead remains | Measure wall-clock and phase timing |
 | 3. Convergence analysis | **Partial** | `fp32opt` fixed the flat-KL failure, but newer run `newmatchg2_3_trlmatch_fp32opt` shows max-length generation collapse and KL spikes | Align generation termination/length behavior with TRL before further reward conclusions |
-| 5. Recommended fixes | **Partial** | confirmed-good defaults are in place through `fp32opt`; old-logprob=current, rollout TP=2, safe checkpoint pruning, and TRL-like save/eval cadence are default-aligned before the next run | Backend/Ray differences remain |
+| 5. Recommended fixes | **Partial** | confirmed-good defaults are in place through `fp32opt`; old-logprob=current, old-log-prob recompute bypass, rollout TP=2, safe checkpoint pruning, and TRL-like save/eval cadence are default-aligned before the next run | Backend/Ray differences remain |
 | 6. Verification plan | **Pending** | checklist exists below | Run and record evidence |
 
 ## 1. Hyperparameter Analysis
@@ -285,7 +285,7 @@ Current verl-gr step shape:
 
 ```text
 1. vLLM rollout: 6 prompts × 8 = 48 completions
-2. old_log_prob: backend may still compute/recompute this tensor
+2. old_log_prob: bypassed; required field is filled from rollout_log_probs
 3. ref_log_prob: separate ref forward over 48 sequences
 4. actor update: 6 fixed micro-batches, 1 optimizer step
 ```
@@ -293,15 +293,19 @@ Current verl-gr step shape:
 For the TRL-matched loss path, `algorithm.rank_grpo.old_log_prob_mode=current`
 uses the current forward pass detached from gradient (`log_prob.detach()`) as
 the PPO anchor, matching TRL's aligned-generation behavior when
-`old_per_token_logps` is absent. This aligns loss semantics, but it does not yet
-remove any backend work that may still produce `old_log_probs`.
+`old_per_token_logps` is absent. The current default also sets
+`algorithm.rollout_correction.bypass_mode=true`, which skips the separate
+old-log-prob actor forward by copying vLLM
+`rollout_log_probs` into the required `old_log_probs` batch field. In Rank-GRPO
+`trl_match` mode the loss still uses `log_prob.detach()` as the PPO anchor, so
+the copied `old_log_probs` field is only a compatibility/input-plumbing value.
 
 ### 2.2 Why verl-gr Is Slower: Pending
 
 Known remaining speed differences:
 
-- Possible separate old-log-prob production in the backend, even though
-  Rank-GRPO loss now anchors to current detached log-probs in `trl_match` mode.
+- The old-log-prob actor recompute is bypassed by default; verify timing logs no
+  longer include a separate `old_log_prob` phase.
 - Separate `ref_log_prob` forward pass.
 - Ray RPC/DataProto boundaries between phases.
 - Historical confirmed good run used vLLM TP=1/DP=2; the current aligned default
@@ -418,8 +422,8 @@ Next checks:
 - Keep `fp32opt` as the baseline for dtype/batch/clip/epoch alignment, but do
   not mark convergence fully aligned until generation length behavior matches
   TRL.
-- Prioritize the generation termination plan in section 3.6 before changing
-  old-log-prob semantics or rollout TP topology.
+- Prioritize validating generation termination / length behavior under the
+  current aligned defaults before changing other backend/runtime knobs.
 - Compare reward, clipped-completion ratio, detected item count, overflow ratio,
   and checkpoint drift at the same steps.
 
@@ -675,8 +679,8 @@ stay near TRL.
 4. Stop early if clipped ratio moves toward the previous failure mode
    (`~1.0`) instead of TRL's near-zero clipped ratio.
 5. If convergence still differs after length behavior is aligned, test
-   remaining backend differences separately: old-log-prob computation cost,
-   ref-log-prob phase cost, FSDP2/Ray vs ZeRO-3, and Ray RPC overhead.
+   remaining backend differences separately: ref-log-prob phase cost, FSDP2/Ray
+   vs ZeRO-3, and Ray RPC overhead.
 
 ## 4. Root Causes Summary
 
@@ -720,6 +724,8 @@ stay near TRL.
   in `trl_match` mode it resolves `old_log_probs` to `log_prob.detach()`,
   matching TRL's aligned-generation fallback when `old_per_token_logps` is
   absent.
+- `RANKGRPO_BYPASS_OLD_LOG_PROB=True` by default, so verl-gr no longer runs the
+  separate actor old-log-prob recompute before the Rank-GRPO update.
 - `ROLLOUT_TENSOR_PARALLEL_SIZE=2` is now the script default for 2-GPU runs.
 - vLLM custom all-reduce is disabled by default so TP=2 startup falls back to
   NCCL instead of failing on `custom_all_reduce.cuh:455 invalid argument`.
@@ -728,11 +734,8 @@ stay near TRL.
 
 ### Not Applied Yet
 
-- `RANKGRPO_BYPASS_OLD_LOG_PROB=True`
-  - Current default: `False`.
-  - Expected impact: speed improvement by avoiding one separate actor forward.
-  - Convergence impact: should be tested carefully because it changes which
-    old log-prob source is trusted.
+- None from the current high-priority TRL-alignment list. Remaining differences
+  are backend/runtime differences rather than simple launch defaults.
 
 ## 6. Verification Plan
 
@@ -753,6 +756,8 @@ Fresh aligned run checklist:
 - [x] vLLM custom all-reduce is disabled to keep TP=2 stable on this stack.
 - [x] `min_p` is not passed through Hydra `RolloutConfig`, avoiding the previous
   `unexpected keyword argument 'min_p'` startup failure.
+- [x] Old-log-prob actor recompute is bypassed by default while Rank-GRPO loss
+  keeps TRL's `log_prob.detach()` anchor.
 - [x] `actor/kl_loss` grows comparably to TRL `train/kl` in the good `fp32opt`
   run.
 - [ ] `train/rankgrpo/completions/clipped_ratio` exists and stays near TRL's
@@ -767,8 +772,8 @@ Fresh aligned run checklist:
 - [ ] Checkpoint parameter drift is no longer bf16-quantized away.
 - [ ] `eval/reward_total` slope is compared against the TRL baseline.
 - [ ] Wall-clock time per 100 optimizer steps is recorded.
-- [ ] If convergence still differs beyond KL, test old-logprob semantics
-  separately.
+- [ ] If convergence still differs beyond KL, revisit old-log-prob plumbing only
+  if logs show bypass/current anchoring is not being applied as expected.
 - [ ] If speed or generation behavior still differs under TP=2, compare TP=2
   against the historical TP=1/DP=2 `fp32opt` baseline.
 
