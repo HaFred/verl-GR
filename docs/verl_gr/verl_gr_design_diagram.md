@@ -70,43 +70,46 @@ runtime. The main path is:
 ```mermaid
 flowchart LR
   subgraph C1["Role 1: Entrypoint & Task Selection"]
-    TaskRunner["main_ppo.TaskRunner\n- infer/select task\n- build datasets\n- construct RLTrainer"]
-    TaskSpec["TaskSpec registry\nopenonerec | rankgrpo"]
-    TaskFactory["task_factory\nconfig-driven loader\nMiniOneRec and custom tasks"]
+    TaskRunner["main_ppo.TaskRunner\n- TASK_REGISTRY select\n- legacy rankgrpo infer\n- build datasets + RLTrainer"]
+    TaskSpec["TASK_REGISTRY\nopenonerec | rankgrpo"]
+    TaskFactory["task_factory.py\nclass-path loader\nMiniOneRec + custom tasks"]
   end
 
   subgraph C2["Role 2: Recipe Runtime & Data"]
-    RecipeTaskRuntime["RecipeTaskRuntime\n- FSDP wrap cleanup\n- tokenizer/processor setup\n- rollout hooks"]
-    OneRecTask["OneRecTask\nOpenOneRec two-stage rollout"]
-    MiniOneRecTask["MiniOneRecTask\nconstrained-beam rollout"]
-    RankGRPOTask["RankGRPOTask\nalgorithm config injection\nbatched vLLM agent loop"]
+    RecipeTaskRuntime["RecipeTaskRuntime\n- FSDP wrap cleanup\n- tokenizer/processor\n- worker + rollout hooks"]
+    OneRecTask["OneRecTask\ntwo_stage rollout registration"]
+    MiniOneRecTask["MiniOneRecTask\nconstrained_beam registration"]
+    RankGRPOTask["RankGRPOTask\ninject algorithm.rank_grpo\ninto actor_rollout_ref"]
     Datasets["Recipe datasets\nOneRecDataset\nMiniOneRecDataset\nRankGRPODataset"]
   end
 
-  subgraph C3["Role 3: Trainer, Validation & Reward"]
-    RLTrainer["RLTrainer\n- task adapter delegation\n- recommendation gen batch prep\n- Rank-GRPO advantage hook\n- tqdm timing excludes validate/save"]
+  subgraph C3["Role 3: Trainer, Loss, Validation & Reward"]
+    RLTrainer["RLTrainer\n- task adapter delegation\n- recommendation gen batch prep\n- Rank-GRPO advantage + train metrics\n- top-k ckpt prune / latency tqdm"]
     TrainerTaskAdapter["TrainerTaskAdapter\nbase delegation surface"]
-    OpenOneRecAdapter["OpenOneRecTrainerAdapter\nvalidate / dump / log generations"]
-    MiniOneRecAdapter["MiniOneRecTrainerAdapter\npostprocess rewards / validate"]
-    RankGRPOAdapter["RankGRPOTrainerAdapter\nvalidate\nstdout val-generation preview"]
-    RankGRPOAlgorithm["rankgrpo_algorithm\nper-rank GRPO advantages\ncatalog-aware reward rows"]
-    RankGRPOReward["rankgrpo_reward\nreference-aligned parsing\nGT catalog matching\nscore/rank_rewards/rank_reward_sum"]
-    RankGRPOMetrics["Rank-GRPO validation aliases\neval/reward\neval/reward_total\neval/loss"]
+    OpenOneRecAdapter["OpenOneRec hooks\nvalidate / dump / log"]
+    MiniOneRecAdapter["MiniOneRecTrainerAdapter\nrewards / validate"]
+    RankGRPOAdapter["RankGRPOTrainerAdapter\nrankgrpo_validate\nval-generation preview"]
+    RankGRPOAlgorithm["rankgrpo_algorithm\nsegmentation + length shaping\ncompute_rank_grpo_advantage"]
+    RankGRPOReward["rankgrpo_reward\ncatalog-aware rank_rewards_from_text"]
+    RankGRPOWorker["RankGRPOActorRolloutRefWorker\ngrad_hooks + rankgrpo_ppo_loss"]
+    RankGRPOLoss["rankgrpo_loss\ntrl_match / item-level IS\nold_log_prob_mode=current"]
+    RankGRPOMetrics["eval aliases + train metrics\neval/reward_total\ntrain/rankgrpo/completions/*"]
   end
 
   subgraph C4["Role 4: Rollout, Beam Search & Agent Loops"]
     RolloutRegistration["rollout registration\ntwo_stage | constrained_beam"]
     TwoStageRollout["TwoStagevLLMRollout\nTwoStagevLLMHttpServer\nTwoStagevLLMReplica"]
     ConstrainedRollout["ConstrainedBeamvLLMRollout\nConstrainedBeamvLLMHttpServer\nConstrainedBeamvLLMReplica"]
-    BeamBackend["BeamBackend / BeamCandidate\nshared async beam ranking"]
-    OpenOneRecLoop["OpenOneRecTwoStageAgentLoop\nWorker / Manager"]
-    MiniOneRecLoop["MiniOneRecConstrainedBeamAgentLoop\nWorker / Manager"]
-    RankGRPOAgentLoop["rankgrpo_agent_loop.py\nRankGRPOAgentLoopManager\nRankGRPOAgentLoopWorker"]
-    RankGRPOBatchedVLLM["RankGRPOvLLMHttpServer\nRankGRPOvLLMReplica\ngenerate_many(n=rollouts)"]
+    BeamBackend["beam_backend\nBeamCandidate / async beam search"]
+    OpenOneRecLoop["OpenOneRecAgentLoopManager\nTwoStage Worker"]
+    MiniOneRecLoop["MiniOneRecConstrainedBeam\nAgentLoopManager"]
+    RankGRPOAgentLoop["RankGRPOAgentLoopManager/Worker\ncontiguous prompt groups\nasyncio.gather n x n=1 vLLM"]
+    RankGRPORolloutMask["build_trl_completion_mask\nTRL SamplingParams defaults"]
+    vLLMReplica["upstream vLLMReplica\nverl async rollout server"]
   end
 
   TaskRunner -.->|registry| TaskSpec
-  TaskRunner -.->|class-path loader| TaskFactory
+  TaskRunner -.->|load_object| TaskFactory
   TaskRunner --> RecipeTaskRuntime
   TaskRunner --> Datasets
   TaskRunner --> RLTrainer
@@ -114,24 +117,30 @@ flowchart LR
   RecipeTaskRuntime --> OneRecTask
   RecipeTaskRuntime --> MiniOneRecTask
   RecipeTaskRuntime --> RankGRPOTask
-  RLTrainer -.->|get task adapter| TrainerTaskAdapter
+  RLTrainer -.->|_get_task_adapter| TrainerTaskAdapter
   TrainerTaskAdapter --> OpenOneRecAdapter
   TrainerTaskAdapter --> MiniOneRecAdapter
   TrainerTaskAdapter --> RankGRPOAdapter
-  RLTrainer -.->|compute_advantage override| RankGRPOAlgorithm
+  RLTrainer -.->|compute_advantage| RankGRPOAlgorithm
   RankGRPOAlgorithm -.->|rank_rewards_from_text| RankGRPOReward
-  RankGRPOAdapter -.->|add eval aliases| RankGRPOMetrics
+  RankGRPOAlgorithm -.->|log per step| RankGRPOMetrics
+  RankGRPOAdapter -.->|eval aliases| RankGRPOMetrics
+  RankGRPOTask -.->|worker class| RankGRPOWorker
+  RankGRPOWorker --> RankGRPOLoss
 
-  OneRecTask -.->|register two stage| RolloutRegistration
-  MiniOneRecTask -.->|register constrained beam| RolloutRegistration
+  OneRecTask -.->|register| RolloutRegistration
+  MiniOneRecTask -.->|register| RolloutRegistration
   OneRecTask --> TwoStageRollout
   MiniOneRecTask --> ConstrainedRollout
-  RankGRPOTask --> RankGRPOAgentLoop
-  RankGRPOAgentLoop --> RankGRPOBatchedVLLM
-  TwoStageRollout -.->|stage2 beams| BeamBackend
-  ConstrainedRollout -.->|constrained beams| BeamBackend
+  RankGRPOTask -.->|Hydra agent_loop_manager_class| RankGRPOAgentLoop
+  RankGRPOAgentLoop --> RankGRPORolloutMask
+  RankGRPOAgentLoop --> vLLMReplica
+  TwoStageRollout -.->|beams| BeamBackend
+  ConstrainedRollout -.->|beams| BeamBackend
   OneRecTask --> OpenOneRecLoop
   MiniOneRecTask --> MiniOneRecLoop
+  TwoStageRollout --> OpenOneRecLoop
+  ConstrainedRollout --> MiniOneRecLoop
 ```
 
 ## Recipe Integration Notes
@@ -145,23 +154,21 @@ flowchart LR
   `MiniOneRecActorRolloutRefWorker`, and wire `MiniOneRecConstrainedBeamAgentLoopManager`.
   Dataset, reward, format helpers, worker shim, agent loop, and trainer adapter
   are separate recipe modules under `verl_gr/recipes/minionerec`.
-- Rank-GRPO now keeps the logical rollout type as upstream `vllm`, but installs
-  `rankgrpo_agent_loop.RankGRPOAgentLoopManager` through
-  `actor_rollout_ref.rollout.agent.agent_loop_manager_class`. This manager uses a
-  recipe-local `RankGRPOAgentLoopWorker`, `RankGRPOAsyncLLMServerManager`,
-  `RankGRPOvLLMHttpServer`, and `RankGRPOvLLMReplica` to collapse contiguous
-  repeated prompt rollouts into a single vLLM request with `n=<rollouts>`.
-  The output is expanded back into the normal `DataProto` shape, including
-  optional rollout logprobs for bypassing old-log-prob recomputation.
-  - Rank-GRPO recipe code is split across `rankgrpo_dataset.py`,
-  `rankgrpo_task.py`, `rankgrpo_algorithm.py`, `rankgrpo_trainer.py`,
-  `rankgrpo_reward.py`, and `rankgrpo_agent_loop.py`, while
-  `rankgrpo_recipe.py` remains a compatibility export module for existing
-  config overrides. Reward computation is
-  reference-aligned through `gt_catalog.pkl`; both validation and advantage
-  recomputation use the same catalog-aware per-rank reward path. Validation also
-  emits Rank-GRPO-style aliases: `eval/reward`, `eval/reward_total`, and
-  `eval/loss`.
+- Rank-GRPO keeps upstream rollout name `vllm` and installs
+  `RankGRPOAgentLoopManager` via Hydra
+  (`actor_rollout_ref.rollout.agent.agent_loop_manager_class`). The fast path
+  groups contiguous repeated prompts and issues `n` concurrent `n=1` vLLM
+  requests through the standard `vLLMReplica` async server (TRL colocate style),
+  then applies `build_trl_completion_mask` for EOS-aware `response_mask`.
+  `RankGRPOActorRolloutRefWorker` installs `rankgrpo_ppo_loss` (`trl_match`,
+  item-level importance sampling) and optional rollout logprobs for
+  `bypass_mode` old-log-prob plumbing.
+  - Recipe modules: `rankgrpo_dataset.py`, `rankgrpo_task.py`,
+  `rankgrpo_worker.py`, `rankgrpo_algorithm.py`, `rankgrpo_loss.py`,
+  `rankgrpo_trainer.py`, `rankgrpo_reward.py`, `rankgrpo_agent_loop.py`
+  (`rankgrpo_recipe.py` is a compatibility export). Training logs
+  `train/rankgrpo/completions/*`; validation emits `eval/reward`,
+  `eval/reward_total`, and `eval/loss`.
 
 ## Shared Runtime Flow
 
@@ -174,9 +181,8 @@ flowchart LR
   tokenizer/processor creation, worker class selection, and rollout configuration
   hooks. OpenOneRec and MiniOneRec override the rollout hooks; Rank-GRPO overrides
   `prepare` to inject `rank_grpo` algorithm config into `actor_rollout_ref`,
-  and overrides `get_actor_rollout_ref_worker` to select
-  `RankGRPOActorRolloutRefWorker` (following the same worker-selection pattern
-  as the other two recipes).
+  injects `algorithm.rank_grpo` into `actor_rollout_ref`, and selects
+  `RankGRPOActorRolloutRefWorker` (custom PPO loss + grad hooks).
 - `RLTrainer` owns shared recommendation generation batch preparation. It delegates
   recipe validation and generation logging through task adapters, and calls
   `rankgrpo_algorithm.compute_rank_grpo_advantage` only when
