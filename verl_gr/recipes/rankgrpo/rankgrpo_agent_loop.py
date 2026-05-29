@@ -16,6 +16,7 @@ from uuid import uuid4
 
 import numpy as np
 import ray
+import torch
 
 from verl import DataProto
 from verl.experimental.agent_loop.agent_loop import (
@@ -27,6 +28,7 @@ from verl.experimental.agent_loop.agent_loop import (
 from verl.utils.profiler import simple_timer
 from verl.utils.ray_utils import auto_await
 from verl.utils.tokenizer import normalize_token_ids
+from verl.utils.torch_functional import get_response_mask
 from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
@@ -60,6 +62,46 @@ def _build_rankgrpo_sampling_params(config, *, validate: bool) -> dict[str, Any]
     if params["max_tokens"] is None:
         params.pop("max_tokens")
     return params
+
+
+def _resolve_eos_token_id(tokenizer) -> int | list[int] | None:
+    eos_token_id = getattr(tokenizer, "eos_token_id", None)
+    if eos_token_id is None:
+        return None
+    if isinstance(eos_token_id, (list, tuple)):
+        return [int(token_id) for token_id in eos_token_id]
+    return int(eos_token_id)
+
+
+def build_trl_completion_mask(response_ids: list[int], eos_token_id: int | list[int] | None) -> list[int]:
+    """Build TRL ``completion_mask``: 1 through first EOS inclusive, 0 after.
+
+    Matches ``Rank-GRPO/libs/trl/rank_grpo_trainer.py`` when
+    ``mask_truncated_completions`` is disabled.
+    """
+    if not response_ids:
+        return []
+    if eos_token_id is None:
+        return [1] * len(response_ids)
+
+    response_tensor = torch.tensor([response_ids], dtype=torch.long)
+    mask = get_response_mask(response_tensor, eos_token=eos_token_id, dtype=torch.int64)
+    return mask[0].tolist()
+
+
+def _mask_rollout_logprobs(
+    response_logprobs: list[float] | None,
+    response_mask: list[int],
+) -> list[float] | None:
+    if response_logprobs is None:
+        return None
+    masked: list[float] = []
+    for idx, mask_value in enumerate(response_mask):
+        if idx < len(response_logprobs):
+            masked.append(response_logprobs[idx] if mask_value else 0.0)
+        else:
+            masked.append(0.0)
+    return masked
 
 
 class RankGRPOAgentLoopWorker(AgentLoopWorker):
@@ -159,18 +201,23 @@ class RankGRPOAgentLoopWorker(AgentLoopWorker):
             ]
             token_outputs: list[TokenOutput] = await asyncio.gather(*tasks)
 
+        eos_token_id = _resolve_eos_token_id(self.tokenizer)
         outputs = []
         for token_output in token_outputs:
             response_ids = token_output.token_ids[: self.rollout_config.response_length]
-            response_logprobs = (
-                token_output.log_probs[: self.rollout_config.response_length]
-                if token_output.log_probs is not None
-                else None
+            response_mask = build_trl_completion_mask(response_ids, eos_token_id)
+            response_logprobs = _mask_rollout_logprobs(
+                (
+                    token_output.log_probs[: self.rollout_config.response_length]
+                    if token_output.log_probs is not None
+                    else None
+                ),
+                response_mask,
             )
             output = AgentLoopOutput(
                 prompt_ids=prompt_ids,
                 response_ids=response_ids,
-                response_mask=[1] * len(response_ids),
+                response_mask=response_mask,
                 response_logprobs=response_logprobs,
                 routed_experts=token_output.routed_experts,
                 multi_modal_data={},

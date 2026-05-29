@@ -21,7 +21,11 @@ import torch
 from verl.trainer.ppo.core_algos import agg_loss
 
 from verl_gr.trainers.rl_trainer import _prune_unkept_checkpoint_dirs
-from verl_gr.recipes.rankgrpo.rankgrpo_agent_loop import _build_rankgrpo_sampling_params
+from verl_gr.recipes.rankgrpo.rankgrpo_agent_loop import (
+    _build_rankgrpo_sampling_params,
+    _mask_rollout_logprobs,
+    build_trl_completion_mask,
+)
 from verl_gr.recipes.rankgrpo.rankgrpo_loss import (
     _compute_item_mean_log_ratio,
     _resolve_old_log_prob,
@@ -291,6 +295,43 @@ def test_rankgrpo_sampling_params_match_trl_vllm_defaults():
     assert params["logprobs"] is True
 
 
+def _trl_completion_mask_manual(completion_ids: list[int], eos_token_id: int) -> list[int]:
+    """Mirror TRL rank_grpo_trainer completion_mask (mask_truncated_completions=False)."""
+    if not completion_ids:
+        return []
+    is_eos = [token_id == eos_token_id for token_id in completion_ids]
+    if not any(is_eos):
+        return [1] * len(completion_ids)
+    eos_idx = next(idx for idx, flag in enumerate(is_eos) if flag)
+    return [1 if idx <= eos_idx else 0 for idx in range(len(completion_ids))]
+
+
+def test_build_trl_completion_mask_matches_trl_formula():
+    eos = 151643
+    cases = [
+        [10, 20, eos, 99, 100],
+        [10, 20, 30],
+        [eos],
+        [],
+    ]
+    for completion_ids in cases:
+        expected = _trl_completion_mask_manual(completion_ids, eos)
+        actual = build_trl_completion_mask(completion_ids, eos)
+        assert actual == expected, (completion_ids, expected, actual)
+
+
+def test_build_trl_completion_mask_no_eos_token_id_falls_back_to_all_ones():
+    completion_ids = [1, 2, 3, 4]
+    assert build_trl_completion_mask(completion_ids, None) == [1, 1, 1, 1]
+
+
+def test_mask_rollout_logprobs_zeros_tokens_after_eos():
+    mask = [1, 1, 1, 0, 0]
+    logprobs = [-0.1, -0.2, -0.3, -0.4, -0.5]
+    masked = _mask_rollout_logprobs(logprobs, mask)
+    assert masked == [-0.1, -0.2, -0.3, 0.0, 0.0]
+
+
 def test_topk_pruning_removes_unkept_checkpoint_dirs():
     with tempfile.TemporaryDirectory() as tmpdir:
         ckpt_root = Path(tmpdir)
@@ -319,5 +360,8 @@ if __name__ == "__main__":
     test_rankgrpo_completion_stats_match_trl_length_semantics()
     test_rankgrpo_debug_dump_step_filter()
     test_rankgrpo_sampling_params_match_trl_vllm_defaults()
+    test_build_trl_completion_mask_matches_trl_formula()
+    test_build_trl_completion_mask_no_eos_token_id_falls_back_to_all_ones()
+    test_mask_rollout_logprobs_zeros_tokens_after_eos()
     test_topk_pruning_removes_unkept_checkpoint_dirs()
     print("test_rankgrpo_loss_modes: all checks passed")

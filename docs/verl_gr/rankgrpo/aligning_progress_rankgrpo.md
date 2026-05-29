@@ -620,7 +620,7 @@ The next implementation must align these code/design surfaces, in this order:
      `custom_all_reduce.cuh:455 invalid argument`. This keeps TP=2 aligned with
      TRL while using NCCL fallback collectives.
 
-4. **EOS and masking parity**
+4. **EOS and masking parity: Implemented in agent loop**
 
    TRL masks after first EOS:
 
@@ -630,15 +630,15 @@ The next implementation must align these code/design surfaces, in this order:
    completion_mask = sequence_indices <= eos_idx
    ```
 
-   verl-gr target:
+   verl-gr now applies the same mask when building rollout `response_mask` in
+   `verl_gr/recipes/rankgrpo/rankgrpo_agent_loop.py` via
+   `build_trl_completion_mask()` (`verl.utils.torch_functional.get_response_mask`).
 
-   - Generated `response_mask` and `responses` must represent the same
-     completion length semantics.
-   - Rank-GRPO advantage code must compute `terminated_with_eos` from the same
-     EOS token ID used by the tokenizer and rollout backend.
-   - If vLLM strips EOS from returned token IDs in the async path, verl-gr must
-     account for that explicitly instead of treating every max-token response as
-     non-terminated.
+   Remaining checks on the next run:
+
+   - `train/rankgrpo/completions/clipped_ratio` stays near TRL (~0).
+   - If vLLM strips EOS from returned token IDs, treat as non-terminated and
+     investigate tokenizer/vLLM return semantics explicitly.
 
 5. **Length-shaping parity**
 
@@ -692,7 +692,7 @@ stay near TRL.
 | Clip epsilon | **Done** | `0.06 / 0.08` defaults | Monitor clipfrac |
 | PPO epochs | **Done** | `PPO_EPOCHS=1` default | Confirm no override |
 | Actor update precision | **Done for KL** | `ACTOR_MODEL_DTYPE=fp32` default; `fp32opt` run shows KL growth comparable to TRL | Continue reward/drift checks |
-| Generation termination / length collapse | **Partial / sampling aligned** | previous `newmatchg2_3_trlmatch_fp32opt` run reached near-1024-token completions and KL spikes; current defaults align fast-path sampling, avoid Hydra `min_p`, use `old_log_prob_mode=current`, and keep TP=2 with custom all-reduce disabled | Next successful run must verify clipped ratio stays near TRL |
+| Generation termination / length collapse | **Partial / EOS mask in agent loop** | fast-path sampling aligned; agent loop applies TRL `completion_mask` via `build_trl_completion_mask` (`rankgrpo_agent_loop.py`); prior `newmatchg2_3` late max-length collapse predates this fix | Next run: verify `train/rankgrpo/completions/clipped_ratio` stays near TRL (~0). If clip ratio still climbs late in training, the remaining gap is likely generation not stopping (vLLM/model/stack), not mask plumbing |
 
 ### 4.2 Secondary Speed Causes
 
