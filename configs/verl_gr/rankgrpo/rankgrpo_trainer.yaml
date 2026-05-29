@@ -61,7 +61,10 @@ actor_rollout_ref:
   actor:
     entropy_coeff: 0.0  # TRL Rank-GRPO reference uses no entropy bonus (PPO default is also 0)
     entropy_checkpointing: true
-    clip_ratio_high: 0.2
+    clip_ratio: 0.06
+    clip_ratio_low: 0.06
+    clip_ratio_high: 0.08
+    clip_ratio_c: 1e6
     use_dynamic_bsz: false
     ppo_mini_batch_size: 8
     ppo_micro_batch_size_per_gpu: 32  # 4 prompts × 8 rollouts = 32 seq/GPU, matches TRL's per_device_train_batch_size=4
@@ -78,8 +81,8 @@ actor_rollout_ref:
       wrap_policy:
         transformer_layer_cls_to_wrap:
           - Qwen2DecoderLayer
-      # Keep trainable parameters and Adam states in fp32. Loading the actor
-      # directly as bf16 makes lr=1e-6 updates mostly quantize away.
+      # Keep trainable parameters and Adam states in fp32. TRL's DeepSpeed ZeRO-3
+      # also uses fp32 master weights with AMP (bf16 compute, fp32 update).
       model_dtype: fp32
     profiler:
       enable: false
@@ -93,6 +96,7 @@ actor_rollout_ref:
     tensor_model_parallel_size: 2
     temperature: 1.0
     top_p: 1.0
+    top_k: -1
     do_sample: true
     gpu_memory_utilization: 0.25
     max_num_batched_tokens: 40960
@@ -116,6 +120,7 @@ actor_rollout_ref:
       top_k: -1
     engine_kwargs:
       vllm:
+        disable_custom_all_reduce: true
         max_logprobs: 20
     profiler:
       enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}

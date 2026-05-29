@@ -26,10 +26,10 @@ Status legend:
 | 1.2 PPO clip ratio | **Done** | verl-gr defaults to `[0.94, 1.08]`, matching TRL | Monitor `actor/pg_clipfrac` |
 | 1.3 PPO epochs / sequence reuse | **Done** | good `fp32opt` run shows `ppo_epochs=1`, matching TRL `mu=1` | Keep no override in future runs |
 | 1.4 Other aligned hparams | **Done** | LR, KL coefficient, Adam betas, shuffle behavior, rollout count, seed, and actor dtype defaults are aligned in `fp32opt` | Keep these fixed for follow-ups |
-| 1.5 Distributed backend | **Pending / known difference** | TRL uses DeepSpeed ZeRO-3 + colocated vLLM TP=2; the good verl-gr run still uses FSDP2 + Ray hybrid engine with rollout TP=1/DP=2 | Test TP=2 separately if needed |
+| 1.5 Distributed backend | **Partial** | TRL uses DeepSpeed ZeRO-3 + colocated vLLM TP=2; verl-gr now defaults rollout TP=2 but still uses FSDP2 + Ray hybrid engine. vLLM custom all-reduce is disabled after a TP=2 startup failure, so TP topology remains aligned while the collective implementation falls back to NCCL | Backend/runtime remains different |
 | 2. Compute performance | **Pending** | Batch work per optimizer step is aligned; structural overhead remains | Measure wall-clock and phase timing |
-| 3. Convergence analysis | **Done for KL** | good run `g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt` shows `actor/kl_loss` growing in the same range as TRL | Continue reward/throughput comparisons |
-| 5. Recommended fixes | **Partial** | confirmed-good defaults are in place through `fp32opt`; old-logprob and TP=2 experiments are not part of the good run | Keep follow-ups separate |
+| 3. Convergence analysis | **Partial** | `fp32opt` fixed the flat-KL failure, but newer run `newmatchg2_3_trlmatch_fp32opt` shows max-length generation collapse and KL spikes | Align generation termination/length behavior with TRL before further reward conclusions |
+| 5. Recommended fixes | **Partial** | confirmed-good defaults are in place through `fp32opt`; old-logprob=current, rollout TP=2, safe checkpoint pruning, and TRL-like save/eval cadence are default-aligned before the next run | Backend/Ray differences remain |
 | 6. Verification plan | **Pending** | checklist exists below | Run and record evidence |
 
 ## 1. Hyperparameter Analysis
@@ -144,8 +144,11 @@ verl-gr:
 Progress-bar denominator implication:
 
 ```text
-383013 dataset prompts // 6 unique prompts per optimizer step = 63835 steps
+raw dataset prompts // 6 unique prompts per optimizer step
 ```
+
+The latest startup log reports `Total training steps: 63804` after prompt-length
+filtering, which is the denominator to expect for the current aligned launch.
 
 The previous `gen_batch_size=48` verl-gr setting meant 48 unique prompts × 8
 rollouts = 384 generated sequences per update, which was not equivalent to TRL.
@@ -207,9 +210,12 @@ Current defaults aligned with TRL:
 | Adam beta1/beta2 | `0.9 / 0.99` | `0.9 / 0.99` |
 | Rollouts per prompt | `num_generations=8` | `ROLLOUT_N=8` |
 | Prompt/completion length | `2048 / 1024` | `2048 / 1024` |
+| Save/eval frequency | `200 / 200` | `SAVE_FREQ=200`, `TEST_FREQ=SAVE_FREQ` |
+| Top-k checkpoint pruning | keep best 3 by eval metric | keep best 3 by `eval/reward_total` and delete all non-kept `global_step_*` dirs after ranking |
 | Seed | `3407` | `SEED=3407` |
 | Train shuffle | enabled | `DATA_SHUFFLE=True` |
 | Validation shuffle | disabled | `VALIDATION_SHUFFLE=False` |
+| Eval before train | not explicitly requested | `VAL_BEFORE_TRAIN=False` |
 | Actor train dtype | fp32 master/mixed bf16 | `ACTOR_MODEL_DTYPE=fp32` + FSDP mixed precision |
 
 Accomplished:
@@ -217,6 +223,11 @@ Accomplished:
 - Validation now follows TRL's `--no-val_shuffle` behavior.
 - The trainable actor now defaults to fp32 loading to avoid quantizing
   `lr=1e-6` AdamW updates into bf16 parameters.
+- Save/eval cadence now defaults to TRL's `200 / 200`, and top-k pruning removes
+  all checkpoint directories outside the kept best-3 set after each successful
+  validation ranking update.
+- Eval-before-train is disabled by default to avoid an extra initial validation
+  pass not requested by the TRL launch script.
 
 Confirmed in the good `fp32opt` run:
 
@@ -225,7 +236,7 @@ Confirmed in the good `fp32opt` run:
 - Hydra dump shows `ppo_epochs: 1`.
 - Hydra dump shows `validation_shuffle: False`.
 
-### 1.5 Distributed Backend Differences: Pending / Known Difference
+### 1.5 Distributed Backend Differences: Partial / Known Difference
 
 Not aligned yet:
 
@@ -234,16 +245,19 @@ Not aligned yet:
 | Training backend | DeepSpeed ZeRO-3 | FSDP2 |
 | Runtime topology | Accelerate trainer process | Ray hybrid engine |
 | vLLM integration | colocated | Ray rollout workers |
-| vLLM tensor parallelism | TP=2 | TP=1, DP=2 in the confirmed good `fp32opt` run |
+| vLLM tensor parallelism | TP=2 | TP=2 by default |
+| vLLM all-reduce implementation | vLLM default | custom all-reduce disabled; NCCL fallback after `custom_all_reduce.cuh:455 invalid argument` on this stack |
 
 Current decision:
 
-- Keep the confirmed good `fp32opt` run as the baseline. Do not fold TP=2 into
-  that baseline until a separate TP=2 run proves it preserves KL/reward behavior.
+- The confirmed `fp32opt` run remains the historical dtype/batch/clip baseline.
+- The current aligned launch keeps rollout TP=2 to match TRL's colocated vLLM
+  tensor-parallel topology, but disables vLLM custom all-reduce for stability on
+  this machine.
 
 Remaining verification:
 
-- Compare a future TP=2 run against the confirmed TP=1/DP=2 `fp32opt` run under
+- Compare the next successful TP=2 run against the confirmed TP=1/DP=2 `fp32opt` run under
   the same batch/clip/epoch/dtype settings.
 - Compare checkpoint parameter drift and optimizer-state dtypes between TRL and
   verl-gr.
@@ -271,20 +285,29 @@ Current verl-gr step shape:
 
 ```text
 1. vLLM rollout: 6 prompts × 8 = 48 completions
-2. old_log_prob: separate actor forward over 48 sequences
+2. old_log_prob: backend may still compute/recompute this tensor
 3. ref_log_prob: separate ref forward over 48 sequences
 4. actor update: 6 fixed micro-batches, 1 optimizer step
 ```
+
+For the TRL-matched loss path, `algorithm.rank_grpo.old_log_prob_mode=current`
+uses the current forward pass detached from gradient (`log_prob.detach()`) as
+the PPO anchor, matching TRL's aligned-generation behavior when
+`old_per_token_logps` is absent. This aligns loss semantics, but it does not yet
+remove any backend work that may still produce `old_log_probs`.
 
 ### 2.2 Why verl-gr Is Slower: Pending
 
 Known remaining speed differences:
 
-- Separate `old_log_prob` forward pass.
+- Possible separate old-log-prob production in the backend, even though
+  Rank-GRPO loss now anchors to current detached log-probs in `trl_match` mode.
 - Separate `ref_log_prob` forward pass.
 - Ray RPC/DataProto boundaries between phases.
-- vLLM remains TP=1/DP=2 in the confirmed good run, unlike TRL's colocated TP=2
-  group.
+- Historical confirmed good run used vLLM TP=1/DP=2; the current aligned default
+  uses TP=2 to match TRL's colocated TP=2 group.
+- vLLM custom all-reduce is disabled for stability, so TP=2 topology is aligned
+  while the collective implementation differs from vLLM's default fast path.
 - FSDP2/Ray memory layout differs from DeepSpeed ZeRO-3.
 
 No fix is marked done for these structural speed items yet. The batch fix makes
@@ -347,9 +370,10 @@ Accomplished:
 
 Remaining verification:
 
-- Confirm progress-bar denominator near `383013 // 6 = 63835`.
+- Confirm future runs keep the same filtered dataloader denominator unless the
+  dataset or prompt-length filtering changes.
 
-### 3.5 KL Divergence Dynamics: Done for the confirmed fp32 actor run
+### 3.5 KL Divergence Dynamics: Partial
 
 Accomplished:
 
@@ -362,18 +386,297 @@ Accomplished:
   KL is no longer flat: `actor/kl_loss` went from `0.000167` at step 10 to
   `0.020529` at step 360. The TRL reference was `0.000064` at step 10 and
   `0.021844` at step 360.
+- The newer run `newmatchg2_3_trlmatch_fp32opt` confirms the actor learning-rate
+  path itself is not dynamically drifting:
+
+```text
+actor/lr      min=max=9.999999974752427e-07
+actor/base_lr min=max=9.999999974752427e-07
+```
+
+Backend code check:
+
+- `scripts/run_rankgrpo.sh` passes
+  `actor_rollout_ref.actor.optim.lr_scheduler_type=constant`.
+- verl FSDP builds `get_constant_schedule_with_warmup(...)`.
+- With `lr_warmup_steps=0`, the constant schedule returns multiplier `1.0` at
+  every step.
 
 Still open:
 
-- Reward and throughput still need comparison after accepting the KL behavior.
-- Remaining backend differences still include old/ref log-prob plumbing, vLLM
-  topology, FSDP2 vs ZeRO-3, and Ray boundaries.
+- The latest failure is no longer "flat KL"; it is a generation behavior
+  divergence. In `newmatchg2_3_trlmatch_fp32opt`, KL spikes coincide with
+  completions hitting `max_response_length=1024`.
+- TRL's comparable trace keeps completions near 187 tokens and almost never
+  clips, so `eval/reward_total` is not aligned while verl-gr is producing
+  max-length / non-terminating generations.
+- Remaining backend differences still include generation termination semantics,
+  old/ref log-prob plumbing, vLLM topology, FSDP2 vs ZeRO-3, and Ray boundaries.
 
 Next checks:
 
-- Keep `fp32opt` as the baseline for follow-up experiments.
-- Compare reward, clipfrac, throughput, and checkpoint drift at the same steps.
-- Test old-log-prob semantics and rollout TP=2 only as separate experiments.
+- Keep `fp32opt` as the baseline for dtype/batch/clip/epoch alignment, but do
+  not mark convergence fully aligned until generation length behavior matches
+  TRL.
+- Prioritize the generation termination plan in section 3.6 before changing
+  old-log-prob semantics or rollout TP topology.
+- Compare reward, clipped-completion ratio, detected item count, overflow ratio,
+  and checkpoint drift at the same steps.
+
+### 3.6 Generation Termination / Length Collapse: Next Alignment Target
+
+#### Problem Evidence
+
+Latest failing verl-gr trace:
+
+```text
+Trace:
+tensorboard_log/RankGRPO/newmatchg2_3_trlmatch_fp32opt
+
+actor/lr:
+  constant 1e-6 for all logged steps
+
+Before the failure:
+  step 2800 response_length/mean       = 201.75
+  step 2800 response_length/clip_ratio = 0.0
+  step 2800 actor/kl_loss              = 0.2168
+
+At first collapse:
+  step 3000 response_length/mean       = 1016.40
+  step 3000 response_length/clip_ratio = 0.9583
+  step 3000 actor/kl_loss              = 0.8666
+  step 3000 eval/reward_total          = 0.4520
+
+At major KL/reward failure:
+  step 5000 response_length/mean       = 1012.58
+  step 5000 response_length/clip_ratio = 0.9792
+  step 5000 actor/kl_loss              = 3.4241
+  step 5000 eval/reward_total          = 0.3363
+
+Peak KL window:
+  step 5020 actor/kl_loss              = 3.6645
+  step 5020 response_length/clip_ratio = 1.0
+  step 5430 actor/kl_loss              = 3.8333
+```
+
+Comparable TRL trace:
+
+```text
+Trace:
+Rank-GRPO/results/grpo/new2/runs/May28_09-35-22_hk01dgx028
+
+train/learning_rate:
+  constant 1e-6
+
+train/completions/mean_length:
+  min 183.40, max 194.08, final about 188
+
+train/completions/clipped_ratio:
+  min 0.0, max 0.00417, final 0.0
+
+eval/reward_total:
+  range 0.4685 to 0.4891
+```
+
+Working hypothesis:
+
+```text
+The latest verl-gr run fails because generated completions stop terminating
+normally and saturate the 1024-token response budget. This inflates KL, makes
+loss/eval behavior non-comparable to TRL, and prevents reward convergence.
+Learning-rate drift is not the root cause for this trace.
+```
+
+#### Code-Level Alignment Targets
+
+The next implementation must align these code/design surfaces, in this order:
+
+1. **Training length metrics parity: Implemented**
+
+   Add TRL-equivalent training metrics in verl-gr so every run can detect this
+   failure without manual scalar scripts.
+
+   Files:
+
+   - `verl_gr/recipes/rankgrpo/rankgrpo_algorithm.py`
+   - `verl_gr/trainers/rl_trainer.py`
+   - `tests/test_rankgrpo_loss_modes.py`
+
+   Required metrics:
+
+   ```text
+   train/rankgrpo/completions/mean_length
+   train/rankgrpo/completions/min_length
+   train/rankgrpo/completions/max_length
+   train/rankgrpo/completions/clipped_ratio
+   train/rankgrpo/completions/mean_terminated_length
+   train/rankgrpo/completions/min_terminated_length
+   train/rankgrpo/completions/max_terminated_length
+   train/rankgrpo/items/detected_mean
+   train/rankgrpo/items/detected_max
+   train/rankgrpo/items/overflow_token_ratio
+   train/rankgrpo/items/eos_rate
+   ```
+
+   Semantics must match TRL where names overlap:
+
+   - `clipped_ratio = fraction of completions without EOS before max length`.
+   - `terminated_length` statistics only include completions with EOS; if no
+     completion has EOS, log `0.0` for terminated length statistics.
+   - `items/detected` must use the same newline-token segmentation semantics as
+     TRL's `_segment_items_from_tokens(...)`.
+
+2. **Generated sample dump around failure windows**
+
+   Make it easy to inspect what the model is actually generating at the collapse
+   steps.
+
+   Files:
+
+   - `verl_gr/recipes/rankgrpo/rankgrpo_trainer.py`
+   - Existing dump/log-generation helpers if available in `verl_gr/trainers/rl_trainer.py`
+
+   Required behavior:
+
+   ```text
+   When VERL_GR_DEBUG=1 or an explicit dump flag is set:
+     dump prompts/completions/reward_model/rank_rewards/items_detected/eos_found
+     at selected train steps, especially 2800, 3000, 5000, 5400
+   ```
+
+   The dump should answer:
+
+   - Are completions repeating text, movie IDs, separators, or prompt fragments?
+   - Are newline separators still present?
+   - Is EOS missing, malformed, or masked out?
+   - Are more than 20 recommendation items emitted?
+
+3. **Sampling parameter parity: Implemented for Rank-GRPO fast path**
+
+   Confirm the actual vLLM requests match TRL, not only the Hydra config.
+
+   TRL source target:
+
+   - `Rank-GRPO/libs/trl/rank_grpo_trainer.py`
+
+   TRL vLLM generation uses:
+
+   ```text
+   SamplingParams(
+     n=1,
+     repetition_penalty=1.0,
+     temperature=1.0,
+     top_p=1.0,
+     top_k=-1,
+     max_tokens=1024,
+   )
+   ```
+
+   verl-gr source targets:
+
+   - `verl_gr/recipes/rankgrpo/rankgrpo_agent_loop.py`
+   - `verl/workers/rollout/vllm_rollout/vllm_async_server.py`
+   - `configs/verl_gr/rankgrpo/rankgrpo_trainer.yaml`
+
+   Required checks:
+
+   ```text
+   config.temperature = 1.0
+   config.top_p = 1.0
+   config.top_k = -1
+   request min_p = 0.0
+   request n = 1
+   repetition_penalty = 1.0
+   max_tokens resolves to response_length=1024
+   vLLM EOS behavior is not changed by ignore_eos or stop settings
+   generated token ids include tokenizer.eos_token_id when the model terminates
+   ```
+
+   Implemented in `verl_gr/recipes/rankgrpo/rankgrpo_agent_loop.py`:
+
+   ```text
+   n=1
+   repetition_penalty=1.0
+   temperature=1.0
+   top_p=1.0
+   top_k=-1
+   min_p=0.0
+   max_tokens=response_length
+   ```
+
+   Compatibility note:
+
+   - `min_p` is intentionally not passed as `actor_rollout_ref.rollout.min_p` in
+     Hydra, because this verl version's `RolloutConfig` rejects that field.
+   - The Rank-GRPO agent loop still injects `min_p=0.0` into actual vLLM
+     sampling params, preserving TRL-aligned sampling behavior without breaking
+     rollout config instantiation.
+   - `actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce`
+     defaults to `true` after TP=2 vLLM startup failed with
+     `custom_all_reduce.cuh:455 invalid argument`. This keeps TP=2 aligned with
+     TRL while using NCCL fallback collectives.
+
+4. **EOS and masking parity**
+
+   TRL masks after first EOS:
+
+   ```text
+   is_eos = completion_ids == eos_token_id
+   eos_idx = first EOS position or sequence length
+   completion_mask = sequence_indices <= eos_idx
+   ```
+
+   verl-gr target:
+
+   - Generated `response_mask` and `responses` must represent the same
+     completion length semantics.
+   - Rank-GRPO advantage code must compute `terminated_with_eos` from the same
+     EOS token ID used by the tokenizer and rollout backend.
+   - If vLLM strips EOS from returned token IDs in the async path, verl-gr must
+     account for that explicitly instead of treating every max-token response as
+     non-terminated.
+
+5. **Length-shaping parity**
+
+   TRL applies length shaping after item segmentation:
+
+   ```text
+   overflow tokens after item 20 receive extra_token_penalty = -0.1
+   exact 20-item EOS receives end_of_list_reward = 0.1
+   early EOS before 20 items receives early_stop_penalty = -0.1
+   ```
+
+   verl-gr target:
+
+   - Confirm `rank_token_mask`, `item_token_mask`, `overflow_token_mask`,
+     `exact_len`, and `early_stop` match TRL on the same synthetic completions.
+   - Do not add a separate no-EOS penalty by default because TRL does not have a
+     `non_terminated_penalty` hyperparameter. Keep the active reward semantics
+     aligned with TRL while fixing sampling/EOS behavior at the source.
+   - Add tests with:
+     - exactly 20 newline-separated items followed by EOS,
+     - fewer than 20 items followed by EOS,
+     - more than 20 items with overflow tokens,
+     - no EOS and max-length padding/clipping.
+
+#### Execution Plan for Next Run
+
+The observability and sampling/old-log-prob alignment code has been implemented.
+The next step is a fresh run that proves startup succeeds and generated lengths
+stay near TRL.
+
+1. Launch with the current defaults from `.match_rankgrpo.sh` /
+   `scripts/run_rankgrpo.sh`.
+2. Confirm the startup log shows TP=2, `disable_custom_all_reduce=True`,
+   `VAL_BEFORE_TRAIN=False`, and total training steps around the filtered
+   dataloader count (`63804` in the latest startup log).
+3. Confirm `train/rankgrpo/completions/clipped_ratio` and
+   `train/rankgrpo/completions/mean_length` are logged.
+4. Stop early if clipped ratio moves toward the previous failure mode
+   (`~1.0`) instead of TRL's near-zero clipped ratio.
+5. If convergence still differs after length behavior is aligned, test
+   remaining backend differences separately: old-log-prob computation cost,
+   ref-log-prob phase cost, FSDP2/Ray vs ZeRO-3, and Ray RPC overhead.
 
 ## 4. Root Causes Summary
 
@@ -381,17 +684,18 @@ Next checks:
 
 | Cause | Status | What changed | Remaining work |
 |---|---|---|---|
-| Unique prompts per step | **Done** | `GEN_BATCH_SIZE=6`; actor global/mini batch = 48 seq | Verify fresh logs |
+| Unique prompts per step | **Done** | `GEN_BATCH_SIZE=6`; actor global/mini batch = 48 seq; latest startup log reports `Total training steps: 63804` after filtering | Keep defaults |
 | Clip epsilon | **Done** | `0.06 / 0.08` defaults | Monitor clipfrac |
 | PPO epochs | **Done** | `PPO_EPOCHS=1` default | Confirm no override |
 | Actor update precision | **Done for KL** | `ACTOR_MODEL_DTYPE=fp32` default; `fp32opt` run shows KL growth comparable to TRL | Continue reward/drift checks |
+| Generation termination / length collapse | **Partial / sampling aligned** | previous `newmatchg2_3_trlmatch_fp32opt` run reached near-1024-token completions and KL spikes; current defaults align fast-path sampling, avoid Hydra `min_p`, use `old_log_prob_mode=current`, and keep TP=2 with custom all-reduce disabled | Next successful run must verify clipped ratio stays near TRL |
 
 ### 4.2 Secondary Speed Causes
 
 | Cause | Status | Current state |
 |---|---|---|
-| Separate forward passes | **Pending** | old/ref log-probs still separate |
-| vLLM TP topology | **Pending** | confirmed good run uses TP=1/DP=2; TP=2 should be tested separately |
+| Separate forward passes | **Pending** | loss anchors to current detached log-probs, but backend old/ref log-prob work may still exist |
+| vLLM TP topology | **Partial** | default uses TP=2; latest attempt reached vLLM startup but needed custom all-reduce disabled |
 | Distributed backend | **Pending** | FSDP2/Ray remains different from ZeRO-3 |
 | Ray RPC overhead | **Pending** | not optimized yet |
 
@@ -408,22 +712,27 @@ Next checks:
 - Single pass per generated sequence: `PPO_EPOCHS=1`.
 - Train shuffle enabled and validation shuffle disabled.
 - fp32 actor load for trainable parameters: `ACTOR_MODEL_DTYPE=fp32`.
+- Save/eval frequency aligned to `200 / 200`.
+- Top-k checkpoint pruning now deletes all `global_step_*` dirs outside the
+  kept best-3 set, including previously unranked save-only checkpoints.
+- Eval-before-train disabled by default: `VAL_BEFORE_TRAIN=False`.
+- `old_log_prob_mode=current` wired in `verl_gr/recipes/rankgrpo/rankgrpo_loss.py`;
+  in `trl_match` mode it resolves `old_log_probs` to `log_prob.detach()`,
+  matching TRL's aligned-generation fallback when `old_per_token_logps` is
+  absent.
+- `ROLLOUT_TENSOR_PARALLEL_SIZE=2` is now the script default for 2-GPU runs.
+- vLLM custom all-reduce is disabled by default so TP=2 startup falls back to
+  NCCL instead of failing on `custom_all_reduce.cuh:455 invalid argument`.
+- `min_p=0.0` remains in the Rank-GRPO agent-loop sampling params, but is no
+  longer passed as a Hydra `RolloutConfig` field.
 
 ### Not Applied Yet
 
-- `old_log_prob_mode=current`
-  - Not part of the good `fp32opt` run.
-  - Expected impact: closer TRL PPO-anchor semantics; needs a separate test
-    before being folded into defaults.
 - `RANKGRPO_BYPASS_OLD_LOG_PROB=True`
   - Current default: `False`.
   - Expected impact: speed improvement by avoiding one separate actor forward.
   - Convergence impact: should be tested carefully because it changes which
     old log-prob source is trusted.
-- `ROLLOUT_TENSOR_PARALLEL_SIZE=2`
-  - Current default for the good `fp32opt` run: `1`.
-  - Expected impact: closer to TRL's vLLM TP=2 generation topology and possibly
-    better rollout throughput.
 
 ## 6. Verification Plan
 
@@ -435,24 +744,41 @@ Fresh aligned run checklist:
 - [x] Hydra dump shows `actor_rollout_ref.actor.fsdp_config.model_dtype=fp32`.
 - [x] Logs show total actor batch of 48 generated sequences per optimizer step.
 - [x] Logs show 6 fixed micro-batches of 4 seq/GPU per optimizer step.
-- [ ] Progress denominator is about `383013 // 6 = 63835`.
+- [x] Save/test frequency defaults are aligned to `200 / 200`.
+- [x] Top-k pruning deletes unkept checkpoint dirs after successful validation
+  ranking.
+- [x] Latest startup log reports `Total training steps: 63804` with
+  `GEN_BATCH_SIZE=6` after dataset filtering.
+- [x] TP=2 is the default rollout topology.
+- [x] vLLM custom all-reduce is disabled to keep TP=2 stable on this stack.
+- [x] `min_p` is not passed through Hydra `RolloutConfig`, avoiding the previous
+  `unexpected keyword argument 'min_p'` startup failure.
 - [x] `actor/kl_loss` grows comparably to TRL `train/kl` in the good `fp32opt`
   run.
+- [ ] `train/rankgrpo/completions/clipped_ratio` exists and stays near TRL's
+  `train/completions/clipped_ratio`.
+- [ ] `train/rankgrpo/completions/mean_length` exists and stays near TRL's
+  `train/completions/mean_length` under the same checkpoint segment.
+- [ ] `train/rankgrpo/items/detected_mean`, `items/overflow_token_ratio`, and
+  `items/eos_rate` exist and identify whether max-length outputs are caused by
+  missing EOS, excessive item overflow, or malformed separators.
+- [ ] Debug sample dumps around steps 2800/3000/5000/5400 show actual
+  completions, detected items, EOS status, and rank rewards.
 - [ ] Checkpoint parameter drift is no longer bf16-quantized away.
 - [ ] `eval/reward_total` slope is compared against the TRL baseline.
 - [ ] Wall-clock time per 100 optimizer steps is recorded.
 - [ ] If convergence still differs beyond KL, test old-logprob semantics
   separately.
-- [ ] If speed or generation behavior still differs, test rollout TP=2
-  separately.
+- [ ] If speed or generation behavior still differs under TP=2, compare TP=2
+  against the historical TP=1/DP=2 `fp32opt` baseline.
 
 ## Implementation Inventory
 
 | File | Current role |
 |---|---|
 | `scripts/run_rankgrpo.sh` | Owns alignment defaults and passes Hydra overrides |
-| `scripts/.match_rankgrpo.sh` | Endpoint-specific GPU/Ray/output/resume wrapper |
-| `configs/verl_gr/rankgrpo/rankgrpo_trainer.yaml` | RankGRPO base config; actor dtype default is fp32 |
+| `scripts/.match_rankgrpo.sh` | Endpoint-specific GPU/Ray/output/resume wrapper; cleanup is scoped to this run's GCS port and Ray temp dir, not arbitrary worker-port listeners |
+| `configs/verl_gr/rankgrpo/rankgrpo_trainer.yaml` | RankGRPO base config; actor dtype default is fp32, TP=2 is default, and vLLM custom all-reduce is disabled |
 | `verl_080_dev/verl/trainer/ppo/ray_trainer.py` | Actor update uses `gen_batch_size × rollout.n` and one full mini-batch |
 | `verl_gr/recipes/rankgrpo/rankgrpo_loss.py` | TRL-matched RankGRPO PPO loss path |
 | `verl_gr/recipes/rankgrpo/rankgrpo_algorithm.py` | Per-prompt-group RankGRPO advantage computation |

@@ -46,6 +46,23 @@ AdvantageEstimator = getattr(core_algos, "AdvantageEstimator")
 _RANKGRPO_TOKENIZER = None
 
 
+def _prune_unkept_checkpoint_dirs(ckpt_root: str, keep_paths: set[str]) -> list[str]:
+    keep_abs = {os.path.abspath(path) for path in keep_paths}
+    removed: list[str] = []
+    if not os.path.isdir(ckpt_root):
+        return removed
+
+    for name in os.listdir(ckpt_root):
+        if not name.startswith("global_step_"):
+            continue
+        path = os.path.abspath(os.path.join(ckpt_root, name))
+        if path in keep_abs or not os.path.isdir(path):
+            continue
+        shutil.rmtree(path)
+        removed.append(path)
+    return removed
+
+
 class _OpenOneRecTrainerAdapter(TrainerTaskAdapter):
     def prepare_gen_batch(self, trainer, batch: DataProto) -> DataProto:
         return trainer._prepare_recommendation_gen_batch(batch)
@@ -423,6 +440,12 @@ class RLTrainer(RayPPOTrainerBase):
         )
         if metric_name:
             value = metrics.get(metric_name)
+            if value is None:
+                # Try glob matching (e.g. "val-aux/*/pass_at_32/mean")
+                from fnmatch import fnmatch
+                for key, val in metrics.items():
+                    if fnmatch(key, metric_name):
+                        return key, self._as_float(val, default=float("nan"))
             return metric_name, self._as_float(value, default=float("nan"))
 
         for candidate in (
@@ -486,12 +509,17 @@ class RLTrainer(RayPPOTrainerBase):
         keep = state[:top_k]
         drop = state[top_k:]
 
-        keep_paths = {entry["path"] for entry in keep}
+        keep_paths = {os.path.abspath(entry["path"]) for entry in keep}
         for entry in drop:
-            path = entry.get("path")
+            raw_path = entry.get("path")
+            path = os.path.abspath(raw_path) if raw_path else raw_path
             if path and path not in keep_paths and os.path.isdir(path):
                 shutil.rmtree(path)
                 print(f"[topk] Removed checkpoint outside top-{top_k}: {path}")
+
+        ckpt_root = os.path.abspath(str(self.config.trainer.default_local_dir))
+        for path in _prune_unkept_checkpoint_dirs(ckpt_root, keep_paths):
+            print(f"[topk] Removed unranked checkpoint outside top-{top_k}: {path}")
 
         self._save_topk_checkpoint_state(keep)
         print(f"[topk] Kept top-{top_k} checkpoints by {metric_name}: {keep}")

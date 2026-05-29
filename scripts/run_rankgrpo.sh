@@ -72,8 +72,9 @@ LOG_PROB_MAX_TOKENS_PER_GPU="${LOG_PROB_MAX_TOKENS_PER_GPU:-${MAX_TOKENS_PER_GPU
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${MAX_TOKENS_PER_GPU}}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-512}"
 ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-False}"
+ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE="${ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE:-True}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
-DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE="${DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE:-1}"
+DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE="${DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE:-2}"
 if (( DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE > N_GPUS )); then
   DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE="${N_GPUS}"
 fi
@@ -153,11 +154,11 @@ RAY_NUM_CPUS="${RAY_NUM_CPUS:-$((N_GPUS * 24))}"
 RAY_OBJECT_STORE_MEMORY="${RAY_OBJECT_STORE_MEMORY:-$((N_GPUS * 32 * 1024 * 1024 * 1024))}"
 RAY_INCLUDE_DASHBOARD="${RAY_INCLUDE_DASHBOARD:-False}"
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-1}"
-SAVE_FREQ="${SAVE_FREQ:-50}"
-TEST_FREQ="${TEST_FREQ:-200}"
+SAVE_FREQ="${SAVE_FREQ:-200}"
+TEST_FREQ="${TEST_FREQ:-${SAVE_FREQ}}"
 LOGGING_STEPS="${LOGGING_STEPS:-10}"
 VAL_LOG_GENERATIONS="${VAL_LOG_GENERATIONS:-4}"
-VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
+VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-False}"
 BEST_CKPT_PRUNE_ENABLE="${BEST_CKPT_PRUNE_ENABLE:-True}"
 BEST_CKPTS_TO_KEEP="${BEST_CKPTS_TO_KEEP:-${TOPK_CKPT_KEEP:-3}}"
 BEST_CKPT_METRIC="${BEST_CKPT_METRIC:-${TOPK_CKPT_METRIC:-eval/reward_total}}"
@@ -208,6 +209,7 @@ echo "Actor max tokens/GPU: ${ACTOR_MAX_TOKENS_PER_GPU}"
 echo "Log-prob max tokens/GPU: ${LOG_PROB_MAX_TOKENS_PER_GPU}"
 echo "Rollout max batched tokens: ${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
 echo "Rollout max sequences: ${ROLLOUT_MAX_NUM_SEQS}"
+echo "Rollout disable custom all-reduce: ${ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE}"
 echo "Rollout GPU memory utilization: ${ROLLOUT_GPU_MEMORY_UTILIZATION}"
 echo "Rollout calculate log probs: ${ROLLOUT_CALCULATE_LOG_PROBS}"
 echo "Rank-GRPO bypass old log prob: ${RANKGRPO_BYPASS_OLD_LOG_PROB}"
@@ -286,6 +288,7 @@ done
   actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" \
   actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}" \
   actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}" \
+  actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce="${ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE}" \
   actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TENSOR_PARALLEL_SIZE}" \
   actor_rollout_ref.rollout.calculate_log_probs="${ROLLOUT_CALCULATE_LOG_PROBS}" \
@@ -299,6 +302,7 @@ done
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.val_kwargs.n="${ROLLOUT_N}" \
   actor_rollout_ref.rollout.val_kwargs.do_sample=True \
+  actor_rollout_ref.rollout.top_k=-1 \
   actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
   actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
   actor_rollout_ref.rollout.val_kwargs.top_k=-1 \

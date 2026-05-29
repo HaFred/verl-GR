@@ -72,6 +72,18 @@ def _item_level_log_prob(
     return old_log_prob + item_log_ratio
 
 
+def _resolve_old_log_prob(*, log_prob: torch.Tensor, old_log_prob: torch.Tensor, rank_grpo_config) -> torch.Tensor:
+    mode = str(_cfg_get(rank_grpo_config, "old_log_prob_mode", "recomputed")).lower()
+    if mode in {"current", "trl", "trl_match"}:
+        # TRL aligned path: when generation and update are aligned, TRL does not
+        # carry a separate old_per_token_logps tensor and anchors PPO to the
+        # current forward pass detached from gradient.
+        return log_prob.detach()
+    if mode in {"recomputed", "old", "verl"}:
+        return old_log_prob
+    raise ValueError(f"Unknown Rank-GRPO old_log_prob_mode: {mode}")
+
+
 def _trl_clipped_pg_loss(
     log_importance_weights: torch.Tensor,
     advantages: torch.Tensor,
@@ -233,7 +245,11 @@ def rankgrpo_ppo_loss(
 
     response_mask = data["response_mask"].to(bool)
     loss_mask = data["item_token_mask"].to(bool)
-    old_log_prob = data["old_log_probs"]
+    old_log_prob = _resolve_old_log_prob(
+        log_prob=log_prob,
+        old_log_prob=data["old_log_probs"],
+        rank_grpo_config=rank_grpo_config,
+    )
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
     ref_log_prob = data.get("ref_log_prob", None)

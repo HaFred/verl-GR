@@ -31,6 +31,37 @@ from verl.workers.rollout.replica import TokenOutput
 from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
 
 
+def _cfg_get(config: Any, key: str, default=None):
+    if config is None:
+        return default
+    if hasattr(config, "get"):
+        return config.get(key, default)
+    return getattr(config, key, default)
+
+
+def _build_rankgrpo_sampling_params(config, *, validate: bool) -> dict[str, Any]:
+    params = {
+        # Match TRL's colocated vLLM path: one independent sample per request.
+        "n": 1,
+        "repetition_penalty": 1.0,
+        "temperature": _cfg_get(config, "temperature", 1.0),
+        "top_p": _cfg_get(config, "top_p", 1.0),
+        "top_k": _cfg_get(config, "top_k", -1),
+        "min_p": _cfg_get(config, "min_p", 0.0),
+        "max_tokens": _cfg_get(config, "response_length", None),
+        "logprobs": _cfg_get(config, "calculate_log_probs", False),
+    }
+    if validate:
+        val_kwargs = _cfg_get(config, "val_kwargs", None)
+        params["temperature"] = _cfg_get(val_kwargs, "temperature", params["temperature"])
+        params["top_p"] = _cfg_get(val_kwargs, "top_p", params["top_p"])
+        params["top_k"] = _cfg_get(val_kwargs, "top_k", params["top_k"])
+        params["min_p"] = _cfg_get(val_kwargs, "min_p", params["min_p"])
+    if params["max_tokens"] is None:
+        params.pop("max_tokens")
+    return params
+
+
 class RankGRPOAgentLoopWorker(AgentLoopWorker):
     """Batch repeated Rank-GRPO single-turn rollouts before calling vLLM.
 
@@ -80,19 +111,10 @@ class RankGRPOAgentLoopWorker(AgentLoopWorker):
         return all(str(name) == "single_turn_agent" for name in agent_names)
 
     def _build_sampling_params(self, batch: DataProto) -> dict[str, Any]:
-        config = self.rollout_config
-        sampling_params = {
-            "temperature": config.temperature,
-            "top_p": config.top_p,
-            "top_k": config.top_k,
-            "repetition_penalty": 1.0,
-            "logprobs": config.calculate_log_probs,
-        }
-        if batch.meta_info.get("validate", False):
-            sampling_params["top_p"] = config.val_kwargs.top_p
-            sampling_params["top_k"] = config.val_kwargs.top_k
-            sampling_params["temperature"] = config.val_kwargs.temperature
-        return sampling_params
+        return _build_rankgrpo_sampling_params(
+            self.rollout_config,
+            validate=batch.meta_info.get("validate", False),
+        )
 
     def _group_repeated_prompts(self, batch: DataProto) -> list[tuple[list[int], list[int]]]:
         groups: list[tuple[list[int], list[int]]] = []
