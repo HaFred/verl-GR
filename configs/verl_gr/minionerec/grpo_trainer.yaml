@@ -9,6 +9,7 @@ defaults:
   - _self_
 
 task:
+  name: minionerec
   class_path: verl_gr.recipes.minionerec.minionerec_recipe.MiniOneRecTask
   trainer_adapter_class: verl_gr.recipes.minionerec.minionerec_trainer.MiniOneRecTrainerAdapter
 
@@ -16,15 +17,15 @@ data:
   max_prompt_length: 2560
   prompt_key: prompt
   shuffle: false
-  max_response_length: 64
-  filter_overlong_prompts: true
-  filter_overlong_prompts_workers: 16
-  truncation: error
+  max_response_length: 256
+  filter_overlong_prompts: false
+  truncation: left
   custom_cls:
     name: MiniOneRecDataset
     path: null
   category: Industrial_and_Scientific
   include_alignment_tasks: true
+  include_alignment_tasks_for_val: false
   sid_index_path: null
   item_meta_path: null
   seq_title_sample: 10000
@@ -35,6 +36,12 @@ custom_reward_function:
   name: compute_score
   path: null
 
+reward:
+  # MiniOneRec uses a lightweight rule-based reward function.
+  # Spawning the global default (8) reward loop workers makes each one load
+  # tokenizer state and can trigger host-memory pressure during startup.
+  num_workers: 1
+
 actor_rollout_ref:
   hybrid_engine: true
 
@@ -42,6 +49,8 @@ actor_rollout_ref:
     entropy_from_logits_with_chunking: true
     fsdp_config:
       model_dtype: bfloat16
+    engine_config:
+      completion_only_logprob: true
     profiler:
       enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}
       all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.all_ranks,false}
@@ -51,19 +60,26 @@ actor_rollout_ref:
     # 与 ref 一致：rmpad 路径下用分块熵，避免 (bsz, seq, vocab) 全量 softmax 导致数十 GB 峰值
     entropy_from_logits_with_chunking: true
     entropy_checkpointing: true
-    clip_ratio_high: 0.28
     use_dynamic_bsz: true
     ppo_mini_batch_size: 8
     ppo_max_token_len_per_gpu: 40960
+    loss_agg_mode: seq-mean-token-mean
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
-    optim:
-      lr: 2e-6
-      lr_warmup_steps: 10
-      weight_decay: 0.1
+    policy_loss:
+      loss_mode: minionerec_reinforce
     fsdp_config:
       model_dtype: bfloat16
+    engine_config:
+      completion_only_logprob: true
+    optim:
+      optimizer: paged_adamw_32bit
+      lr: 1e-5
+      lr_warmup_steps_ratio: 0.03
+      weight_decay: 0.0
+      clip_grad: 0.3
+      lr_scheduler_type: cosine
     profiler:
       enable: false
       all_ranks: false
@@ -88,7 +104,11 @@ actor_rollout_ref:
       # MiniOneRec semantics: constrained-beam groups per prompt before beam expansion.
       # Effective rollout requests per prompt = num_generations_per_prompt * beam_width.
       num_generations_per_prompt: 1
-      beam_width: 20
+      beam_width: 16
+      val_beam_width: 50
+      decode_mode_train: hf_constrained_beam_sample
+      decode_mode_val: hf_constrained_beam_eval
+      disable_cache_in_train: true
       constrained_beam_max_inflight_requests: 64
       beam_search_params:
         max_tokens: 16
@@ -128,12 +148,13 @@ algorithm:
 trainer:
   project_name: MiniOneRec_RL
   experiment_name: minionerec_grpo_constrained_beam
-  val_before_train: true
+  val_before_train: false
+  best_ckpt_metric: val-aux/*/hr@20/mean
   default_hdfs_dir: null
   logger: [tensorboard]
   remove_previous_ckpt_in_save: true
-  save_freq: 20
-  test_freq: 20
+  save_freq: 165
+  test_freq: 165
   total_epochs: 2
   nnodes: 1
   n_gpus_per_node: 8

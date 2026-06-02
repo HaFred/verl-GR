@@ -1,174 +1,281 @@
 # `verl_gr` Design Diagram
 
-## Framework-Side Features (Recipe-Agnostic)
-
-The `trainers/` and `workers/` directories contain reusable infrastructure that any
-recipe can opt into via config flags or method overrides — recipe code in
-`recipes/<name>/` only does recipe-specific wiring.
-
-### `trainers/` — Pluggable Training Infrastructure
-
-- **Task registry + selection** ([main_ppo.py](../../verl_gr/trainers/main_ppo.py)) —
-  `TASK_REGISTRY` maps task names to task factory functions. `_select_task()` resolves
-  the task at startup with backward-compat heuristics. Adding a recipe requires only
-  one registry entry — the runner never changes.
-- **Task adapter delegation** ([task_adapter.py](../../verl_gr/trainers/task_adapter.py)) —
-  `TrainerTaskAdapter` base class with overridable hooks (`prepare_gen_batch`,
-  `validate`, `dump_generations`, `maybe_log_val_generations`, `postprocess_rewards`).
-  Recipes subclass this to inject their own validation, logging, and reward processing.
-  The trainer calls `self._get_task_adapter()` without importing recipe code.
-- **Recommendation gen batch prep** ([rl_trainer.py](../../verl_gr/trainers/rl_trainer.py)) —
-  `_prepare_recommendation_gen_batch()` strips prompt tensors before generation, wires
-  beam-search config (`two_stage` / `constrained_beam`), resolves beam width, decode
-  params, and constraints from both canonical and legacy config keys.
-- **Top-k checkpoint pruning** — ranks checkpoints by a configurable validation
-  metric, keeps the N best, and deletes the rest. Metric selection is config-driven
-  with a recipe-aware fallback chain.
-- **Latency-adjusted tqdm** — pauses the training progress bar during validation and
-  checkpoint saving so eval latency doesn't inflate the displayed step rate.
-- **LR metric synthesis** — infers actor LR from optimizer config + scheduler math
-  (warmup, cosine decay) even when the worker omits `actor/lr`.
-- **Parameter drift check** — at training milestones (steps 10, 50, 150, 300),
-  queries workers for L2 drift from the SFT checkpoint.
-
-### `workers/` — Reusable Rollout & Training Primitives
-
-- **Rollout class registration** ([registration.py](../../verl_gr/workers/rollout/registration.py)) —
-  dynamically injects custom rollout types and vLLM replica classes into verl's
-  internal registries. Called by `OneRecTask.configure_rollout()` and
-  `MiniOneRecTask.configure_rollout()` at startup.
-- **Beam-search config resolution** ([beam_config.py](../../verl_gr/workers/rollout/beam_config.py)) —
-  `BeamSearchConfig`, `TwoStageDecodeConfig`, `DecodePhaseConfig` dataclasses, with
-  `resolve_beam_search_config()` / `resolve_two_stage_decode_config()` that handle
-  both canonical and legacy config keys (`stage2_beam_size`, `stage1_max_tokens`, etc.).
-  Shared by both two-stage and constrained-beam rollout paths.
-- **Async beam search engine** ([beam_backend.py](../../verl_gr/workers/rollout/beam_backend.py)) —
-  `BeamCandidate`, `beam_search_score()`, `run_async_beam_search()` — generic async
-  beam search over token sequences with scoring, length penalty, and per-step
-  constraint filtering. Used by both `TwoStagevLLMRollout` and
-  `ConstrainedBeamvLLMRollout`.
-- **Rollout packing primitives** ([primitives.py](../../verl_gr/workers/rollout/primitives.py)) —
-  `prepare_prompt_token_inputs()` converts DataProto → vLLM format,
-  `pack_rollout_batch()` converts generated responses back into verl-compatible
-  DataProto, `expand_beam_candidates()` expands beam outputs across samples. Shared
-  by all beam-based rollout paths.
-- **Per-layer gradient hooks** ([grad_hooks.py](../../verl_gr/workers/grad_hooks.py)) —
-  monkey-patches `FSDPEngine.train_batch` to log per-layer gradient L2 norms. Also
-  fixes an FSDP2 in-place `div_` autograd disconnection bug. Opt-in — any worker
-  calls `install_grad_hooks()` in `init_model()`.
-
-## Architecture Diagram
-
 This diagram shows how the three recipe workloads plug into the shared `verl_gr`
-runtime. The main path is:
+runtime after the recipe refactor. The main path is:
 
 1. `verl_gr.trainers.main_ppo` selects a task runtime and builds datasets.
 2. `RecipeTaskRuntime` or a recipe task prepares tokenizer, processor, worker class, and rollout registration.
 3. `RLTrainer` delegates recipe-specific generation and validation through `TrainerTaskAdapter`.
-4. Custom rollout workloads register recipe-specific async agent loops and vLLM server adapters.
+4. Custom beam workloads register rollout replicas and async agent loops under `verl_gr.workers.rollout`.
+   **OpenOneRec** and **MiniOneRec async** paths run beam expansion in rollout-server
+   classes (`TwoStagevLLMHttpServer`, `ConstrainedBeamvLLMHttpServer`); agent loops only
+   group requests and attach metadata (`beam_index`, `beam_group_id`, etc.). MiniOneRec
+   DDP training additionally routes to `hf_constrained_beam_generate` on the actor worker.
 
 ```mermaid
-flowchart LR
-  subgraph C1["Role 1: Entrypoint & Task Selection"]
-    TaskRunner["main_ppo.TaskRunner\n- TASK_REGISTRY select\n- legacy rankgrpo infer\n- build datasets + RLTrainer"]
-    TaskSpec["TASK_REGISTRY\nopenonerec | rankgrpo"]
-    TaskFactory["task_factory.py\nclass-path loader\nMiniOneRec + custom tasks"]
-  end
+classDiagram
+direction LR
 
-  subgraph C2["Role 2: Recipe Runtime & Data"]
-    RecipeTaskRuntime["RecipeTaskRuntime\n- FSDP wrap cleanup\n- tokenizer/processor\n- worker + rollout hooks"]
-    OneRecTask["OneRecTask\ntwo_stage rollout registration"]
-    MiniOneRecTask["MiniOneRecTask\nconstrained_beam registration"]
-    RankGRPOTask["RankGRPOTask\ninject algorithm.rank_grpo\ninto actor_rollout_ref"]
-    Datasets["Recipe datasets\nOneRecDataset\nMiniOneRecDataset\nRankGRPODataset"]
-  end
+class Dataset
+class ActorRolloutRefWorker
+class ServerAdapter
+class vLLMHttpServer
+class vLLMReplica
+class RayPPOTrainerBase
+class TrainerTaskAdapter
+class SingleTurnAgentLoop
+class AgentLoopWorker
+class AgentLoopManager
 
-  subgraph C3["Role 3: Trainer, Loss, Validation & Reward"]
-    RLTrainer["RLTrainer\n- task adapter delegation\n- recommendation gen batch prep\n- Rank-GRPO advantage + train metrics\n- top-k ckpt prune / latency tqdm"]
-    TrainerTaskAdapter["TrainerTaskAdapter\nbase delegation surface"]
-    OpenOneRecAdapter["OpenOneRec hooks\nvalidate / dump / log"]
-    MiniOneRecAdapter["MiniOneRecTrainerAdapter\nrewards / validate"]
-    RankGRPOAdapter["RankGRPOTrainerAdapter\nrankgrpo_validate\nval-generation preview"]
-    RankGRPOAlgorithm["rankgrpo_algorithm\nsegmentation + length shaping\ncompute_rank_grpo_advantage"]
-    RankGRPOReward["rankgrpo_reward\ncatalog-aware rank_rewards_from_text"]
-    RankGRPOWorker["RankGRPOActorRolloutRefWorker\ngrad_hooks + rankgrpo_ppo_loss"]
-    RankGRPOLoss["rankgrpo_loss\ntrl_match / item-level IS\nold_log_prob_mode=current"]
-    RankGRPOMetrics["eval aliases + train metrics\neval/reward_total\ntrain/rankgrpo/completions/*"]
-  end
+class TaskRunner {
+  +run(config)
+}
+class TaskSpec {
+  +name
+  +factory
+}
+class TaskFactory {
+  +build_task(config)
+  +load_object(class_path)
+}
 
-  subgraph C4["Role 4: Rollout, Beam Search & Agent Loops"]
-    RolloutRegistration["rollout registration\ntwo_stage | constrained_beam"]
-    TwoStageRollout["TwoStagevLLMRollout\nTwoStagevLLMHttpServer\nTwoStagevLLMReplica"]
-    ConstrainedRollout["ConstrainedBeamvLLMRollout\nConstrainedBeamvLLMHttpServer\nConstrainedBeamvLLMReplica"]
-    BeamBackend["beam_backend\nBeamCandidate / async beam search"]
-    OpenOneRecLoop["OpenOneRecAgentLoopManager\nTwoStage Worker"]
-    MiniOneRecLoop["MiniOneRecConstrainedBeam\nAgentLoopManager"]
-    RankGRPOAgentLoop["RankGRPOAgentLoopManager/Worker\ncontiguous prompt groups\nasyncio.gather n x n=1 vLLM"]
-    RankGRPORolloutMask["build_trl_completion_mask\nTRL SamplingParams defaults"]
-    vLLMReplica["upstream vLLMReplica\nverl async rollout server"]
-  end
+class RecipeTaskRuntime {
+  +sanitize_fsdp2_wrap_policy(config)
+  +expand_rollout_counts(config)
+  +configure_rollout(config)
+  +get_actor_rollout_ref_worker(config)
+  +prepare(config) dict
+}
 
-  TaskRunner -.->|registry| TaskSpec
-  TaskRunner -.->|load_object| TaskFactory
-  TaskRunner --> RecipeTaskRuntime
-  TaskRunner --> Datasets
-  TaskRunner --> RLTrainer
+class OneRecTask {
+  +expand_rollout_counts(config)
+  +configure_rollout(config)
+  +get_actor_rollout_ref_worker(config)
+}
+class MiniOneRecTask {
+  +expand_rollout_counts(config)
+  +configure_rollout(config)
+  +get_actor_rollout_ref_worker(config)
+}
+class RankGRPOTask {
+  +prepare(config) dict
+}
+RecipeTaskRuntime <|-- OneRecTask
+RecipeTaskRuntime <|-- MiniOneRecTask
+RecipeTaskRuntime <|-- RankGRPOTask
 
-  RecipeTaskRuntime --> OneRecTask
-  RecipeTaskRuntime --> MiniOneRecTask
-  RecipeTaskRuntime --> RankGRPOTask
-  RLTrainer -.->|_get_task_adapter| TrainerTaskAdapter
-  TrainerTaskAdapter --> OpenOneRecAdapter
-  TrainerTaskAdapter --> MiniOneRecAdapter
-  TrainerTaskAdapter --> RankGRPOAdapter
-  RLTrainer -.->|compute_advantage| RankGRPOAlgorithm
-  RankGRPOAlgorithm -.->|rank_rewards_from_text| RankGRPOReward
-  RankGRPOAlgorithm -.->|log per step| RankGRPOMetrics
-  RankGRPOAdapter -.->|eval aliases| RankGRPOMetrics
-  RankGRPOTask -.->|worker class| RankGRPOWorker
-  RankGRPOWorker --> RankGRPOLoss
+class OneRecDataset {
+  +__init__(data_files, tokenizer, config, processor, max_samples)
+  +__getitem__(index) dict
+}
+class MiniOneRecDataset {
+  +__init__(data_files, tokenizer, config, processor, max_samples)
+  +__getitem__(index) dict
+}
+class RankGRPODataset {
+  +__init__(data_files, tokenizer, config, processor, max_samples)
+  +__getitem__(index) dict
+}
+Dataset <|-- OneRecDataset
+Dataset <|-- MiniOneRecDataset
+Dataset <|-- RankGRPODataset
 
-  OneRecTask -.->|register| RolloutRegistration
-  MiniOneRecTask -.->|register| RolloutRegistration
-  OneRecTask --> TwoStageRollout
-  MiniOneRecTask --> ConstrainedRollout
-  RankGRPOTask -.->|Hydra agent_loop_manager_class| RankGRPOAgentLoop
-  RankGRPOAgentLoop --> RankGRPORolloutMask
-  RankGRPOAgentLoop --> vLLMReplica
-  TwoStageRollout -.->|beams| BeamBackend
-  ConstrainedRollout -.->|beams| BeamBackend
-  OneRecTask --> OpenOneRecLoop
-  MiniOneRecTask --> MiniOneRecLoop
-  TwoStageRollout --> OpenOneRecLoop
-  ConstrainedRollout --> MiniOneRecLoop
+class RLTrainer {
+  +compute_advantage(data, adv_estimator)
+  +_get_task_adapter() TrainerTaskAdapter
+  +_prepare_recommendation_gen_batch(batch) DataProto
+  +_validate()
+}
+RayPPOTrainerBase <|-- RLTrainer
+
+class OpenOneRecTrainerAdapter {
+  +prepare_gen_batch(trainer, batch)
+  +validate(trainer)
+  +dump_generations(...)
+}
+class MiniOneRecTrainerAdapter {
+  +prepare_gen_batch(trainer, batch)
+  +postprocess_rewards(trainer, batch, reward_batch)
+  +validate(trainer)
+}
+class RankGRPOTrainerAdapter {
+  +prepare_gen_batch(trainer, batch)
+  +validate(trainer)
+}
+TrainerTaskAdapter <|-- OpenOneRecTrainerAdapter
+TrainerTaskAdapter <|-- MiniOneRecTrainerAdapter
+TrainerTaskAdapter <|-- RankGRPOTrainerAdapter
+
+class RankGRPOAlgorithm {
+  +rankgrpo_enabled(config)
+  +compute_rank_grpo_advantage(data, config, tokenizer)
+}
+class RankGRPOReward {
+  +compute_score(...)
+  +rank_rewards_from_text(...)
+}
+class RankGRPOTokenizer {
+  +build_rankgrpo_tokenizer_and_processor(...)
+}
+
+class OneRecActorRolloutRefWorker {
+  +init_model()
+}
+class MiniOneRecActorRolloutRefWorker {
+  +init_model()
+  +hf_constrained_beam_generate(prompts, meta_info) dict
+}
+class HfConstrainedBeamGenerator {
+  +generate_train(model, prompts, prompt_token_ids)
+  +generate_eval(model, prompts, prompt_token_ids)
+}
+ActorRolloutRefWorker <|-- OneRecActorRolloutRefWorker
+ActorRolloutRefWorker <|-- MiniOneRecActorRolloutRefWorker
+
+class RolloutRegistration {
+  +register_two_stage_rollout_class()
+  +register_two_stage_replica()
+  +register_constrained_beam_rollout_class()
+  +register_constrained_beam_replica()
+}
+class TwoStagevLLMRollout {
+  +_two_stage_generation(prompts, kwargs) DataProto
+  +update_weights(weights, global_steps)
+}
+class ConstrainedBeamvLLMRollout {
+  +update_weights(weights, global_steps)
+}
+ServerAdapter <|-- TwoStagevLLMRollout
+ServerAdapter <|-- ConstrainedBeamvLLMRollout
+
+class TwoStagevLLMHttpServer {
+  +generate(prompt_ids, sampling_params, request_id, image_data, video_data)
+  +_generate_two_stage(...) TokenOutput
+  +_build_two_stage_cache_entry(...) dict
+  +_run_stage2_beam_search(...) list
+  +abort_all_requests(reset_prefix_cache)
+}
+class ConstrainedBeamvLLMHttpServer {
+  +generate(prompt_ids, sampling_params, request_id, image_data, video_data)
+  +abort_all_requests(reset_prefix_cache)
+}
+vLLMHttpServer <|-- TwoStagevLLMHttpServer
+vLLMHttpServer <|-- ConstrainedBeamvLLMHttpServer
+
+class TwoStagevLLMReplica
+class ConstrainedBeamvLLMReplica
+vLLMReplica <|-- TwoStagevLLMReplica
+vLLMReplica <|-- ConstrainedBeamvLLMReplica
+TwoStagevLLMReplica ..> TwoStagevLLMHttpServer : server class
+ConstrainedBeamvLLMReplica ..> ConstrainedBeamvLLMHttpServer : server class
+
+class BeamBackend {
+  +run_async_beam_search(...)
+  +beam_search_score(candidate)
+}
+class BeamCandidate {
+  +prompt_token_ids
+  +generated_token_ids
+  +cumulative_logprob
+}
+BeamBackend ..> BeamCandidate : ranks
+TwoStagevLLMHttpServer ..> BeamBackend : stage2 beams
+ConstrainedBeamvLLMHttpServer ..> BeamBackend : constrained beams
+
+class OpenOneRecTwoStageAgentLoop {
+  +run(sampling_params, kwargs) AgentLoopOutput
+}
+class OpenOneRecAgentLoopWorker {
+  +generate_sequences(batch)
+}
+class OpenOneRecAgentLoopManager {
+  +generate_sequences(prompts) DataProto
+}
+SingleTurnAgentLoop <|-- OpenOneRecTwoStageAgentLoop
+AgentLoopWorker <|-- OpenOneRecAgentLoopWorker
+AgentLoopManager <|-- OpenOneRecAgentLoopManager
+OpenOneRecAgentLoopWorker ..> OpenOneRecTwoStageAgentLoop : metadata routing only
+OpenOneRecTwoStageAgentLoop ..> TwoStagevLLMHttpServer : server_manager.generate
+
+class MiniOneRecConstrainedBeamAgentLoop {
+  +run(sampling_params, kwargs) AgentLoopOutput
+}
+class MiniOneRecConstrainedBeamAgentLoopWorker {
+  +generate_sequences(batch)
+}
+class MiniOneRecConstrainedBeamAgentLoopManager {
+  +generate_sequences(prompts) DataProto
+  +_should_route_to_hf(prompts) bool
+  +_hf_generate_sequences(prompts) DataProto
+}
+SingleTurnAgentLoop <|-- MiniOneRecConstrainedBeamAgentLoop
+AgentLoopWorker <|-- MiniOneRecConstrainedBeamAgentLoopWorker
+AgentLoopManager <|-- MiniOneRecConstrainedBeamAgentLoopManager
+MiniOneRecConstrainedBeamAgentLoopWorker ..> MiniOneRecConstrainedBeamAgentLoop : metadata routing only
+MiniOneRecConstrainedBeamAgentLoop ..> ConstrainedBeamvLLMHttpServer : server_manager.generate
+MiniOneRecConstrainedBeamAgentLoopManager ..> MiniOneRecConstrainedBeamAgentLoopWorker : fallback async vLLM path
+
+TaskRunner ..> TaskSpec : registry
+TaskRunner ..> OneRecTask : openonerec
+TaskRunner ..> RankGRPOTask : rankgrpo
+TaskFactory ..> OneRecTask : default class path
+TaskFactory ..> MiniOneRecTask : minionerec class path
+TaskFactory ..> RecipeTaskRuntime : standalone loader
+TaskRunner ..> RLTrainer : constructs
+TaskRunner ..> OneRecDataset : create rl dataset
+TaskRunner ..> MiniOneRecDataset : create rl dataset
+TaskRunner ..> RankGRPODataset : create rl dataset
+
+OneRecTask ..> RolloutRegistration : two stage
+OneRecTask ..> OneRecActorRolloutRefWorker : selects
+OneRecTask ..> OpenOneRecAgentLoopManager : configures rollout-server routing
+OneRecActorRolloutRefWorker ..> TwoStagevLLMRollout : registers rollout engine
+TwoStagevLLMRollout ..> TwoStagevLLMHttpServer : async generation dispatch
+OpenOneRecAgentLoopManager ..> OpenOneRecAgentLoopWorker : dispatches grouped requests
+
+MiniOneRecTask ..> RolloutRegistration : constrained beam
+MiniOneRecTask ..> MiniOneRecActorRolloutRefWorker : selects
+MiniOneRecTask ..> MiniOneRecConstrainedBeamAgentLoopManager : configures HF-first routing
+MiniOneRecConstrainedBeamAgentLoopManager ..> MiniOneRecActorRolloutRefWorker : calls hf_constrained_beam_generate
+MiniOneRecActorRolloutRefWorker ..> HfConstrainedBeamGenerator : constrained HF generate
+MiniOneRecActorRolloutRefWorker ..> ConstrainedBeamvLLMRollout : optional async rollout registration
+
+RankGRPOTask ..> RankGRPOTokenizer : builds tokenizer
+RankGRPOTask ..> ActorRolloutRefWorker : vanilla vllm
+RLTrainer ..> OpenOneRecTrainerAdapter : task adapter
+RLTrainer ..> RankGRPOTrainerAdapter : task adapter
+RLTrainer ..> MiniOneRecTrainerAdapter : adapter extension
+RLTrainer ..> RankGRPOAlgorithm : rank advantages
+RankGRPOAlgorithm ..> RankGRPOReward : per rank rewards
 ```
 
 ## Recipe Integration Notes
 
 - OpenOneRec uses `OneRecTask` to expand rollout counts by beam width, register the
   `two_stage` async rollout path, select `OneRecActorRolloutRefWorker`, and wire
-  `OpenOneRecAgentLoopManager`. Its dataset, reward, and task runtime still live
-  in `verl_gr/recipes/openonerec/onerec_recipe.py`; validation and checkpoint
-  pruning live in `verl_gr/recipes/openonerec/onerec_trainer.py`.
+  `OpenOneRecAgentLoopManager`. Dataset, reward, and task runtime live in
+  `verl_gr/recipes/openonerec/onerec_recipe.py`; validation and checkpoint pruning
+  live in `onerec_trainer.py`.
+  **Decode path (engine / rollout layer, not trainer):**
+  - `OpenOneRecTwoStageAgentLoop` / `OpenOneRecAgentLoopWorker` only attach
+    `stage1_sample_idx`, `beam_index`, and `beam_group_id`, then call
+    `server_manager.generate(...)`.
+  - Stage-1 sampling, stage-2 beam expansion, per-group cache reuse, and inflight
+    throttling run in `workers/rollout/two_stage_vllm_async.py::TwoStagevLLMHttpServer`
+    (`_generate_two_stage`, `_build_two_stage_cache_entry`, `_run_stage2_beam_search`).
+  - Shared beam kernel: `workers/rollout/beam_backend.py::run_async_beam_search`.
 - MiniOneRec uses `MiniOneRecTask` to register `constrained_beam`, select
   `MiniOneRecActorRolloutRefWorker`, and wire `MiniOneRecConstrainedBeamAgentLoopManager`.
   Dataset, reward, format helpers, worker shim, agent loop, and trainer adapter
   are separate recipe modules under `verl_gr/recipes/minionerec`.
-- Rank-GRPO keeps upstream rollout name `vllm` and installs
-  `RankGRPOAgentLoopManager` via Hydra
-  (`actor_rollout_ref.rollout.agent.agent_loop_manager_class`). The fast path
-  groups contiguous repeated prompts and issues `n` concurrent `n=1` vLLM
-  requests through the standard `vLLMReplica` async server (TRL colocate style),
-  then applies `build_trl_completion_mask` for EOS-aware `response_mask`.
-  `RankGRPOActorRolloutRefWorker` installs `rankgrpo_ppo_loss` (`trl_match`,
-  item-level importance sampling) and optional rollout logprobs for
-  `bypass_mode` old-log-prob plumbing.
-  - Recipe modules: `rankgrpo_dataset.py`, `rankgrpo_task.py`,
-  `rankgrpo_worker.py`, `rankgrpo_algorithm.py`, `rankgrpo_loss.py`,
-  `rankgrpo_trainer.py`, `rankgrpo_reward.py`, `rankgrpo_agent_loop.py`
-  (`rankgrpo_recipe.py` is a compatibility export). Training logs
-  `train/rankgrpo/completions/*`; validation emits `eval/reward`,
-  `eval/reward_total`, and `eval/loss`.
+  For DDP-aligned training, MiniOneRec agent loop routes generation to
+  `hf_constrained_beam_generate` on worker side (HF `model.generate()` path);
+  async constrained-vLLM remains available via rollout-server classes.
+- Rank-GRPO keeps rollout on the upstream vanilla `vllm` path. Its recipe code is
+  now split across `rankgrpo_dataset.py`, `rankgrpo_task.py`,
+  `rankgrpo_algorithm.py`, `rankgrpo_trainer.py`, `rankgrpo_reward.py`, and
+  `rankgrpo_tokenizer.py`, while `rankgrpo_recipe.py` remains a compatibility
+  export module for existing config overrides.
 
 ## Shared Runtime Flow
 
@@ -180,28 +287,24 @@ flowchart LR
 - `RecipeTaskRuntime` centralizes common FSDP wrap-policy cleanup, HuggingFace
   tokenizer/processor creation, worker class selection, and rollout configuration
   hooks. OpenOneRec and MiniOneRec override the rollout hooks; Rank-GRPO overrides
-  `prepare` to inject `rank_grpo` algorithm config into `actor_rollout_ref`,
-  injects `algorithm.rank_grpo` into `actor_rollout_ref`, and selects
-  `RankGRPOActorRolloutRefWorker` (custom PPO loss + grad hooks).
+  `prepare` to keep its tokenizer behavior unchanged.
 - `RLTrainer` owns shared recommendation generation batch preparation. It delegates
   recipe validation and generation logging through task adapters, and calls
   `rankgrpo_algorithm.compute_rank_grpo_advantage` only when
-  `algorithm.rank_grpo.enable` is true. Its local wrapper also adjusts the tqdm
-  progress clock around validation and checkpoint saving so evaluation latency
-  does not inflate the displayed training-step rate.
+  `algorithm.rank_grpo.enable` is true.
 - `verl_gr.workers.rollout` contains the reusable beam-search infrastructure:
-  registration helpers, two async vLLM server subclasses, rollout adapter classes,
-  and the shared async beam backend used by both beam-search recipes. Rank-GRPO's
-  fast path intentionally lives in `verl_gr/recipes/rankgrpo/rankgrpo_agent_loop.py`
-  because it depends on Rank-GRPO's text-only, contiguous repeated-prompt batch
-  layout rather than a reusable beam-search rollout primitive.
+  registration helpers, async vLLM server subclasses (`TwoStagevLLMHttpServer`,
+  `ConstrainedBeamvLLMHttpServer`), rollout adapter classes, and
+  `beam_backend.run_async_beam_search`. OpenOneRec and MiniOneRec async paths
+  execute beam expansion in these rollout-server classes; MiniOneRec DDP training
+  additionally uses `HfConstrainedBeamGenerator` on the actor worker.
+  This engine-side decode layer replaces the earlier trainer-side Python beam idea.
 
 ## Diagram Legend
 
-- Each column is a role in the runtime path, from launch-time task selection to
-  rollout execution.
-- Solid arrows show the main construction or direct runtime handoff between
-  role blocks.
-- Dotted arrows show registry lookup, configuration-driven selection,
-  delegation, registration, or dependency edges rather than direct ownership.
-- Boxes group related classes/modules rather than listing every class method.
+- Solid inheritance arrows show local classes subclassing upstream `verl` bases or
+  other local abstractions.
+- Dotted arrows show runtime selection, registration, delegation, or dependency
+  edges rather than inheritance.
+- The diagram includes external upstream bases only where they make the `verl_gr`
+  class relationships easier to read.

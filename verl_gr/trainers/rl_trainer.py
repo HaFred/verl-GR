@@ -1,20 +1,18 @@
 """RL trainer extensions for verl-GR with bridged ray-trainer API."""
 
+import numpy as np
 import json
 import math
 import os
 import shutil
-import time
+from contextlib import contextmanager
 from typing import Any
-
 import torch
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
-from verl.trainer.ppo.metric_utils import compute_data_metrics as _base_compute_data_metrics
 from verl.trainer.ppo.ray_trainer import RayPPOTrainer as RayPPOTrainerBase
 from verl.trainer.ppo.ray_trainer import Role, ResourcePoolManager
-
 from verl.utils import tensordict_utils as tu
 from verl.utils.torch_functional import masked_mean
 from verl.workers.utils.padding import left_right_2_no_padding
@@ -26,11 +24,7 @@ from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_maybe_log_val_generations,
     openonerec_validate,
 )
-from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import (
-    compute_rank_grpo_advantage,
-    compute_rank_grpo_training_reward_metrics,
-    rankgrpo_enabled,
-)
+from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import compute_rank_grpo_advantage, rankgrpo_enabled
 from verl_gr.recipes.rankgrpo.rankgrpo_trainer import RankGRPOTrainerAdapter
 from verl_gr.trainers.task_adapter import TrainerTaskAdapter
 from verl_gr.workers.rollout.beam_config import (
@@ -46,21 +40,16 @@ AdvantageEstimator = getattr(core_algos, "AdvantageEstimator")
 _RANKGRPO_TOKENIZER = None
 
 
-def _prune_unkept_checkpoint_dirs(ckpt_root: str, keep_paths: set[str]) -> list[str]:
-    keep_abs = {os.path.abspath(path) for path in keep_paths}
-    removed: list[str] = []
-    if not os.path.isdir(ckpt_root):
-        return removed
-
-    for name in os.listdir(ckpt_root):
-        if not name.startswith("global_step_"):
-            continue
-        path = os.path.abspath(os.path.join(ckpt_root, name))
-        if path in keep_abs or not os.path.isdir(path):
-            continue
-        shutil.rmtree(path)
-        removed.append(path)
-    return removed
+@contextmanager
+def _nvtx_range(name: str):
+    enabled = torch.cuda.is_available() and hasattr(torch.cuda, "nvtx")
+    if enabled:
+        torch.cuda.nvtx.range_push(name)
+    try:
+        yield
+    finally:
+        if enabled:
+            torch.cuda.nvtx.range_pop()
 
 
 class _OpenOneRecTrainerAdapter(TrainerTaskAdapter):
@@ -158,6 +147,7 @@ def compute_advantage(
                 token_level_rewards=data.batch["token_level_rewards"],
                 response_mask=data.batch["response_mask"],
                 index=data.non_tensor_batch["uid"],
+                epsilon=1e-4,
                 norm_adv_by_std_in_grpo=norm_adv_by_std_in_grpo,
             )
             data.batch["advantages"] = advantages
@@ -179,10 +169,49 @@ def compute_advantage(
     return data
 
 
-def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
-    metrics = _base_compute_data_metrics(batch=batch, use_critic=use_critic)
-    metrics.update(compute_rank_grpo_training_reward_metrics(batch))
-    return metrics
+# ---------------------------------------------------------------------------
+# Module-level helpers
+# ---------------------------------------------------------------------------
+
+
+def _get_constraint_info_file(rollout_config) -> str:
+    """Extract info_file path from rollout custom config (OmegaConf-safe)."""
+    custom = getattr(rollout_config, "custom", {}) or {}
+    if hasattr(custom, "items"):
+        custom = dict(custom.items())
+    if isinstance(custom, dict):
+        beam_params = custom.get("beam_search_params", {}) or {}
+        if hasattr(beam_params, "items"):
+            beam_params = dict(beam_params.items())
+        if isinstance(beam_params, dict):
+            constraint = beam_params.get("constraint", {}) or {}
+            if hasattr(constraint, "items"):
+                constraint = dict(constraint.items())
+            if isinstance(constraint, dict):
+                info = constraint.get("info_file", "")
+                return str(info) if info else ""
+    return ""
+
+
+def _prune_unkept_checkpoint_dirs(ckpt_root: str, keep_paths: set[str]) -> list[str]:
+    """Delete `global_step_*` dirs under `ckpt_root` that are not in `keep_paths`."""
+
+    removed: list[str] = []
+    if not os.path.isdir(ckpt_root):
+        return removed
+
+    normalized_keep = {os.path.abspath(path) for path in keep_paths}
+    for name in os.listdir(ckpt_root):
+        if not name.startswith("global_step_"):
+            continue
+        path = os.path.join(ckpt_root, name)
+        abs_path = os.path.abspath(path)
+        if abs_path in normalized_keep:
+            continue
+        if os.path.isdir(path):
+            shutil.rmtree(path)
+            removed.append(path)
+    return removed
 
 
 class RLTrainer(RayPPOTrainerBase):
@@ -199,18 +228,19 @@ class RLTrainer(RayPPOTrainerBase):
             import verl.trainer.ppo.ray_trainer as ray_trainer_mod
 
             ray_trainer_mod.compute_advantage = compute_advantage
-            ray_trainer_mod.compute_data_metrics = compute_data_metrics
+
+    def init_workers(self):
+        super().init_workers()
+        # MiniOneRec uses a rule-based reward function but has no RM.
+        # self.use_rm is False by default, preventing _compute_reward_colocate
+        # from running.  We force it to True AFTER init so that RM workers
+        # are NOT created but postprocess_rewards still sets rm_scores.
+        self.use_rm = True
 
     def fit(self):
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
-        ray_trainer_mod, original_tqdm, progress_tqdm_cls = self._install_latency_adjusted_tqdm()
-        self._progress_tqdm_cls = progress_tqdm_cls
         if logging_steps <= 1:
-            try:
-                return super().fit()
-            finally:
-                ray_trainer_mod.tqdm = original_tqdm
-                self._progress_tqdm_cls = None
+            return super().fit()
 
         from verl.utils.tracking import Tracking
 
@@ -226,47 +256,6 @@ class RLTrainer(RayPPOTrainerBase):
             return super().fit()
         finally:
             Tracking.log = original_log
-            ray_trainer_mod.tqdm = original_tqdm
-            self._progress_tqdm_cls = None
-
-    @staticmethod
-    def _install_latency_adjusted_tqdm():
-        import verl.trainer.ppo.ray_trainer as ray_trainer_mod
-
-        original_tqdm = ray_trainer_mod.tqdm
-
-        class LatencyAdjustedTqdm(original_tqdm):
-            _active = None
-
-            def __init__(self, *args, **kwargs):
-                super().__init__(*args, **kwargs)
-                self._paused_at = None
-                LatencyAdjustedTqdm._active = self
-
-            def close(self):
-                if LatencyAdjustedTqdm._active is self:
-                    LatencyAdjustedTqdm._active = None
-                return super().close()
-
-            @classmethod
-            def pause_active(cls):
-                bar = cls._active
-                if bar is not None and bar._paused_at is None:
-                    bar._paused_at = time.monotonic()
-
-            @classmethod
-            def resume_active(cls):
-                bar = cls._active
-                if bar is None or bar._paused_at is None:
-                    return
-                elapsed = time.monotonic() - bar._paused_at
-                bar.start_t += elapsed
-                if hasattr(bar, "last_print_t"):
-                    bar.last_print_t += elapsed
-                bar._paused_at = None
-
-        ray_trainer_mod.tqdm = LatencyAdjustedTqdm
-        return ray_trainer_mod, original_tqdm, LatencyAdjustedTqdm
 
     def _get_task_adapter(self) -> TrainerTaskAdapter:
         if hasattr(self, "_task_adapter"):
@@ -354,29 +343,88 @@ class RLTrainer(RayPPOTrainerBase):
         if expected_lr is not None:
             metrics["actor/lr"] = expected_lr
 
-    _drift_checked_at = set()
+    def _compute_old_log_prob(self, batch: DataProto):
+        """Override to skip old_log_prob forward pass for REINFORCE loss.
+
+        The minionerec_reinforce loss does not use old_log_probs in its gradient
+        (only for the ppo_kl metric), and use_kl_in_reward is false for minionerec.
+        This saves one full actor inference per step (~20% training time).
+
+        Only activates when the ACTUAL composed config has
+        ``policy_loss.loss_mode == "minionerec_reinforce"`` — never bypass based
+        on rollout name alone, because vanilla PPO requires correct old_log_probs
+        for the importance ratio exp(logp - old_logp).
+        """
+        actor_cfg = self.config.actor_rollout_ref.actor
+        loss_mode = ""
+        try:
+            if hasattr(actor_cfg, "policy_loss"):
+                pl = actor_cfg.policy_loss
+                if hasattr(pl, "loss_mode"):
+                    loss_mode = pl.loss_mode
+                elif hasattr(pl, "get"):
+                    loss_mode = pl.get("loss_mode", "")
+            elif hasattr(actor_cfg, "get"):
+                pl = actor_cfg.get("policy_loss", {})
+                if hasattr(pl, "get"):
+                    loss_mode = pl.get("loss_mode", "")
+                elif hasattr(pl, "loss_mode"):
+                    loss_mode = pl.loss_mode
+        except Exception:
+            loss_mode = ""
+
+        if loss_mode != "minionerec_reinforce":
+            if not getattr(self, "_old_log_prob_losswarned", False):
+                print(f"[RLTrainer._compute_old_log_prob] loss_mode={loss_mode!r} "
+                      f"-> using parent forward pass", flush=True)
+                self._old_log_prob_losswarned = True
+            return super()._compute_old_log_prob(batch)
+
+        if not getattr(self, "_old_log_prob_bypass_logged", False):
+            print("[RLTrainer._compute_old_log_prob] loss_mode='minionerec_reinforce' — "
+                  "old_log_prob bypass active (zero-filled, saving one forward pass per step).",
+                  flush=True)
+            self._old_log_prob_bypass_logged = True
+
+        # For REINFORCE, return zero-filled tensors since old_log_probs are unused.
+        # response_mask determines the valid token positions.
+        if "response_mask" not in batch.batch:
+            batch.batch["response_mask"] = compute_response_mask(batch)
+        response_mask = batch.batch["response_mask"]
+        log_probs = torch.zeros_like(response_mask, dtype=torch.float32)
+        entropy = torch.zeros_like(response_mask, dtype=torch.float32)
+
+        old_log_prob_td = tu.get_tensordict({"old_log_probs": log_probs, "entropys": entropy})
+        old_log_prob = DataProto.from_tensordict(old_log_prob_td)
+        return old_log_prob, 0.0
 
     def _update_actor(self, batch: DataProto) -> DataProto:
-        actor_output = super()._update_actor(batch)
+        with _nvtx_range("actor.forward_backward"):
+            actor_output = super()._update_actor(batch)
         self._add_actor_lr_metrics(actor_output.meta_info["metrics"])
-
-        # Measure parameter drift from SFT at milestones 10, 50, 150, 300.
-        # Controlled by VERL_GR_DEBUG=1 (off by default).
-        if os.environ.get("VERL_GR_DEBUG", "0") == "1":
-            step = self.global_steps
-            if step in {10, 50, 150, 300} and step not in self._drift_checked_at:
-                self._drift_checked_at.add(step)
-                try:
-                    result = self.actor_rollout_wg.debug_param_drift_from_init()
-                    drift = result.get("total_drift_l2", -1)
-                    rel = result.get("relative_drift", -1)
-                    print(f"[PARAM_DRIFT] step={step} total_drift_l2={drift:.6f} relative_drift={rel:.8f}")
-                    for layer in result.get("top_layers", []):
-                        print(f"[PARAM_DRIFT] step={step} layer={layer['layer']} drift_l2={layer['drift_l2']:.6f}")
-                except Exception as e:
-                    print(f"[PARAM_DRIFT] step={step} check failed: {e}")
-
+        if not batch.meta_info.get("validate", False):
+            self._try_sync_ref_model()
         return actor_output
+
+    def _compute_ref_log_prob(self, batch: DataProto) -> DataProto:
+        with _nvtx_range("ref.forward"):
+            return super()._compute_ref_log_prob(batch)
+
+    def _try_sync_ref_model(self):
+        if not self.use_reference_policy or self.ref_in_actor:
+            return
+        ref_cfg = _cfg_get(self.config.actor_rollout_ref, "ref")
+        freq = _cfg_get(ref_cfg, "sync_freq")
+        if freq is None:
+            rollout = str(self.config.actor_rollout_ref.rollout.get("name", ""))
+            freq = 512 if rollout == "constrained_beam" else 0
+        freq = int(freq)
+        if freq <= 0 or self.global_steps % freq != 0:
+            return
+        # TRL-style EMA mixup: ref = alpha * ref + (1-alpha) * actor
+        # alpha = 0 → hard copy (original behavior)
+        alpha = float(_cfg_get(ref_cfg, "ref_model_mixup_alpha", 0.6))
+        self.ref_policy_wg.sync_ref_weights(mixup_alpha=alpha)
 
     def _compute_eval_actor_metrics(self, batch: DataProto) -> dict[str, Any]:
         """Compute actor loss metrics in eval mode without stepping the optimizer."""
@@ -440,12 +488,6 @@ class RLTrainer(RayPPOTrainerBase):
         )
         if metric_name:
             value = metrics.get(metric_name)
-            if value is None:
-                # Try glob matching (e.g. "val-aux/*/pass_at_32/mean")
-                from fnmatch import fnmatch
-                for key, val in metrics.items():
-                    if fnmatch(key, metric_name):
-                        return key, self._as_float(val, default=float("nan"))
             return metric_name, self._as_float(value, default=float("nan"))
 
         for candidate in (
@@ -509,17 +551,9 @@ class RLTrainer(RayPPOTrainerBase):
         keep = state[:top_k]
         drop = state[top_k:]
 
-        keep_paths = {os.path.abspath(entry["path"]) for entry in keep}
-        for entry in drop:
-            raw_path = entry.get("path")
-            path = os.path.abspath(raw_path) if raw_path else raw_path
-            if path and path not in keep_paths and os.path.isdir(path):
-                shutil.rmtree(path)
-                print(f"[topk] Removed checkpoint outside top-{top_k}: {path}")
-
-        ckpt_root = os.path.abspath(str(self.config.trainer.default_local_dir))
-        for path in _prune_unkept_checkpoint_dirs(ckpt_root, keep_paths):
-            print(f"[topk] Removed unranked checkpoint outside top-{top_k}: {path}")
+        keep_paths = {entry["path"] for entry in keep}
+        for path in _prune_unkept_checkpoint_dirs(self.config.trainer.default_local_dir, keep_paths):
+            print(f"[topk] Removed checkpoint outside top-{top_k}: {path}")
 
         self._save_topk_checkpoint_state(keep)
         print(f"[topk] Kept top-{top_k} checkpoints by {metric_name}: {keep}")
@@ -624,16 +658,40 @@ class RLTrainer(RayPPOTrainerBase):
         return gen_batch
 
     def _validate(self):
-        progress_tqdm_cls = getattr(self, "_progress_tqdm_cls", None)
-        if progress_tqdm_cls is not None:
-            progress_tqdm_cls.pause_active()
-        try:
-            metrics = self._get_task_adapter().validate(self)
-            self._update_topk_checkpoints(metrics)
-            return metrics
-        finally:
-            if progress_tqdm_cls is not None:
-                progress_tqdm_cls.resume_active()
+        metrics = self._get_task_adapter().validate(self)
+        self._last_validation_metrics = metrics
+        self._update_topk_checkpoints(metrics)
+        return metrics
+
+    def _compute_reward_colocate(self, batch: DataProto):
+        with _nvtx_range("reward.compute"):
+            reward_batch = super()._compute_reward_colocate(batch)
+        if batch.meta_info.get("validate", False):
+            return reward_batch
+        reward_batch, reward_extra_info = self._get_task_adapter().postprocess_rewards(self, batch, reward_batch)
+        if reward_extra_info:
+            for key, values in reward_extra_info.items():
+                reward_batch.non_tensor_batch[key] = np.array(values, dtype=object)
+            reward_extra_keys = list(reward_batch.meta_info.get("reward_extra_keys", []))
+            for key in reward_extra_info:
+                if key not in reward_extra_keys:
+                    reward_extra_keys.append(key)
+            reward_batch.meta_info["reward_extra_keys"] = reward_extra_keys
+
+            # Compute per-step scalar reward metrics for wandb logging.
+            # The parent framework only logs generic critic/score/mean and
+            # critic/rewards/mean; these add MiniOneRec-specific breakdowns.
+            reward_metrics = {}
+            for key, values in reward_extra_info.items():
+                try:
+                    arr = np.asarray(values, dtype=np.float64)
+                    reward_metrics[f"minionerec/{key}/mean"] = float(arr.mean())
+                except (ValueError, TypeError):
+                    pass
+            existing = reward_batch.meta_info.get("metrics", {})
+            existing.update(reward_metrics)
+            reward_batch.meta_info["metrics"] = existing
+        return reward_batch
 
     def _dump_generations(self, inputs, outputs, scores, reward_extra_infos_dict, dump_path, ground_truths=None):
         return self._get_task_adapter().dump_generations(
@@ -650,19 +708,12 @@ class RLTrainer(RayPPOTrainerBase):
         return self._get_task_adapter().maybe_log_val_generations(self, inputs=inputs, outputs=outputs, scores=scores)
 
     def _save_checkpoint(self):
-        progress_tqdm_cls = getattr(self, "_progress_tqdm_cls", None)
-        if progress_tqdm_cls is not None:
-            progress_tqdm_cls.pause_active()
-        try:
-            super()._save_checkpoint()
-        finally:
-            if progress_tqdm_cls is not None:
-                progress_tqdm_cls.resume_active()
+        super()._save_checkpoint()
         task_name = str(_cfg_get(_cfg_get(self.config, "task", None), "name", "")).lower()
         if task_name != "openonerec":
             return
         local_global_step_folder = f"{self.config.trainer.default_local_dir}/global_step_{self.global_steps}"
-        openonerec_evaluate_and_prune_checkpoint(
+        self._get_task_adapter().evaluate_and_prune_checkpoint(
             self,
             local_global_step_folder,
             metrics=getattr(self, "_last_validation_metrics", None),

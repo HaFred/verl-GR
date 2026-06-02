@@ -137,7 +137,12 @@ class MiniOneRecDataset(Dataset):
         self.seed = config.get("seed", None)
         self.category = config.get("category", "Industrial_and_Scientific")
         self.category_text = CATEGORY_DESCRIPTIONS.get(self.category, self.category)
-        self.include_alignment_tasks = config.get("include_alignment_tasks", True)
+        requested_alignment = bool(config.get("include_alignment_tasks", True))
+        include_alignment_tasks_for_val = config.get("include_alignment_tasks_for_val", False)
+        self.is_val_split = self._is_val_split(self.original_data_files, config.get("val_files"))
+        self.include_alignment_tasks = (
+            bool(include_alignment_tasks_for_val) if self.is_val_split else requested_alignment
+        )
         self.sid_index_path = config.get("sid_index_path")
         self.item_meta_path = config.get("item_meta_path")
         self.seq_title_sample = int(config.get("seq_title_sample", 10000))
@@ -149,6 +154,30 @@ class MiniOneRecDataset(Dataset):
 
         self._download()
         self._read_files_and_tokenize()
+
+    @staticmethod
+    def _normalize_paths(paths: Any) -> list[str]:
+        if paths is None:
+            return []
+        if isinstance(paths, (list, ListConfig)):
+            candidates = list(paths)
+        else:
+            candidates = [paths]
+        normalized = []
+        for value in candidates:
+            if value is None:
+                continue
+            text = str(value).strip()
+            if not text:
+                continue
+            normalized.append(os.path.normcase(os.path.abspath(os.path.expanduser(text))))
+        return normalized
+
+    @classmethod
+    def _is_val_split(cls, data_files: list[str], val_files_cfg: Any) -> bool:
+        data_paths = cls._normalize_paths(data_files)
+        val_paths = cls._normalize_paths(val_files_cfg)
+        return bool(data_paths and val_paths and set(data_paths) == set(val_paths))
 
     def _download(self, use_origin_parquet: bool = False) -> None:
         target_files = self.original_data_files if use_origin_parquet else self.data_files
@@ -170,20 +199,24 @@ class MiniOneRecDataset(Dataset):
         dataframes = [self._load_file(data_file) for data_file in self.data_files]
         source_dataframe = datasets.concatenate_datasets(dataframes)
         logger.info("MiniOneRec source dataset len: %s", len(source_dataframe))
+        print(f"[MiniOneRec] source dataset (CSV rows): {len(source_dataframe)}", flush=True)
 
         records = self._build_sid_records(source_dataframe)
         if self.include_alignment_tasks:
-            records.extend(self._build_title2sid_records())
-            records.extend(self._build_seq_title2sid_records(source_dataframe))
+            title2sid_records = self._build_title2sid_records()
+            seq_records = self._build_seq_title2sid_records(source_dataframe)
+            print(f"[MiniOneRec] title2sid+desc2sid records: {len(title2sid_records)}", flush=True)
+            print(f"[MiniOneRec] seq_title2sid records: {len(seq_records)}", flush=True)
+            records.extend(title2sid_records)
+            records.extend(seq_records)
 
         self.dataframe = datasets.Dataset.from_list(records)
+        print(f"[MiniOneRec] combined (before filter): {len(self.dataframe)}", flush=True)
         logger.info("MiniOneRec combined dataset len: %s", len(self.dataframe))
         if self.shuffle:
             self.dataframe = self.dataframe.shuffle(seed=self.seed)
         if self.max_samples > 0 and self.max_samples < len(self.dataframe):
             self.dataframe = self.dataframe.select(list(range(self.max_samples)))
-        if self.filter_overlong_prompts:
-            self.dataframe = self.maybe_filter_out_long_prompts(self.dataframe)
         logger.info("MiniOneRec processed dataset len: %s", len(self.dataframe))
 
     def _build_sid_records(self, dataframe: datasets.Dataset) -> list[dict[str, Any]]:
@@ -200,16 +233,20 @@ class MiniOneRecDataset(Dataset):
 
         title2sid: dict[str, str] = {}
         description2sid: dict[str, str] = {}
+        valid_items = 0
         for item_id, sids in indices.items():
             if item_id not in item_feat or len(sids) < 3:
                 continue
-            combined_sid = str(sids[0]) + str(sids[1]) + str(sids[2])
-            title = str(item_feat[item_id].get("title", ""))
-            description = maybe_parse_description(item_feat[item_id].get("description", ""))
-            if title:
-                title2sid[title] = combined_sid
-            if description:
-                description2sid[description] = combined_sid
+            valid_items += 1
+            # Exact mirror of original: sids[0] + sids[1] + sids[2]
+            combined_sid = sids[0] + sids[1] + sids[2]
+            title = item_feat[item_id].get("title")
+            description = maybe_parse_description(item_feat[item_id].get("description"))
+            title2sid[title] = combined_sid
+            description2sid[description] = combined_sid
+        print(f"[MiniOneRec] valid_items (in index & item_feat & len>=3): {valid_items}", flush=True)
+        print(f"[MiniOneRec] unique titles: {len(title2sid)}", flush=True)
+        print(f"[MiniOneRec] unique descriptions: {len(description2sid)}", flush=True)
 
         records: list[dict[str, Any]] = []
         for task, mapping in (("title2sid", title2sid), ("description2sid", description2sid)):
@@ -231,8 +268,6 @@ class MiniOneRecDataset(Dataset):
             row = dict(row)
             history_item_title = parse_maybe_list(row.get("history_item_title"))
             target_sid = str(row.get("item_sid", "")).strip()
-            if not history_item_title or not target_sid:
-                continue
             is_duplicate = False
             if "history_item_id" in row:
                 history_item_id = parse_maybe_list(row.get("history_item_id"))

@@ -1,0 +1,272 @@
+# @package _
+# MiniOneRec GRPO config for verl-GR — DDP variant (no FSDP).
+# Uses PyTorch DistributedDataParallel instead of FSDP for faster
+# training on small models.
+#
+# Compose from concrete component configs instead of abstract actor/ref
+# skeletons. The backend now lives in dedicated DDP config groups, so
+# `main_ppo.py` no longer needs to heal missing actor/ref fields at runtime.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - /actor@actor_rollout_ref.actor: minionerec_ddp_actor
+  - /data@data: legacy_data
+  - /ref@actor_rollout_ref.ref: minionerec_ddp_ref
+  - /rollout@actor_rollout_ref.rollout: rollout
+  - /model@actor_rollout_ref.model: minionerec_hf_model
+  - /critic@critic: dp_critic
+  - /model@critic.model: hf_model
+  - /legacy_reward_impl
+  - /reward@reward: reward
+  - /algorithm@algorithm.rollout_correction: rollout_correction
+  - /distillation@distillation: distillation
+  - _self_
+
+task:
+  name: minionerec
+  class_path: verl_gr.recipes.minionerec.minionerec_recipe.MiniOneRecTask
+  trainer_adapter_class: verl_gr.recipes.minionerec.minionerec_trainer.MiniOneRecTrainerAdapter
+  reward_penalties:
+    empty_completion: -1.0
+    invalid_sid: -0.5
+
+data:
+  tokenizer: ${actor_rollout_ref.model.path}
+  use_shm: false
+  max_prompt_length: 2560
+  train_batch_size: 1024
+  val_batch_size: null
+  prompt_key: prompt
+  reward_fn_key: source
+  tool_config_path: null
+  return_raw_input_ids: false
+  return_raw_chat: true
+  return_full_prompt: false
+  shuffle: false
+  seed: null
+  dataloader_num_workers: 8
+  image_patch_size: 14
+  validation_shuffle: false
+  max_response_length: 256
+  filter_overlong_prompts: false
+  filter_overlong_prompts_workers: 1
+  truncation: left
+  image_key: images
+  video_key: videos
+  trust_remote_code: false
+  custom_cls:
+    name: MiniOneRecDataset
+    path: null
+  category: Industrial_and_Scientific
+  include_alignment_tasks: true
+  include_alignment_tasks_for_val: false
+  sid_index_path: null
+  item_meta_path: null
+  seq_title_sample: 10000
+  data_source_key: source
+  return_multi_modal_inputs: true
+  sampler:
+    class_path: null
+    class_name: null
+  datagen:
+    path: null
+    name: null
+  apply_chat_template_kwargs: {}
+
+reward:
+  _target_: verl.trainer.config.RewardConfig
+  num_workers: 1
+  launch_reward_fn_async: false
+  reward_type: function
+  reward_manager:
+    _target_: verl.workers.config.reward_model.RewardManagerConfig
+    source: register
+    name: naive
+    module:
+      _target_: verl.trainer.config.config.ModuleConfig
+      path: null
+      name: custom_reward_manager
+  reward_model:
+    enable: false
+    rm_coef: 1.0
+    model:
+      path: ~/models/FsfairX-LLaMA3-RM-v0.1
+      tokenizer_path: ${actor_rollout_ref.model.path}
+      use_shared_fs: false
+      trust_remote_code: false
+      external_lib: null
+      override_config: {}
+      enable_gradient_checkpointing: false
+    micro_batch_size_per_gpu: null
+    log_prob_micro_batch_size_per_gpu: null
+    max_length: null
+    use_dynamic_batch: ${oc.select:critic.use_dynamic_bsz,false}
+    max_num_tokens: 16384
+    use_remove_padding: false
+  custom_reward_function:
+    path: null
+    name: compute_score
+  verifier:
+    reward_coef: 1.0
+    tokenizer_path: ${actor_rollout_ref.model.path}
+    model:
+      path: null
+      tokenizer_path: ${actor_rollout_ref.model.path}
+      trust_remote_code: false
+      override_config: {}
+      use_remove_padding: false
+      use_shm: false
+      external_lib: null
+    micro_batch_size_per_gpu: null
+    max_length: null
+    use_dynamic_batch: ${oc.select:critic.use_dynamic_bsz,false}
+    max_num_tokens: 16384
+    param_offload: false
+    forward_max_token_len_per_gpu: ${oc.select:.max_num_tokens,null}
+    norm_batch_size: 256
+    verifier_prompt_template: null
+
+actor_rollout_ref:
+  hybrid_engine: true
+  nccl_timeout: 600
+
+  rollout:
+    name: constrained_beam
+    n: 1
+    dtype: bfloat16
+    tensor_model_parallel_size: 1
+    temperature: 1.0
+    top_p: 1.0
+    do_sample: true
+    gpu_memory_utilization: 0.8
+    max_num_batched_tokens: 40960
+    max_num_seqs: 2048
+    log_prob_max_token_len_per_gpu: 40960
+    enable_chunked_prefill: true
+    calculate_log_probs: false
+    layered_summon: false
+    custom:
+      num_generations_per_prompt: 1
+      beam_width: 16
+      val_beam_width: 50
+      decode_mode_train: hf_constrained_beam_sample
+      decode_mode_val: hf_constrained_beam_eval
+      disable_cache_in_train: true
+      constrained_beam_max_inflight_requests: 64
+      beam_search_params:
+        max_tokens: 16
+        logprobs_multiplier: 2
+        constraint:
+          type: minionerec_prefix_trie
+          info_file: null
+          base_model: null
+          fallback_to_eos: true
+    agent:
+      num_workers: 8
+      agent_loop_manager_class: verl_gr.recipes.minionerec.constrained_beam_agent_loop.MiniOneRecConstrainedBeamAgentLoopManager
+      default_agent_loop: minionerec_constrained_beam_agent
+    engine_kwargs:
+      vllm:
+        max_logprobs: 320
+
+algorithm:
+  _target_: verl.trainer.config.AlgoConfig
+  gamma: 1.0
+  lam: 1.0
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  kl_penalty: kl
+  kl_ctrl:
+    _target_: verl.trainer.config.KLControlConfig
+    type: fixed
+    kl_coef: 0.001
+    horizon: 10000
+    target_kl: 0.1
+  use_pf_ppo: false
+  pf_ppo:
+    reweight_method: pow
+    weight_pow: 2.0
+
+trainer:
+  balance_batch: true
+  project_name: MiniOneRec_RL
+  experiment_name: minionerec_grpo_ddp
+  total_training_steps: null
+  val_before_train: false
+  log_val_generations: 0
+  rollout_data_dir: null
+  validation_data_dir: null
+  best_ckpt_metric: val-aux/*/hr@20/mean
+  default_hdfs_dir: null
+  logger: [tensorboard]
+  remove_previous_ckpt_in_save: true
+  save_freq: 165
+  test_freq: 165
+  total_epochs: 2
+  nnodes: 1
+  n_gpus_per_node: 8
+  esi_redundant_time: 0
+  resume_mode: auto
+  resume_from_path: null
+  val_only: false
+  critic_warmup: 0
+  del_local_ckpt_after_load: false
+  default_local_dir: checkpoints/${trainer.project_name}/${trainer.experiment_name}
+  max_actor_ckpt_to_keep: null
+  max_critic_ckpt_to_keep: null
+  ray_wait_register_center_timeout: 300
+  device: cuda
+
+critic:
+  enable: false
+
+global_profiler:
+  _target_: verl.utils.profiler.ProfilerConfig
+  tool: null
+  steps: null
+  profile_continuous_steps: false
+  save_path: outputs/profile/minionerec
+  global_tool_config:
+    nsys:
+      _target_: verl.utils.profiler.config.NsightToolConfig
+      discrete: false
+      controller_nsight_options:
+        trace: cuda,nvtx,cublas,ucx
+        cuda-memory-usage: "true"
+        cuda-graph-trace: graph
+      worker_nsight_options:
+        trace: cuda,nvtx,cublas,ucx
+        cuda-memory-usage: "true"
+        cuda-graph-trace: graph
+        capture-range: cudaProfilerApi
+        capture-range-end: null
+        kill: none
+    torch_memory:
+      trace_alloc_max_entries: 100000
+      stack_depth: 32
+      context: all
+      stacks: all
+      kw_args: {}
+    precision_debugger:
+      _target_: verl.utils.profiler.config.PrecisionDebuggerToolConfig
+      config_path: null
+      steps: null
+      stages: null
+      strict: false
+
+transfer_queue:
+  enable: false
+  backend:
+    storage_backend: SimpleStorage
+    SimpleStorage:
+      total_storage_size: 100000
+      num_data_storage_units: 8
+
+ray_kwargs:
+  ray_init:
+    num_cpus: null
+  timeline_json_file: null

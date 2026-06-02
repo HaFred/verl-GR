@@ -18,18 +18,12 @@ if [[ ! -d "${DEFAULT_VERL_LIB_PATH}/verl" ]]; then
   DEFAULT_VERL_LIB_PATH=""
 fi
 VERL_LIB_PATH="${VERL_LIB_PATH:-${DEFAULT_VERL_LIB_PATH}}"
-VERL_GR_ENV="${VERL_GR_ENV:-/home/dyvm6xra/dyvm6xrauser45/miniconda3/envs/verl_080_vllm_015}"
+VERL_GR_ENV="${VERL_GR_ENV:-/home/dyvm6xra/dyvm6xrauser45/miniconda3/envs/verl_080}"
 PYTHON_BIN="${PYTHON_BIN:-${VERL_GR_ENV}/bin/python}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
 fi
-# If the caller set RAY_ADDRESS (for an isolated per-run Ray cluster), keep it.
-# Otherwise clear it so Ray auto-detects or starts a default local cluster.
-if [[ -n "${RAY_ADDRESS:-}" ]]; then
-  echo "Using caller-provided RAY_ADDRESS=${RAY_ADDRESS}"
-else
-  unset RAY_ADDRESS
-fi
+unset RAY_ADDRESS
 
 N_NODES="${N_NODES:-1}"
 
@@ -44,35 +38,14 @@ TRAIN_FILES="${TRAIN_FILES:-[${TRAIN_DATASET_DIR}]}"
 VAL_FILES="${VAL_FILES:-[${VAL_DATASET_DIR}]}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 REC_NUM="${REC_NUM:-20}"
-
-# verl-GR's train_batch_size and gen_batch_size are measured in unique prompts.
-# TRL's RankGRPO generation_batch_size is measured in repeated generation slots:
-# per_device_train_batch_size × num_processes × gradient_accumulation_steps.
-# With the 2-GPU TRL reference, 4 × 2 × 6 = 48 slots, and num_generations=8
-# means 48 / 8 = 6 unique prompts per optimizer update.
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-6}"
-GEN_BATCH_SIZE="$((TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
-# When gradient accumulation is active, force fixed micro-batching so the engine
-# creates exactly GRADIENT_ACCUMULATION_STEPS micro-batches, accumulating gradients.
-# micro_batch_size_per_gpu = TRAIN_BATCH_SIZE × ROLLOUT_N / N_GPUS
-#   = prompts_per_gpu_per_microbatch × rollouts
-if (( GRADIENT_ACCUMULATION_STEPS > 1 )); then
-  USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-False}"
-  _DEFAULT_MBS_PER_GPU="$((TRAIN_BATCH_SIZE * ROLLOUT_N / N_GPUS))"
-  ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-${_DEFAULT_MBS_PER_GPU}}"
-else
-  USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
-  ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU:-32}"
-fi
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-6}"
 VAL_BATCH_SIZE="${VAL_BATCH_SIZE:-$((16 * N_GPUS))}"
-MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-49152}"
+MAX_TOKENS_PER_GPU="${MAX_TOKENS_PER_GPU:-40960}"
 ACTOR_MAX_TOKENS_PER_GPU="${ACTOR_MAX_TOKENS_PER_GPU:-${MAX_TOKENS_PER_GPU}}"
 LOG_PROB_MAX_TOKENS_PER_GPU="${LOG_PROB_MAX_TOKENS_PER_GPU:-${MAX_TOKENS_PER_GPU}}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-${MAX_TOKENS_PER_GPU}}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-512}"
-ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-False}"
-ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE="${ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE:-True}"
+ROLLOUT_ENFORCE_EAGER="${ROLLOUT_ENFORCE_EAGER:-True}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.25}"
 DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE="${DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE:-2}"
 if (( DEFAULT_ROLLOUT_TENSOR_PARALLEL_SIZE > N_GPUS )); then
@@ -84,43 +57,21 @@ if (( N_GPUS % ROLLOUT_TENSOR_PARALLEL_SIZE != 0 )); then
   exit 2
 fi
 ROLLOUT_DATA_PARALLEL_SIZE="$((N_GPUS / ROLLOUT_TENSOR_PARALLEL_SIZE))"
-ROLLOUT_CALCULATE_LOG_PROBS="${ROLLOUT_CALCULATE_LOG_PROBS:-True}"
-RANKGRPO_BYPASS_OLD_LOG_PROB="${RANKGRPO_BYPASS_OLD_LOG_PROB:-True}"
-USE_REMOVE_PADDING="${USE_REMOVE_PADDING:-True}"
-USE_FUSED_KERNELS="${USE_FUSED_KERNELS:-True}"
-ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-False}"
 # vLLM sleep-mode memory release can crash in CUDA/cumem after long runs on this
 # stack. Keep rollout memory resident by default; override both to True if needed.
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-False}"
 ROLLOUT_ENABLE_SLEEP_MODE="${ROLLOUT_ENABLE_SLEEP_MODE:-${ROLLOUT_FREE_CACHE_ENGINE}}"
 KL_LOSS_COEF="${KL_LOSS_COEF:-0.001}"
-# verl's low_var_kl = k3 estimator = exp(ref-log)- (ref-log) - 1.
-# This matches the reference Rank-GRPO trainer's KL computation exactly.
-KL_LOSS_TYPE="${KL_LOSS_TYPE:-low_var_kl}"
-# seq-mean-token-mean = equal weight per sequence (reference behavior).
-# token-mean = longer sequences dominate. Match the reference TRL trainer.
-LOSS_AGG_MODE="${LOSS_AGG_MODE:-seq-mean-token-mean}"
-APPLY_EXTRA_LENGTH_SHAPING="${APPLY_EXTRA_LENGTH_SHAPING:-True}"
-END_OF_LIST_REWARD="${END_OF_LIST_REWARD:-0.1}"
-EXTRA_TOKEN_PENALTY="${EXTRA_TOKEN_PENALTY:--0.1}"
-EARLY_STOP_PENALTY="${EARLY_STOP_PENALTY:--0.1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
 ADAM_BETA1="${ADAM_BETA1:-0.9}"
 ADAM_BETA2="${ADAM_BETA2:-0.99}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0}"
-ACTOR_MODEL_DTYPE="${ACTOR_MODEL_DTYPE:-fp32}"
 PPO_CLIP_RATIO="${PPO_CLIP_RATIO:-0.06}"
 PPO_CLIP_RATIO_HIGH="${PPO_CLIP_RATIO_HIGH:-0.08}"
-# Match the Rank-GRPO reference script's epsilon=0.06 / epsilon_high=0.08
-# (clip range [0.94, 1.08]). The reference trainer does not use dual-clip PPO.
-# Set clip_ratio_c to a large value so the min() always picks the standard PPO
-# clip branch.
-PPO_CLIP_RATIO_C="${PPO_CLIP_RATIO_C:-1e6}"
-PPO_EPOCHS="${PPO_EPOCHS:-1}"
-FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp2}"
+FSDP_STRATEGY="${FSDP_STRATEGY:-fsdp}"
+USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-True}"
 DATA_SHUFFLE="${DATA_SHUFFLE:-True}"
-VALIDATION_SHUFFLE="${VALIDATION_SHUFFLE:-False}"
 SEED="${SEED:-3407}"
 PROJECT_NAME="${PROJECT_NAME:-RankGRPO}"
 LAUNCH_TIMESTAMP="${LAUNCH_TIMESTAMP:-$(date +%Y%m%d_%H%M%S)}"
@@ -149,7 +100,6 @@ if (( ${#RAY_TMPDIR} > RAY_TMPDIR_MAX_LEN )); then
   echo "Warning: RAY_TMPDIR path too long, fallback to ${RAY_TMPDIR}" >&2
 fi
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
-TVM_FFI_CACHE_DIR="${TVM_FFI_CACHE_DIR:-/tmp/${USER:-u}/tvm-ffi}"
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-$((N_GPUS * 24))}"
 RAY_OBJECT_STORE_MEMORY="${RAY_OBJECT_STORE_MEMORY:-$((N_GPUS * 32 * 1024 * 1024 * 1024))}"
 RAY_INCLUDE_DASHBOARD="${RAY_INCLUDE_DASHBOARD:-False}"
@@ -167,10 +117,8 @@ VAL_MAX_SAMPLES="${VAL_MAX_SAMPLES:-1600}"
 LOGGER_BACKENDS="${LOGGER_BACKENDS:-[tensorboard]}"
 REMOVE_PREVIOUS_CKPT_IN_SAVE="${REMOVE_PREVIOUS_CKPT_IN_SAVE:-False}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
-VERL_GR_DEBUG="${VERL_GR_DEBUG:-0}"
 
 mkdir -p "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
-mkdir -p "${TVM_FFI_CACHE_DIR}"
 
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
 export TENSORBOARD_DIR
@@ -181,7 +129,6 @@ else
 fi
 export WANDB_MODE
 export RAY_TMPDIR
-export TVM_FFI_CACHE_DIR
 export TMPDIR="${RAY_TMPDIR}"
 
 echo "==================================="
@@ -194,12 +141,7 @@ echo "Validation data: ${VAL_FILES}"
 echo "GT catalog: ${GT_CATALOG_PATH}"
 echo "Rollout N: ${ROLLOUT_N}"
 echo "Rec num: ${REC_NUM}"
-echo "Train batch size: ${TRAIN_BATCH_SIZE}  (gen_batch_size: ${GEN_BATCH_SIZE}, gradient_accumulation_steps: ${GRADIENT_ACCUMULATION_STEPS})"  # unique prompts → completions: GEN_BATCH_SIZE × ROLLOUT_N
-echo "Train/validation shuffle: ${DATA_SHUFFLE}/${VALIDATION_SHUFFLE}"
-echo "Actor model dtype: ${ACTOR_MODEL_DTYPE}"
-if (( GRADIENT_ACCUMULATION_STEPS > 1 )); then
-  echo "Micro-batches: ${GRADIENT_ACCUMULATION_STEPS} × ${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU} seq/GPU  (total: $((GEN_BATCH_SIZE * ROLLOUT_N)) seq, $((GEN_BATCH_SIZE * ROLLOUT_N / N_GPUS)) seq/GPU → $((GEN_BATCH_SIZE * ROLLOUT_N / N_GPUS / ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU)) micro-batches)"
-fi
+echo "Train batch size: ${TRAIN_BATCH_SIZE}"
 echo "Validation batch size: ${VAL_BATCH_SIZE}"
 echo "Rollout free cache engine: ${ROLLOUT_FREE_CACHE_ENGINE}"
 echo "Rollout sleep mode: ${ROLLOUT_ENABLE_SLEEP_MODE}"
@@ -209,22 +151,15 @@ echo "Actor max tokens/GPU: ${ACTOR_MAX_TOKENS_PER_GPU}"
 echo "Log-prob max tokens/GPU: ${LOG_PROB_MAX_TOKENS_PER_GPU}"
 echo "Rollout max batched tokens: ${ROLLOUT_MAX_NUM_BATCHED_TOKENS}"
 echo "Rollout max sequences: ${ROLLOUT_MAX_NUM_SEQS}"
-echo "Rollout disable custom all-reduce: ${ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE}"
 echo "Rollout GPU memory utilization: ${ROLLOUT_GPU_MEMORY_UTILIZATION}"
-echo "Rollout calculate log probs: ${ROLLOUT_CALCULATE_LOG_PROBS}"
-echo "Rank-GRPO bypass old log prob: ${RANKGRPO_BYPASS_OLD_LOG_PROB}"
-echo "Dynamic bsz/micro_batch_per_gpu/remove padding/fused kernels/activation offload: ${USE_DYNAMIC_BSZ}/${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}/${USE_REMOVE_PADDING}/${USE_FUSED_KERNELS}/${ENABLE_ACTIVATION_OFFLOAD}"
 echo "Training data parallel size: ${N_GPUS}"
 echo "Learning rate: ${LEARNING_RATE}"
-echo "Length shaping (apply/end/overflow/early): ${APPLY_EXTRA_LENGTH_SHAPING}/${END_OF_LIST_REWARD}/${EXTRA_TOKEN_PENALTY}/${EARLY_STOP_PENALTY}"
 echo "Save/test freq: ${SAVE_FREQ}/${TEST_FREQ}"
 echo "Logging steps: ${LOGGING_STEPS}"
 echo "Validation generations to log: ${VAL_LOG_GENERATIONS}"
 echo "Best checkpoint pruning: enable=${BEST_CKPT_PRUNE_ENABLE}, keep=${BEST_CKPTS_TO_KEEP}, metric=${BEST_CKPT_METRIC}"
-echo "Debug mode: ${VERL_GR_DEBUG}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray temp dir: ${RAY_TMPDIR}"
-echo "TVM FFI cache dir: ${TVM_FFI_CACHE_DIR}"
 echo "Ray CPUs/object store/dashboard: ${RAY_NUM_CPUS}/${RAY_OBJECT_STORE_MEMORY}/${RAY_INCLUDE_DASHBOARD}"
 echo "Resume mode: ${RESUME_MODE}"
 if [[ -n "${RESUME_FROM_PATH}" ]]; then
@@ -249,10 +184,8 @@ done
   data.train_files="${TRAIN_FILES}" \
   data.val_files="${VAL_FILES}" \
   data.train_batch_size="${TRAIN_BATCH_SIZE}" \
-  ++data.gen_batch_size="${GEN_BATCH_SIZE}" \
   data.val_batch_size="${VAL_BATCH_SIZE}" \
   data.shuffle="${DATA_SHUFFLE}" \
-  ++data.validation_shuffle="${VALIDATION_SHUFFLE}" \
   data.seed="${SEED}" \
   data.max_prompt_length=2048 \
   data.max_response_length=1024 \
@@ -265,19 +198,11 @@ done
   algorithm.rank_grpo.rec_num="${REC_NUM}" \
   algorithm.rank_grpo.gt_catalog_path="${GT_CATALOG_PATH}" \
   actor_rollout_ref.actor.use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
-  actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}" \
-  ++actor_rollout_ref.ref.log_prob_use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
-  ++actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}" \
-  ++actor_rollout_ref.rollout.log_prob_use_dynamic_bsz="${USE_DYNAMIC_BSZ}" \
-  ++actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu="${ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU}" \
   actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${ACTOR_MAX_TOKENS_PER_GPU}" \
-  actor_rollout_ref.actor.fsdp_config.model_dtype="${ACTOR_MODEL_DTYPE}" \
   actor_rollout_ref.actor.ppo_mini_batch_size="${TRAIN_BATCH_SIZE}" \
-  actor_rollout_ref.actor.ppo_epochs="${PPO_EPOCHS}" \
   actor_rollout_ref.actor.clip_ratio="${PPO_CLIP_RATIO}" \
   actor_rollout_ref.actor.clip_ratio_low="${PPO_CLIP_RATIO}" \
   actor_rollout_ref.actor.clip_ratio_high="${PPO_CLIP_RATIO_HIGH}" \
-  actor_rollout_ref.actor.clip_ratio_c="${PPO_CLIP_RATIO_C}" \
   actor_rollout_ref.actor.optim.lr="${LEARNING_RATE}" \
   actor_rollout_ref.actor.optim.lr_warmup_steps="${LR_WARMUP_STEPS}" \
   actor_rollout_ref.actor.optim.lr_scheduler_type=constant \
@@ -288,38 +213,15 @@ done
   actor_rollout_ref.rollout.max_num_batched_tokens="${ROLLOUT_MAX_NUM_BATCHED_TOKENS}" \
   actor_rollout_ref.rollout.max_num_seqs="${ROLLOUT_MAX_NUM_SEQS}" \
   actor_rollout_ref.rollout.enforce_eager="${ROLLOUT_ENFORCE_EAGER}" \
-  actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce="${ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE}" \
   actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEMORY_UTILIZATION}" \
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TENSOR_PARALLEL_SIZE}" \
-  actor_rollout_ref.rollout.calculate_log_probs="${ROLLOUT_CALCULATE_LOG_PROBS}" \
   actor_rollout_ref.rollout.free_cache_engine="${ROLLOUT_FREE_CACHE_ENGINE}" \
   +actor_rollout_ref.rollout.enable_sleep_mode="${ROLLOUT_ENABLE_SLEEP_MODE}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
-  actor_rollout_ref.model.enable_activation_offload="${ENABLE_ACTIVATION_OFFLOAD}" \
   actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING}" \
-  actor_rollout_ref.model.use_remove_padding="${USE_REMOVE_PADDING}" \
-  actor_rollout_ref.model.use_fused_kernels="${USE_FUSED_KERNELS}" \
   actor_rollout_ref.rollout.n="${ROLLOUT_N}" \
-  actor_rollout_ref.rollout.val_kwargs.n="${ROLLOUT_N}" \
-  actor_rollout_ref.rollout.val_kwargs.do_sample=True \
-  actor_rollout_ref.rollout.top_k=-1 \
-  actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
-  actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-  actor_rollout_ref.rollout.val_kwargs.top_k=-1 \
   actor_rollout_ref.actor.kl_loss_coef="${KL_LOSS_COEF}" \
-  actor_rollout_ref.actor.kl_loss_type="${KL_LOSS_TYPE}" \
-  actor_rollout_ref.actor.loss_agg_mode="${LOSS_AGG_MODE}" \
-  actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_gr.recipes.rankgrpo.rankgrpo_agent_loop.RankGRPOAgentLoopManager \
-  actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent \
-  algorithm.rollout_correction.bypass_mode="${RANKGRPO_BYPASS_OLD_LOG_PROB}" \
-  algorithm.rollout_correction.rollout_is=null \
-  algorithm.rollout_correction.rollout_rs=null \
-  algorithm.rollout_correction.loss_type=ppo_clip \
   algorithm.rank_grpo.importance_sampling_level=item \
-  algorithm.rank_grpo.apply_extra_length_shaping="${APPLY_EXTRA_LENGTH_SHAPING}" \
-  algorithm.rank_grpo.end_of_list_reward="${END_OF_LIST_REWARD}" \
-  algorithm.rank_grpo.extra_token_penalty="${EXTRA_TOKEN_PENALTY}" \
-  algorithm.rank_grpo.early_stop_penalty="${EARLY_STOP_PENALTY}" \
   trainer.n_gpus_per_node="${N_GPUS}" \
   trainer.nnodes="${N_NODES}" \
   trainer.project_name="${PROJECT_NAME}" \
@@ -338,20 +240,13 @@ done
   trainer.best_ckpt_metric="${BEST_CKPT_METRIC}" \
   trainer.logger="${LOGGER_BACKENDS}" \
   trainer.remove_previous_ckpt_in_save="${REMOVE_PREVIOUS_CKPT_IN_SAVE}" \
+  ray_kwargs.ray_init.num_cpus="${RAY_NUM_CPUS}" \
+  +ray_kwargs.ray_init.object_store_memory="${RAY_OBJECT_STORE_MEMORY}" \
+  +ray_kwargs.ray_init.include_dashboard="${RAY_INCLUDE_DASHBOARD}" \
+  +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
+  +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD="'${VLLM_WORKER_MULTIPROC_METHOD}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE="'${NCCL_IB_DISABLE:-1}'" \
-  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_DEBUG="'${VERL_GR_DEBUG}'" \
-  +ray_kwargs.ray_init.runtime_env.env_vars.TVM_FFI_CACHE_DIR="'${TVM_FFI_CACHE_DIR}'" \
-  +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="'${PYTHONPATH:-}'" \
-  $(  # Ray cluster-creation args — only when we aren't connecting to a pre-existing cluster
-    if [[ -z "${RAY_ADDRESS:-}" ]]; then
-      echo "ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS}"
-      echo "+ray_kwargs.ray_init.object_store_memory=${RAY_OBJECT_STORE_MEMORY}"
-      echo "+ray_kwargs.ray_init.include_dashboard=${RAY_INCLUDE_DASHBOARD}"
-      echo "+ray_kwargs.ray_init._temp_dir=${RAY_TMPDIR}"
-      echo "+ray_kwargs.ray_init.object_spilling_directory=${RAY_SPILL_DIR}"
-    fi
-  ) \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \
   actor_rollout_ref.ref.strategy="${FSDP_STRATEGY}" \
   actor_rollout_ref.actor.strategy="${FSDP_STRATEGY}" \

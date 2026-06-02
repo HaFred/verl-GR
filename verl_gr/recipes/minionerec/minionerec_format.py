@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import ast
 import random
 from typing import Any
 
@@ -10,7 +9,8 @@ import numpy as np
 
 
 def parse_maybe_list(value: Any) -> list[Any]:
-    """Parse MiniOneRec CSV list fields without changing already parsed data."""
+    """Parse MiniOneRec CSV list fields — exact mirror of the original ``eval()``
+    pattern used in ``data.py`` (e.g. ``eval(row['history_item_sid'])``)."""
 
     if isinstance(value, list):
         return value
@@ -20,8 +20,8 @@ def parse_maybe_list(value: Any) -> list[Any]:
         return value.tolist()
     if isinstance(value, str):
         try:
-            parsed = ast.literal_eval(value)
-        except (SyntaxError, ValueError):
+            parsed = eval(value)
+        except Exception:
             return [value]
         return parsed if isinstance(parsed, list) else [parsed]
     return [value]
@@ -65,16 +65,21 @@ def build_seq_title2sid_prompt(history_item_title: list[Any]) -> tuple[str, str]
     return formatted, history_key
 
 
-def maybe_parse_description(description: Any) -> str:
-    """Mirror the lenient description parsing used by RLTitle2SidDataset."""
+def maybe_parse_description(description: Any) -> Any:
+    """Exact mirror of RLTitle2SidDataset description parsing (data.py:822-827).
+
+    The original uses ``eval()`` with bare ``except: pass`` on list-format
+    description strings.  All other values — including ``None`` — pass
+    through unchanged.
+    """
 
     if isinstance(description, str) and description.startswith("['") and description.endswith("']"):
         try:
-            desc_list = ast.literal_eval(description)
-            return str(desc_list[0]) if desc_list else description
-        except (SyntaxError, ValueError):
-            return description
-    return "" if description is None else str(description)
+            desc_list = eval(description)
+            description = desc_list[0] if desc_list else description
+        except Exception:
+            pass
+    return description
 
 
 def sample_records(records: list[dict[str, Any]], sample: int, *, seed: int | None = None) -> list[dict[str, Any]]:

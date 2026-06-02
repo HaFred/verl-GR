@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Awaitable, Callable
 from uuid import uuid4
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -53,9 +56,11 @@ async def run_async_beam_search(
     eos_token_id: int,
     ignore_eos: bool,
     length_penalty: float,
+    temperature: float = 1.0,
     generate_one_token: Callable[[list[int], str], Awaitable[Any]] | None = None,
     generate_next_tokens: Callable[[list[list[int]], list[str], list[list[int]] | None], Awaitable[list[Any]]] | None = None,
     allowed_tokens_fn: Callable[[list[int], list[int]], list[int]] | None = None,
+    decode_mode: str = "deterministic_beam",
 ) -> list[BeamCandidate]:
     if generate_next_tokens is None:
         if generate_one_token is None:
@@ -72,13 +77,21 @@ async def run_async_beam_search(
             ]
             return await asyncio.gather(*tasks)
 
-    active = [BeamCandidate(prompt_token_ids=list(prompt_token_ids))]
+    if decode_mode == "stochastic_constrained":
+        active = [BeamCandidate(prompt_token_ids=list(prompt_token_ids)) for _ in range(max(1, beam_width))]
+    else:
+        active = [BeamCandidate(prompt_token_ids=list(prompt_token_ids))]
     completed: list[BeamCandidate] = []
     logprobs_num = max(2 * beam_width, 1)
 
     def add_fallback_token(beam: BeamCandidate, allowed_tokens: set[int], expanded: list[BeamCandidate]) -> bool:
         """Force a legal token when vLLM top-logprobs miss constrained tokens."""
 
+        logger.warning(
+            "add_fallback_token triggered: vLLM allowed_token_ids may not be fully enforced. "
+            "beam_step=%d, allowed_count=%d",
+            len(beam.generated_token_ids), len(allowed_tokens) if allowed_tokens else 0,
+        )
         if allowed_tokens:
             token_id = eos_token_id if eos_token_id in allowed_tokens else min(allowed_tokens)
         else:
@@ -129,11 +142,20 @@ async def run_async_beam_search(
                 continue
 
             step_logprobs = first_output.logprobs[0]
-            ranked_tokens = sorted(
-                step_logprobs.items(),
-                key=lambda item: item[1].logprob,
-                reverse=True,
-            )[:logprobs_num]
+            if decode_mode == "stochastic_constrained" and first_output.token_ids:
+                sampled_token = int(first_output.token_ids[0])
+                sampled_info = step_logprobs.get(sampled_token)
+                if sampled_info is None:
+                    if allowed_tokens is not None:
+                        add_fallback_token(beam, allowed_tokens, expanded)
+                    continue
+                ranked_tokens = [(sampled_token, sampled_info)]
+            else:
+                ranked_tokens = sorted(
+                    step_logprobs.items(),
+                    key=lambda item: item[1].logprob,
+                    reverse=True,
+                )[:logprobs_num]
             if allowed_tokens is not None:
                 ranked_tokens = [(token_id, token_info) for token_id, token_info in ranked_tokens if int(token_id) in allowed_tokens]
                 if not ranked_tokens:
@@ -162,10 +184,15 @@ async def run_async_beam_search(
         )
         active = expanded[:beam_width]
 
-    for beam in active:
-        if beam.finish_reason is None:
-            beam.finish_reason = "length"
-        completed.append(beam)
+    # Only add active (pre-EOS) beams as a fallback when no beam reached EOS.
+    # When all beams completed via EOS (the typical constrained path),
+    # their stop-variants are already in ``completed`` and the active list
+    # would only introduce duplicates that compress the effective beam width.
+    if not completed:
+        for beam in active:
+            if beam.finish_reason is None:
+                beam.finish_reason = "length"
+            completed.append(beam)
 
     if not completed and allowed_tokens_fn is not None:
         add_fallback_token(active[0], set(allowed_tokens_fn(active[0].prompt_token_ids, active[0].generated_token_ids)), completed)
