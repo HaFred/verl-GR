@@ -1,0 +1,210 @@
+# Minimal Rank-GRPO config for verl release/v0.7.1.
+# Composes from upstream PPO trainer config and keeps rollout on vanilla vLLM.
+
+hydra:
+  searchpath:
+    - pkg://verl.trainer.config
+
+defaults:
+  - ppo_trainer
+  - _self_
+
+task:
+  name: rankgrpo
+
+data:
+  train_batch_size: 6
+  max_prompt_length: 2048
+  prompt_key: prompt
+  shuffle: false
+  val_batch_size: 32
+  train_max_samples: -1
+  val_max_samples: 1600
+  max_response_length: 1024
+  filter_overlong_prompts: true
+  filter_overlong_prompts_workers: 16
+  truncation: error
+  custom_cls:
+    name: RankGRPODataset
+  reward_fn_key: source
+  data_source_key: source
+  rankgrpo:
+    rec_num: 20
+    use_chat_template: true
+    add_generation_prompt: true
+    use_processor: false
+    rank_separator: "\n"
+    force_pad_to_eos: true
+
+custom_reward_function:
+  name: compute_score
+  reward_kwargs:
+    gt_catalog_path: null
+
+actor_rollout_ref:
+  hybrid_engine: true
+
+  ref:
+    entropy_from_logits_with_chunking: true
+    log_prob_use_dynamic_bsz: false
+    log_prob_micro_batch_size_per_gpu: 32
+    fsdp_config:
+      wrap_policy:
+        transformer_layer_cls_to_wrap:
+          - Qwen2DecoderLayer
+      model_dtype: bfloat16
+    profiler:
+      enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}
+      all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.all_ranks,false}
+      ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
+
+  actor:
+    entropy_coeff: 0.0  # TRL Rank-GRPO reference uses no entropy bonus (PPO default is also 0)
+    entropy_checkpointing: true
+    clip_ratio: 0.06
+    clip_ratio_low: 0.06
+    clip_ratio_high: 0.08
+    clip_ratio_c: 1e6
+    use_dynamic_bsz: false
+    ppo_mini_batch_size: 8
+    ppo_micro_batch_size_per_gpu: 32  # 4 prompts × 8 rollouts = 32 seq/GPU, matches TRL's per_device_train_batch_size=4
+    ppo_max_token_len_per_gpu: 40960
+    use_kl_loss: true
+    kl_loss_coef: 0.001
+    kl_loss_type: low_var_kl  # verl's k3 estimator: exp(ref-log) - (ref-log) - 1, same as reference TRL
+    loss_agg_mode: seq-mean-token-mean  # match reference: equal weight per sequence, not per token
+    optim:
+      lr: 1e-6
+      lr_warmup_steps: 0
+      weight_decay: 0.0
+    fsdp_config:
+      wrap_policy:
+        transformer_layer_cls_to_wrap:
+          - Qwen2DecoderLayer
+      # Keep trainable parameters and Adam states in fp32. TRL's DeepSpeed ZeRO-3
+      # also uses fp32 master weights with AMP (bf16 compute, fp32 update).
+      model_dtype: fp32
+    profiler:
+      enable: false
+      all_ranks: false
+      ranks: [0]
+
+  rollout:
+    name: vllm
+    n: 8
+    dtype: bfloat16
+    tensor_model_parallel_size: 2
+    temperature: 1.0
+    top_p: 1.0
+    top_k: -1
+    do_sample: true
+    gpu_memory_utilization: 0.25
+    max_num_batched_tokens: 40960
+    max_num_seqs: 512
+    log_prob_use_dynamic_bsz: false
+    log_prob_micro_batch_size_per_gpu: 32
+    log_prob_max_token_len_per_gpu: 40960
+    enable_chunked_prefill: true
+    calculate_log_probs: true
+    layered_summon: false
+    enforce_eager: false
+    agent:
+      num_workers: 8
+      default_agent_loop: single_turn_agent
+      agent_loop_manager_class: verl_gr.recipes.rankgrpo.rankgrpo_agent_loop.RankGRPOAgentLoopManager
+    val_kwargs:
+      n: 8
+      do_sample: true
+      temperature: 1.0
+      top_p: 1.0
+      top_k: -1
+    engine_kwargs:
+      vllm:
+        disable_custom_all_reduce: true
+        max_logprobs: 20
+    profiler:
+      enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}
+      all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.all_ranks,false}
+      ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
+
+  model:
+    enable_activation_offload: false
+    enable_gradient_checkpointing: true
+    use_remove_padding: true
+    use_fused_kernels: false
+    fused_kernel_options:
+      impl_backend: torch
+
+algorithm:
+  adv_estimator: grpo
+  norm_adv_by_std_in_grpo: true
+  use_kl_in_reward: false
+  rank_grpo:
+    enable: true
+    rec_num: ${data.rankgrpo.rec_num}
+    rank_separator: ${data.rankgrpo.rank_separator}
+    normalize_by_std: true
+    year_tolerance: 2
+    exclude_seen: true
+    apply_extra_length_shaping: true
+    end_of_list_reward: 0.1
+    extra_token_penalty: -0.1
+    early_stop_penalty: -0.1
+    gt_catalog_path: null
+    importance_sampling_level: item
+    loss_mode: trl_match  # trl_match = matches TRL reference; verl_default = dual-clip PPO path
+    old_log_prob_mode: current  # TRL aligned path uses per_token_logps.detach() instead of recomputed old log-probs
+  rollout_correction:
+    rollout_is: null
+    rollout_rs: null
+    bypass_mode: true
+    loss_type: ppo_clip
+
+trainer:
+  project_name: RankGRPO
+  experiment_name: rankgrpo_vllm
+  val_before_train: false
+  default_hdfs_dir: null
+  logger: [tensorboard]
+  remove_previous_ckpt_in_save: false
+  save_freq: 200
+  test_freq: 200
+  logging_steps: 10
+  best_ckpt_prune_enable: true
+  best_ckpts_to_keep: 3
+  best_ckpt_metric: eval/reward_total
+  total_epochs: 1
+  nnodes: 1
+  n_gpus_per_node: 2
+
+critic:
+  enable: false
+  profiler:
+    enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}
+    all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.all_ranks,false}
+    ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
+
+global_profiler:
+  tool: null
+  steps: null
+  profile_continuous_steps: false
+  save_path: outputs/profile/rankgrpo
+  global_tool_config:
+    nsys:
+      discrete: false
+      controller_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+      worker_nsight_options:
+        trace: "cuda,nvtx,cublas,ucx"
+        cuda-memory-usage: "true"
+        cuda-graph-trace: "graph"
+        capture-range: "cudaProfilerApi"
+        capture-range-end: null
+        kill: none
+
+ray_init:
+  num_cpus: null
+  timeline_json_file: null
+

@@ -15,14 +15,12 @@ from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 from torch.utils.data import Dataset
 from transformers import PreTrainedTokenizer, ProcessorMixin
 import verl.utils.torch_functional as verl_F
-from verl.single_controller.ray import RayWorkerGroup
-from verl.utils import hf_processor, hf_tokenizer
 from verl.utils.dataset.vision_utils import process_image, process_video
 from verl.utils.fs import copy_to_local
 from verl.utils.model import compute_position_id_with_mask
-from verl.workers.engine_workers import ActorRolloutRefWorker, TrainingWorker
 from verl_gr.workers.rollout.beam_config import BEAM_WIDTH_KEY
-from verl_gr.workers.rollout.two_stage_registration import (
+from verl_gr.recipes.task_runtime import RecipeTaskRuntime
+from verl_gr.workers.rollout.registration import (
     register_two_stage_replica,
     register_two_stage_rollout_class,
 )
@@ -30,18 +28,6 @@ from verl_gr.workers.rollout.two_stage_registration import (
 logger = logging.getLogger(__name__)
 
 __all__ = ["collate_fn", "OneRecDataset", "compute_score"]
-
-
-def build_hf_tokenizer_and_processor(
-    model_path: str,
-    *,
-    trust_remote_code: bool,
-) -> tuple[Any, Any]:
-    """Build HuggingFace tokenizer and processor for OpenOneRec paths."""
-
-    tokenizer = hf_tokenizer(model_path, trust_remote_code=trust_remote_code)
-    processor = hf_processor(model_path, trust_remote_code=trust_remote_code, use_fast=True)
-    return tokenizer, processor
 
 
 def collate_fn(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -412,52 +398,10 @@ class OneRecDataset(Dataset):
         return self.__dict__.copy()
 
 
-class OneRecTask:
+class OneRecTask(RecipeTaskRuntime):
     """OpenOneRec task-specific runtime preparation logic."""
 
-    def __init__(self) -> None:
-        self._two_stage_counts_expanded = False
-
-    @staticmethod
-    def _normalize_layer_wrap_value(value):
-        if isinstance(value, str):
-            return [value]
-        if isinstance(value, set):
-            normalized: list[str] = []
-            for item in value:
-                if isinstance(item, str):
-                    normalized.append(item)
-                elif hasattr(item, "__name__"):
-                    normalized.append(str(item.__name__))
-                else:
-                    normalized.append(str(item))
-            return sorted(normalized)
-        if isinstance(value, tuple):
-            return list(value)
-        if value is None:
-            return None
-        return value
-
-    def sanitize_fsdp2_wrap_policy(self, config) -> None:
-        actor_rollout_ref = config.get("actor_rollout_ref")
-        if actor_rollout_ref is None:
-            return
-        for role_name in ("actor", "ref"):
-            role_cfg = actor_rollout_ref.get(role_name)
-            if role_cfg is None or str(role_cfg.get("strategy", "")) != "fsdp2":
-                continue
-            fsdp_cfg = role_cfg.get("fsdp_config")
-            if fsdp_cfg is None:
-                continue
-            wrap_policy = fsdp_cfg.get("wrap_policy")
-            if wrap_policy is None:
-                continue
-            normalized = self._normalize_layer_wrap_value(wrap_policy.get("transformer_layer_cls_to_wrap"))
-            if normalized is not None:
-                wrap_policy["transformer_layer_cls_to_wrap"] = normalized
-
-    @staticmethod
-    def _expand_two_stage_rollout_counts(config) -> None:
+    def expand_rollout_counts(self, config) -> None:
         rollout_cfg = config.actor_rollout_ref.rollout
         if rollout_cfg.get("name") != "two_stage":
             return
@@ -477,76 +421,37 @@ class OneRecTask:
             base_val_n = int(val_kwargs.get("n", 1))
             val_kwargs["n"] = base_val_n * beam_size
 
-    @staticmethod
-    def get_reward_model_cfg(config):
-        reward_root = config.get("reward")
-        if reward_root is not None and reward_root.get("reward_model") is not None:
-            return reward_root.reward_model
-        legacy_cfg = config.get("reward_model")
-        if legacy_cfg is not None:
-            return legacy_cfg
-        return None
-
-    def prepare(self, config) -> dict[str, Any]:
-        if not self._two_stage_counts_expanded:
-            self._expand_two_stage_rollout_counts(config)
-            self._two_stage_counts_expanded = True
-        reward_model_cfg = self.get_reward_model_cfg(config)
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path,
-            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
+    def configure_rollout(self, config) -> None:
+        if config.actor_rollout_ref.rollout.get("name") != "two_stage":
+            return
+        register_two_stage_replica()
+        register_two_stage_rollout_class()
+        OmegaConf.update(
+            config,
+            "data.return_raw_chat",
+            True,
+            force_add=True,
         )
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        tokenizer, processor = build_hf_tokenizer_and_processor(
-            local_path,
-            trust_remote_code=trust_remote_code,
+        OmegaConf.update(
+            config,
+            "actor_rollout_ref.rollout.agent.agent_loop_manager_class",
+            "verl_gr.recipes.openonerec.two_stage_agent_loop.OpenOneRecAgentLoopManager",
+            force_add=True,
+        )
+        OmegaConf.update(
+            config,
+            "actor_rollout_ref.rollout.agent.default_agent_loop",
+            "openonerec_two_stage_agent",
+            force_add=True,
         )
 
-        if config.actor_rollout_ref.actor.strategy in {"fsdp", "fsdp2"}:
-            ray_worker_group_cls = RayWorkerGroup
-            actor_rollout_ref_worker = ActorRolloutRefWorker
-            if config.actor_rollout_ref.rollout.get("name") == "two_stage":
-                # Agent loop in verl>=0.7 resolves rollout backend via RolloutReplicaRegistry.
-                register_two_stage_replica()
-                register_two_stage_rollout_class()
-                OmegaConf.update(
-                    config,
-                    "actor_rollout_ref.rollout.agent.agent_loop_manager_class",
-                    "verl_gr.recipes.openonerec.two_stage_agent_loop.OpenOneRecAgentLoopManager",
-                    force_add=True,
-                )
-                OmegaConf.update(
-                    config,
-                    "actor_rollout_ref.rollout.agent.default_agent_loop",
-                    "openonerec_two_stage_agent",
-                    force_add=True,
-                )
-                actor_rollout_ref_worker = getattr(
-                    import_module("verl_gr.recipes.openonerec.onerec_fsdp_workers"),
-                    "OneRecActorRolloutRefWorker",
-                )
-            critic_worker = TrainingWorker
-            actor_rollout_cls = actor_rollout_ref_worker
-        elif config.actor_rollout_ref.actor.strategy == "megatron":
-            ray_worker_group_cls = RayWorkerGroup
-            actor_rollout_cls = ActorRolloutRefWorker
-            if config.actor_rollout_ref.rollout.get("name") == "two_stage":
-                actor_rollout_cls = getattr(
-                    import_module("verl_gr.recipes.openonerec.onerec_fsdp_workers"),
-                    "OneRecActorRolloutRefWorker",
-                )
-            critic_worker = TrainingWorker
-        else:
-            raise NotImplementedError(f"Unknown strategy: {config.actor_rollout_ref.actor.strategy}")
-
-        return {
-            "tokenizer": tokenizer,
-            "processor": processor,
-            "actor_rollout_cls": actor_rollout_cls,
-            "critic_worker": critic_worker,
-            "reward_model_cfg": reward_model_cfg,
-            "ray_worker_group_cls": ray_worker_group_cls,
-        }
+    def get_actor_rollout_ref_worker(self, config):
+        if config.actor_rollout_ref.rollout.get("name") == "two_stage":
+            return getattr(
+                import_module("verl_gr.recipes.openonerec.onerec_fsdp_workers"),
+                "OneRecActorRolloutRefWorker",
+            )
+        return super().get_actor_rollout_ref_worker(config)
 
 
 SLOT_PATTERN = re.compile(r"<s_a_(\d+)><s_b_(\d+)><s_c_(\d+)>")
