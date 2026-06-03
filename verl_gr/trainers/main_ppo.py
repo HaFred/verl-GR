@@ -405,10 +405,9 @@ def _ensure_runtime_root_blocks(config) -> None:
                     "skip": {
                         "_target_": "verl.workers.config.SkipConfig",
                         "enable": False,
-                        "action": "dump",
+                        "action": "cache",
                         "dump_dir": "rollout_skip_dump",
-                        "load_dir": None,
-                        "max_dump_step": None,
+                        "max_dump_step": 1,
                     },
                 },
                 "actor": {
