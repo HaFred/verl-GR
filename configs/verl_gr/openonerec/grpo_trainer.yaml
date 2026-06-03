@@ -1,3 +1,4 @@
+# @package _global_
 # OpenOneRec GRPO config for verl release/v0.7.1.
 # Compose from upstream ppo_trainer to inherit all struct keys
 # (notably global_profiler, ray_kwargs, transfer_queue) and dataclass targets.
@@ -7,8 +8,10 @@ hydra:
     - pkg://verl.trainer.config
 
 defaults:
-  - ppo_trainer
+  - /ppo_trainer
   - _self_
+
+model_engine: dp
 
 # ---------- OpenOneRec GRPO defaults ----------
 
