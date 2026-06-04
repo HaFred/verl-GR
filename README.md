@@ -13,6 +13,8 @@
 - `docs/verl_gr/openonerec_parity_plan.md`: tracks the current Phase B parity/smoke checklist after the cleanup refactor.
 - `docs/verl_gr/minionerec_mapping.md`: MiniOneRec dataset / reward / beam contract.
 - `docs/verl_gr/minionerec_pr_changes.md`: workingbranch vs `main` (MiniOneRec + performance).
+- `docs/verl_gr/rankgrpo_mapping.md`: RankGRPO vs TRL root-cause comparison and analysis.
+- `docs/verl_gr/rankgrpo_target.md`: alignment progress tracker by target item (convergence & efficiency).
 - `scripts/README.md`: launcher index for GRPO / SFT / profiling scripts.
 
 ## Data preparation
@@ -34,6 +36,8 @@ bash prepare_rl.sh
 You will get the RL training data:
 - `verl-GR/verl_gr/recipes/openonerec/output/rl_data/train.parquet` - Training set (remaining data after merging all tasks)
 - `verl-GR/verl_gr/recipes/openonerec/output/rl_data/test.parquet` - Test set (1000 samples randomly sampled from merged data)
+
+For Rank-GRPO data, you need to download the Reddit-V2 dataset. Or simply download the preprocessed version [here](https://drive.google.com/file/d/11tOfUMlVOylkkcnwPqGM_0IuiIeHjLle/view)
 
 ## Launching Guide
 
@@ -59,6 +63,13 @@ cd verl-GR
 export BASE_MODEL=/path/to/your/checkpoint
 export PYTHON_BIN=/path/to/vllm-gr/bin/python
 bash scripts/run_minionerec_grpo_rl_aligned.sh
+```
+
+4. Rank-GRPO (set your model path first)
+```bash
+cd verl-GR
+export BASE_MODEL=/path/to/your/checkpoint
+bash scripts/run_rankgrpo.sh
 ```
 
 ## Two-Stage Notes
