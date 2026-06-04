@@ -8,6 +8,7 @@ import shutil
 from contextlib import contextmanager
 from typing import Any
 import torch
+import time
 
 from verl import DataProto
 from verl.trainer.ppo import core_algos
@@ -231,11 +232,22 @@ class RLTrainer(RayPPOTrainerBase):
 
     def init_workers(self):
         super().init_workers()
-        # MiniOneRec uses a rule-based reward function but has no RM.
-        # self.use_rm is False by default, preventing _compute_reward_colocate
-        # from running.  We force it to True AFTER init so that RM workers
-        # are NOT created but postprocess_rewards still sets rm_scores.
-        self.use_rm = True
+        # MiniOneRec uses a rule-based reward function without an RM.
+        # self.use_rm must be True so that _compute_reward_colocate runs
+        # and the task adapter can postprocess rewards to set rm_scores.
+        # For other tasks (RankGRPO, etc.) the default use_rm=False avoids
+        # the unnecessary per-step Ray remote call overhead.
+        if self._get_task_adapter_is_minionerec():
+            self.use_rm = True
+
+    def _get_task_adapter_is_minionerec(self) -> bool:
+        rollout = str(self.config.actor_rollout_ref.rollout.get("name", ""))
+        if rollout == "constrained_beam":
+            return True
+        task_cfg = self.config.get("task", {})
+        if task_cfg and str(task_cfg.get("name", "")).lower() == "minionerec":
+            return True
+        return False
 
     def fit(self):
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
