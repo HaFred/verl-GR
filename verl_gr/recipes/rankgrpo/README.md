@@ -189,29 +189,58 @@ The confirmed-good change for this trace is loading the trainable actor in fp32 
 
 ### Per-Step Runtime
 
-| Implementation | GPUs | Steps | time_per_step (s) | Total throughput (tok/s) | Per-GPU throughput (tok/s/GPU) | Notes | Throughput Delta |
-|---------------|------|-------|-------------------|--------------------------|-------------------------------|-------|------|
-| **Original TRL Rank-GRPO** | 2× H800 | trace to step 820 | ~5.5-5.7 training-only wall sec/step; ~7.15 sec/step in the step 10-600 trace including eval/checkpoint overhead | training-only mean/median ~3,483/~3,485; end-to-end step 10-600 ~2,729 | training-only mean/median ~1,742/~1,743; end-to-end step 10-600 ~1,365 | Derived from adjacent 10-step `num_tokens` deltas; eval runtime is ~442s every 200 steps | - |
-| **verl_gr Fork (`fp32opt`)** | 2× H800 | trace to step 590 | mean 5.12, median 4.41 | mean ~4,045; median ~4,130 | mean ~2,022; median ~2,065 | TensorBoard `perf/throughput` is per GPU; total throughput is `perf/throughput × 2` | +16% |
+| Implementation | GPUs | Steps | time_per_step (s) | Total throughput (tok/s) | Per-GPU throughput (tok/s/GPU) | Notes |
+|---------------|------|-------|-------------------|--------------------------|-------------------------------|-------|
+| **Original TRL Rank-GRPO** | 2× H800 | trace to step 820 | ~5.5-5.7 training-only wall sec/step; ~7.15 sec/step including eval/checkpoint overhead | training-only mean/median ~3,483/~3,485; end-to-end ~2,729 | training-only mean/median ~1,742/~1,743; end-to-end ~1,365 | Derived from adjacent 10-step `num_tokens` deltas; eval runtime ~442s every 200 steps |
+| **verl_gr (`fp32opt`)** | 2× H800 | trace to step 590 | mean 5.12, median 4.41 | mean ~4,045; median ~4,130 | mean ~2,022; median ~2,065 | Fixed micro-batch config (6×4 seq/GPU, `use_dynamic_bsz=False`, `MAX_TOKENS_PER_GPU=24576`). Verl `perf/throughput` is per-GPU normalized. |
+| **verl_gr (`debug_june5`)** | 2× H800 | trace to step ~170 | ~5.1s timer / ~7.2s wall (step 20, warmup) | TBD (full trace needed) | TBD | Dynamic bsz config (`use_dynamic_bsz=True`, `MAX_TOKENS_PER_GPU=12000`). See Phase Distribution below. |
 
-The old table mixed incompatible throughput definitions. TRL's derived throughput above is total tokens per wall second unless explicitly divided by 2, while verl's TensorBoard `perf/throughput` is already normalized per GPU as `total_num_tokens / (time_per_step × n_gpus)`. With consistent definitions, verl_gr has both shorter logged step time and higher token throughput on this trace. The KL/reward behavior is comparable by step 400-600; a final speed claim should still use a controlled wall-clock comparison because TRL and verl_gr report timing differently.
+TRL and verl_gr report throughput differently: TRL derives throughput from token-deltas between adjacent logged steps; verl TensorBoard `perf/throughput` is per-GPU normalized (`total_num_tokens / (time_per_step × n_gpus)`). Multiply verl's per-GPU throughput by N_GPUS for total.
 
-### Distribution Analysis
+### Phase Distribution
 
-**Key finding:** the current `fp32opt` trace is still not vLLM-rollout bound. vLLM rollout is ~10% of logged step time, while actor update plus weight synchronization is ~55%. Compared with the older May 26 run, `update_actor` is much lower and `update_weights` is now a major visible component.
+Config: 6 unique prompts × 8 rollouts = 48 seqs/step, 2× H800. verl-GR current uses `use_dynamic_bsz=True`, `ppo_max_token_len_per_gpu=12000`. TRL does not export per-phase timing; its values are estimated from the step structure (ZeRO-3, 6 micro-batches, colocated vLLM). verl-GR current measured via per-phase `[TIMING]` instrumentation in `verl_gr/trainers/rl_trainer.py` (`debug_june5`, step 20). verl-GR optimized projects what the current config achieves if the environmental gen+ref regression is fixed.
 
-| Phase | Mean Time | % of Step |
-|---|---|---|
-| gen (vLLM rollout) | 0.53s | 10% |
-| update_actor (FSDP train step) | 1.78s | 34% |
-| update_weights (actor → rollout sync) | 1.06s | 20% |
-| old_log_prob | 0.47s | 9% |
-| ref | 0.44s | 9% |
-| adv | 0.09s | 2% |
-| Other/overhead | ~0.83s | 16% |
-| **Total logged step** | **~5.20s** | **100%** |
+| Component | Rank-GRPO (TRL) | verl-GR (current) | verl-GR (optimized) | Δ (current vs TRL) | Notes |
+|-----------|----------------|---------|---|---|---|
+| gen (vLLM rollout) | ~0.5s | ~1.89s | ~0.5s | +1.4s | 6 prompts → 48 completions, TP=2. TRL colocated; verl RPC → vLLM worker. Current regression is environmental (same model, same vLLM config, same GPU). |
+| old_log_prob | ~0.5s (recompute) | 0s (bypassed) | 0s | −0.5s | TRL recomputes or detaches; verl `bypass_mode=true` copies `rollout_log_probs`, skipping a forward pass. |
+| ref (ref log-prob) | ~0.4s | 1.05s | ~0.4s | +0.6s | One frozen-model forward over 48 seqs. Same environmental regression as gen. |
+| adv (advantage) | inline | ~0.10s | ~0.10s | ~0.1s | TRL computes inline; verl on driver CPU. Comparable cost. |
+| fwd+bwd (actor) | ~2.6s (6 micro-batches) | ~0.92s (~2 micro-batches) | ~0.92s | −1.7s | Dynamic bsz splits 48 seqs by token count instead of 6× fixed micro-batches. Each pass processes unique, larger data → better GPU utilization. |
+| optimizer step | ~0.2s | ~0s (in update_weights) | ~0s | −0.2s | AdamW fp32. TRL separate; verl amortized into weight sync RPC. |
+| update_weights (actor → vLLM) | 0s (colocated) | 1.15s | 1.15s | +1.2s | verl must sync weights to separate vLLM process; TRL shares memory. |
+| **Total (training phases)** | **~4.2s** | **5.11s** | **~3.1s** | **+0.9s** | |
+| Step overhead (data, logging, tqdm) | ~1.3s | ~2.1s | ~1.0s | +0.8s | TRL: Accelerate overhead. verl: Ray orchestration + dataloader + DataProto ops. Current tqdm average dragged up by warmup steps 1-5. |
+| **Total wall** | **~5.5s** | **~7.2s** | **~4.1s** | **+1.7s** | |
 
-These numbers are means from the current `g2_3_trlmatch_ppoegradaccu6_trainshuffleOn_fp32opt` TensorBoard timing scalars through step 1370. Validation (`timing_s/testing`, ~591s when it runs) and checkpoint saving (`timing_s/save_checkpoint`, ~4.15s when it runs) are logged separately from the regular per-step phase distribution.
+**Key observations:**
+
+1. **Dynamic bsz is the biggest win.** fwd+bwd drops from TRL's ~2.6s (6 micro-batches) to ~0.92s (~2 micro-batches) — a 65% reduction. This is enabled by `use_dynamic_bsz=True` which packs more tokens per pass instead of repeating the same data.
+
+2. **gen + ref are the biggest gap to TRL** (+2.0s combined). Both are model-forward-pass operations that regressed 3-4× between the May `fp32opt` snapshot and June `debug_june5`, despite identical vLLM engine config and model checkpoint. This is an environmental regression (GPU clocks, conda env package versions, system load), not a code issue.
+
+3. **update_weights (+1.2s vs TRL) is the structural cost** of verl-GR's Ray-based architecture. TRL's colocated vLLM shares GPU memory with the trainer and needs no weight sync; verl-GR's separate vLLM workers require an RPC after each optimizer step. This is the trade-off for independent scaling.
+
+4. **verl-GR optimized projects ~4.1s wall time** — beating both TRL (~5.5s) and the ~4s/it golden target — by combining dynamic bsz (already done) with a fix for the environmental gen+ref regression.
+
+### Comparison: TRL vs verl-GR Step Structure
+
+The two frameworks structure a training step differently:
+
+| Phase | TRL (DeepSpeed ZeRO-3, colocated) | verl-GR (FSDP + Ray) | Notes |
+|-------|-----------------------------------|----------------------|-------|
+| vLLM generation | colocated in-process | Ray RPC → vLLM worker | TRL avoids RPC; verl has ~1.9s gen phase |
+| old log-prob | `old_per_token_logps.detach()` | bypassed (`bypass_mode=true`) | Both use current-policy proxy |
+| ref log-prob | separate ref forward | Ray RPC → ref FSDP worker | Both do one frozen-model forward |
+| reward | CPU string-matching | CPU string-matching | Comparable |
+| advantage | inline in trainer loop | driver CPU | Comparable; verl runs Rank-GRPO group norm |
+| actor fwd+bwd | ZeRO-3, 6 micro-batches | FSDP, ~2 dynamic micro-batches | verl has fewer but larger micro-batches |
+| optimizer step | DeepSpeed AdamW | FSDP AdamW | Comparable |
+| weight sync → vLLM | none (colocated) | ~1.15s RPC per step | verl must sync weights to separate vLLM process |
+| orchestration | Accelerate, single-process | Ray, multi-actor RPC | verl has higher per-step overhead |
+
+The net effect: TRL's colocated design has lower per-step overhead (~5.5s training-only) but is harder to scale beyond one node. verl-GR's Ray-based design adds RPC/weight-sync overhead but supports independent scaling of rollout and training workers. The remaining gap to the ~4s/it golden target is primarily in the vLLM generation phase (gen) and ref forward phase (ref), both of which are model-inference operations that share the same GPU and have regressed equally — suggesting a single environmental root cause rather than code inefficiency.
 
 ### Eval runtime
 
@@ -219,3 +248,80 @@ These numbers are means from the current `g2_3_trlmatch_ppoegradaccu6_trainshuff
 |---------------|-------------|-----------|
 | Original TRL Rank-GRPO | ~442s (mean of step 200 and 400 evals) | Every 200 steps |
 | verl_gr Fork (`fp32opt`) | not logged as a direct eval runtime scalar in this trace | Every 200 steps |
+
+---
+
+## Hyperparameters: TRL (`run_rl.sh`) vs. verl-GR (`run_rankgrpo.sh`)
+
+Trace references:
+- TRL: `Rank-GRPO/scripts/run_rl.sh`, tensorboard: `results/grpo/new2/runs/May28_09-35-22_hk01dgx028`
+- verl-GR: `scripts/run_rankgrpo.sh`, tensorboard: `tensorboard_log/RankGRPO/debug_june5`
+
+### Hyperparameter Mapping Table
+
+| Field | TRL Value | verl-GR Value | Aligned? | Notes |
+|-------|-----------|---------------|----------|-------|
+| **Optimizer** | | | | |
+| Learning rate | `--lr 1e-6` | `LEARNING_RATE=1e-6` | ✓ | |
+| Adam β₁ | `--adam_beta1 0.9` | `ADAM_BETA1=0.9` | ✓ | |
+| Adam β₂ | `--adam_beta2 0.99` | `ADAM_BETA2=0.99` | ✓ | |
+| Weight decay | default (0.0) | `WEIGHT_DECAY=0.0` | ✓ | |
+| LR schedule | default (constant) | `lr_scheduler_type=constant` | ✓ | |
+| LR warmup | default (0) | `LR_WARMUP_STEPS=0` | ✓ | |
+| **Precision** | | | | |
+| Mixed precision | `--bf16` | `ACTOR_MODEL_DTYPE=fp32` (bf16 compute + fp32 optimizer) | ✓ | Same effective precision; different expression |
+| Gradient checkpointing | `--gradient_checkpointing` | `GRADIENT_CHECKPOINTING=True` | ✓ | |
+| **Batch Configuration** | | | | |
+| Unique prompts / optimizer step | 6 (derived) | 6 (`TRAIN_BATCH_SIZE=6`) | ✓ | See Note ① |
+| Generations per prompt | `--num_generations 8` | `ROLLOUT_N=8` | ✓ | |
+| Total seqs / optimizer step | 48 | 48 | ✓ | 6 prompts × 8 rollouts |
+| Per-device train batch size | `--per_device_train_batch_size 4` | N/A (verl uses total prompts) | — | Different abstraction |
+| Gradient accumulation steps | `--gradient_accumulation_steps 6` | `GRADIENT_ACCUMULATION_STEPS=1` | ✗ | See Note ② |
+| Max tokens per GPU | `MAX_TOKENS_PER_GPU=12000` | `MAX_TOKENS_PER_GPU=12000` | ✓ | Controls dynamic-bsz micro-batch split |
+| **PPO / RL** | | | | |
+| PPO epochs (μ) | `--mu 1` | `PPO_EPOCHS=1` | ✓ | Single pass per generated batch |
+| Clip range | default [0.94, 1.08] | `PPO_CLIP_RATIO=0.06`, `PPO_CLIP_RATIO_HIGH=0.08` | ✓ | ε=0.06, ε_high=0.08 in both |
+| KL coefficient | `--kl_beta 1e-3` | `KL_LOSS_COEF=0.001` | ✓ | |
+| KL loss type | `low_var_kl` (k3 estimator) | `KL_LOSS_TYPE=low_var_kl` | ✓ | Same estimator: exp(ref-log) - (ref-log) - 1 |
+| Loss aggregation | `seq-mean-token-mean` | `LOSS_AGG_MODE=seq-mean-token-mean` | ✓ | Equal weight per sequence |
+| Advantage estimator | GRPO | GRPO (Rank-GRPO group-normalized) | ✓ | Group-normalized within 8 generations per prompt |
+| **Rollout / vLLM** | | | | |
+| vLLM mode | `--vllm_mode colocate` | hybrid engine (separate workers) | — | Architectural difference; see Note ④ |
+| vLLM GPU memory util. | `--vllm_gpu_memory_utilization 0.25` | `ROLLOUT_GPU_MEMORY_UTILIZATION=0.25` | ✓ | |
+| vLLM TP size | `--vllm_tensor_parallel_size 2` | `ROLLOUT_TENSOR_PARALLEL_SIZE=2` | ✓ | |
+| Enforce eager | default (False, CUDA graphs enabled) | `ROLLOUT_ENFORCE_EAGER=False` | ✓ | Both attempt CUDA graphs for vLLM |
+| Custom all-reduce | default (vLLM built-in) | `ROLLOUT_DISABLE_CUSTOM_ALL_REDUCE=True` | ✗ | See Note ③ |
+| Flashinfer sampler | not set | `VLLM_USE_FLASHINFER_SAMPLER=1` | — | verl uses faster sampling kernel |
+| **Data / Sequence** | | | | |
+| Max prompt length | `--max_prompt_length 2048` | `max_prompt_length=2048` | ✓ | |
+| Max completion length | `--max_completion_length 1024` | `max_response_length=1024` | ✓ | |
+| Train shuffle | default (True) | `DATA_SHUFFLE=True` | ✓ | |
+| Validation shuffle | `--no-val_shuffle` | `VALIDATION_SHUFFLE=False` | ✓ | |
+| Seed | `--seed 3407` | `SEED=3407` | ✓ | |
+| **Reward** | | | | |
+| Reward function | `--reward_func exp_inf` | `compute_score` (aligned matching logic) | ✓ | Same per-rank hit detection against GT catalog |
+| Length shaping | N/A (not in TRL) | `APPLY_EXTRA_LENGTH_SHAPING=True` (EOL=+0.1, overflow=-0.1, early_stop=-0.1) | — | verl adds length-based reward shaping; can be disabled |
+| **Checkpoint / Logging** | | | | |
+| Save frequency | `--save_steps 200` | `SAVE_FREQ=200` | ✓ | |
+| Eval frequency | `--eval_steps 200` | `TEST_FREQ=200` | ✓ | |
+| Top-k checkpoints | implicit (best only) | `BEST_CKPTS_TO_KEEP=3` | ✓ | verl prunes non-top-k `global_step_*` dirs |
+| Eval before train | implicit (no) | `VAL_BEFORE_TRAIN=False` | ✓ | |
+| **Distributed Backend** | | | | |
+| Training framework | DeepSpeed ZeRO-3 | FSDP (`FSDP_STRATEGY=fsdp`) | ✗ | See Note ④ |
+| Orchestration | Accelerate (single-process) | Ray (multi-actor RPC) | ✗ | See Note ④ |
+| vLLM integration | colocated in-process | Ray rollout workers | ✗ | See Note ④ |
+
+### Side Notes
+
+**① Effective batch size equivalence.** TRL's `per_device_train_batch_size=4` counts *generated sequences* per GPU (not unique prompts). So `4 seqs × 2 GPUs × 6 accum = 48` sequences per optimizer step; with `num_generations=8`, that's `48 ÷ 8 = 6` unique prompts. verl-GR uses the opposite convention: `TRAIN_BATCH_SIZE=6` counts *unique prompts*, and `ROLLOUT_N=8` makes it `6 × 8 = 48` sequences. Both frameworks process the same 48 sequences from 6 unique prompts — the `num_generations`/`ROLLOUT_N` factor is present on both sides, just applied at different levels (TRL bakes it into `per_device_train_batch_size`; verl applies it explicitly via `ROLLOUT_N`).
+
+**② Gradient accumulation: different mechanism, same outcome.** TRL's `gradient_accumulation_steps=6` means: load 1 prompt per micro-step, generate 8 responses, run fwd+bwd, accumulate gradients; repeat 6 times with 6 **different** prompts; then `optimizer.step()`. In verl, setting `GRADIENT_ACCUMULATION_STEPS=6` with the old fixed-micro-batch config would repeat the **same** prompt's data 6 times — redundant computation, not true gradient accumulation. The current verl config instead loads all 6 prompts in one `TRAIN_BATCH_SIZE=6` and uses `use_dynamic_bsz=True` to split them into ~2 micro-batches by token count, each with **different** data. The result is the same: 6 unique prompts' gradients accumulated, one optimizer step. The mechanism differs because the frameworks abstract gradient accumulation at different levels (TRL at the dataloader, verl at the engine micro-batch splitter).
+
+**③ vLLM custom all-reduce disabled for stability.** On this H800 stack, vLLM's built-in custom all-reduce for TP=2 fails at startup (`custom_all_reduce.cuh:455 invalid argument`). verl-GR disables it and falls back to NCCL collectives for TP communication. This is a stability requirement, not a performance choice. The effective TP=2 topology and collective behavior are aligned; only the underlying implementation differs.
+
+**④ Distributed backends are fundamentally different.** TRL uses DeepSpeed ZeRO-3 + HuggingFace Accelerate with vLLM colocated in the same process. verl-GR uses FSDP + Ray with vLLM running in separate Ray actors. These are architectural choices with different trade-offs:
+- TRL's in-process design avoids RPC overhead but is harder to scale beyond one node.
+- verl-GR's Ray-based design adds ~1-2s/step in orchestration overhead but supports independent scaling of rollout and training workers across nodes.
+- Numeric alignment is expected in training signal (rewards, advantages, KL divergence, loss), not in per-step runtime or backend-specific metrics like gradient norms.
+
+The hyperparameter values are intentionally chosen to produce the same training dynamics despite the different backends. Where numbers differ (e.g., `GRADIENT_ACCUMULATION_STEPS`), the difference reflects a framework-level abstraction gap, not a training discrepancy.

@@ -4,8 +4,9 @@
 set -euo pipefail
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export DS_IGNORE_CUDA_DETECTION="${DS_IGNORE_CUDA_DETECTION:-1}"
-export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
-export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-1}"
+# export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 N_GPUS="${N_GPUS:-2}"
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
@@ -45,18 +46,16 @@ VAL_FILES="${VAL_FILES:-[${VAL_DATASET_DIR}]}"
 ROLLOUT_N="${ROLLOUT_N:-8}"
 REC_NUM="${REC_NUM:-20}"
 
-# verl-GR's train_batch_size and gen_batch_size are measured in unique prompts.
-# TRL's RankGRPO generation_batch_size is measured in repeated generation slots:
-# per_device_train_batch_size × num_processes × gradient_accumulation_steps.
-# With the 2-GPU TRL reference, 4 × 2 × 6 = 48 slots, and num_generations=8
-# means 48 / 8 = 6 unique prompts per optimizer update.
-TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-1}"
-GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-6}"
+# Batch config aligned with upstream Rank-GRPO run_rl.sh:
+#   TRL: per_device_train_batch_size=4 × 2 GPUs × 6 accum
+#        = 48 generated sequence slots / optimizer step
+#        = 6 unique prompts (48 / num_generations=8).
+#   verl-gr: 6 unique prompts × 8 rollouts = 48 seqs.
+#   Dynamic bsz splits into ~2 micro-batches at 12000 tok/GPU
+#   instead of 6× redundant fixed 4-seq micro-batches.
+TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-6}"
+GRADIENT_ACCUMULATION_STEPS="${GRADIENT_ACCUMULATION_STEPS:-1}"
 GEN_BATCH_SIZE="$((TRAIN_BATCH_SIZE * GRADIENT_ACCUMULATION_STEPS))"
-# When gradient accumulation is active, force fixed micro-batching so the engine
-# creates exactly GRADIENT_ACCUMULATION_STEPS micro-batches, accumulating gradients.
-# micro_batch_size_per_gpu = TRAIN_BATCH_SIZE × ROLLOUT_N / N_GPUS
-#   = prompts_per_gpu_per_microbatch × rollouts
 if (( GRADIENT_ACCUMULATION_STEPS > 1 )); then
   USE_DYNAMIC_BSZ="${USE_DYNAMIC_BSZ:-False}"
   _DEFAULT_MBS_PER_GPU="$((TRAIN_BATCH_SIZE * ROLLOUT_N / N_GPUS))"
@@ -338,8 +337,8 @@ done
   trainer.best_ckpt_metric="${BEST_CKPT_METRIC}" \
   trainer.logger="${LOGGER_BACKENDS}" \
   trainer.remove_previous_ckpt_in_save="${REMOVE_PREVIOUS_CKPT_IN_SAVE}" \
-  +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD="'${VLLM_WORKER_MULTIPROC_METHOD}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE="'${NCCL_IB_DISABLE:-1}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_CUDA_ALLOC_CONF="'${PYTORCH_CUDA_ALLOC_CONF}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_DEBUG="'${VERL_GR_DEBUG}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.TVM_FFI_CACHE_DIR="'${TVM_FFI_CACHE_DIR}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="'${PYTHONPATH:-}'" \
@@ -358,3 +357,4 @@ done
   critic.enable=False \
   "$@"
 
+  # +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD="'${VLLM_WORKER_MULTIPROC_METHOD}'" \
