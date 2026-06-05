@@ -201,28 +201,30 @@ TRL and verl_gr report throughput differently: TRL derives throughput from token
 
 Config: 6 unique prompts × 8 rollouts = 48 seqs/step, 2× H800. verl-GR current uses `use_dynamic_bsz=True`, `ppo_max_token_len_per_gpu=12000`. TRL does not export per-phase timing; its values are estimated from the step structure (ZeRO-3, 6 micro-batches, colocated vLLM). verl-GR current measured via per-phase `[TIMING]` instrumentation in `verl_gr/trainers/rl_trainer.py` (`debug_june5`, step 20). verl-GR optimized projects what the current config achieves if the environmental gen+ref regression is fixed.
 
-| Component | Rank-GRPO (TRL) | verl-GR (current) | verl-GR (optimized) | Δ (current vs TRL) | Notes |
-|-----------|----------------|---------|---|---|---|
-| gen (vLLM rollout) | ~0.5s | ~1.89s | ~0.5s | +1.4s | 6 prompts → 48 completions, TP=2. TRL colocated; verl RPC → vLLM worker. Current regression is environmental (same model, same vLLM config, same GPU). |
-| old_log_prob | ~0.5s (recompute) | 0s (bypassed) | 0s | −0.5s | TRL recomputes or detaches; verl `bypass_mode=true` copies `rollout_log_probs`, skipping a forward pass. |
-| ref (ref log-prob) | ~0.4s | 1.05s | ~0.4s | +0.6s | One frozen-model forward over 48 seqs. Same environmental regression as gen. |
-| adv (advantage) | inline | ~0.10s | ~0.10s | ~0.1s | TRL computes inline; verl on driver CPU. Comparable cost. |
-| fwd+bwd (actor) | ~2.6s (6 micro-batches) | ~0.92s (~2 micro-batches) | ~0.92s | −1.7s | Dynamic bsz splits 48 seqs by token count instead of 6× fixed micro-batches. Each pass processes unique, larger data → better GPU utilization. |
-| optimizer step | ~0.2s | ~0s (in update_weights) | ~0s | −0.2s | AdamW fp32. TRL separate; verl amortized into weight sync RPC. |
-| update_weights (actor → vLLM) | 0s (colocated) | 1.15s | 1.15s | +1.2s | verl must sync weights to separate vLLM process; TRL shares memory. |
-| **Total (training phases)** | **~4.2s** | **5.11s** | **~3.1s** | **+0.9s** | |
-| Step overhead (data, logging, tqdm) | ~1.3s | ~2.1s | ~1.0s | +0.8s | TRL: Accelerate overhead. verl: Ray orchestration + dataloader + DataProto ops. Current tqdm average dragged up by warmup steps 1-5. |
-| **Total wall** | **~5.5s** | **~7.2s** | **~4.1s** | **+1.7s** | |
+| Component | Rank-GRPO (TRL) | verl-GR (current) | verl-GR (optimized) | Δ0 (optimized vs TRL) | Δ1 (current vs TRL) | Notes |
+|-----------|----------------|---------|---|---|---|---|
+| gen (vLLM rollout) | ~0.5s | ~1.89s | ~0.5s | ~0s | **+1.4s** | 6 prompts → 48 completions, TP=2. TRL colocated; verl RPC → vLLM worker. Current regression is environmental (same model, same vLLM config, same GPU node). |
+| old_log_prob | ~0.5s (recompute) | 0s (bypassed) | 0s | **−0.5s** | **−0.5s** | TRL recomputes or detaches; verl `bypass_mode=true` copies `rollout_log_probs`, skipping a forward pass. |
+| ref (ref log-prob) | ~0.4s | 1.05s | ~0.4s | ~0s | **+0.6s** | One frozen-model forward over 48 seqs. Same environmental regression as gen. |
+| adv (advantage) | inline | ~0.10s | ~0.10s | +0.1s | +0.1s | TRL computes inline; verl on driver CPU. Comparable cost. |
+| fwd+bwd (actor) | ~2.6s (6 micro-batches) | ~0.92s (~2 micro-batches) | ~0.92s | **−1.7s** | **−1.7s** | Dynamic bsz splits 48 seqs by token count instead of 6× fixed micro-batches. Each pass processes unique, larger data → better GPU utilization. |
+| optimizer step | ~0.2s | — (amortized) | — (amortized) | −0.2s | −0.2s | AdamW fp32. TRL separate; verl amortized into weight sync RPC. |
+| update_weights (actor → vLLM) | 0s (colocated) | 1.15s | 1.15s | **+1.2s** | **+1.2s** | verl must sync weights to separate vLLM process; TRL shares memory. |
+| **Total (training phases)** | **~4.2s** | **5.11s** | **~3.1s** | **−1.1s** | **+0.9s** | |
+| Step overhead (data, logging, tqdm) | ~1.3s | ~2.1s | ~1.0s | −0.3s | +0.8s | TRL: Accelerate overhead. verl: Ray orchestration + dataloader + DataProto ops. Current tqdm average dragged up by warmup steps 1-5. |
+| **Total wall** | **~5.5s** | **~7.2s** | **~4.1s** | **−1.4s** | **+1.7s** | |
 
 **Key observations:**
 
 1. **Dynamic bsz is the biggest win.** fwd+bwd drops from TRL's ~2.6s (6 micro-batches) to ~0.92s (~2 micro-batches) — a 65% reduction. This is enabled by `use_dynamic_bsz=True` which packs more tokens per pass instead of repeating the same data.
 
-2. **gen + ref are the biggest gap to TRL** (+2.0s combined). Both are model-forward-pass operations that regressed 3-4× between the May `fp32opt` snapshot and June `debug_june5`, despite identical vLLM engine config and model checkpoint. This is an environmental regression (GPU clocks, conda env package versions, system load), not a code issue.
+2. **verl-GR's `n=1` rollout is more efficient than TRL's `llm.generate()`.** TRL calls `self.llm.generate(prompts, sampling_params)` where `SamplingParams.n=8` — one vLLM request per prompt that generates all 8 completions internally. verl-GR instead fires 8 independent `n=1` requests per prompt concurrently via `asyncio.gather` ([`rankgrpo_agent_loop.py:193-201`](verl_gr/recipes/rankgrpo/rankgrpo_agent_loop.py)). The `n=1` approach is faster because: (a) vLLM's continuous batching scheduler can interleave decode steps from 48 independent requests (6 prompts × 8 rollouts), picking the optimal mix at each step, while `n=8` ties all 8 completions to the same prompt KV cache and forces them to be co-scheduled; (b) independent `n=1` requests can complete and release KV-cache blocks independently — with `n=8`, the prompt KV cache remains pinned until the *slowest* of the 8 completions finishes; (c) `asyncio.gather` saturates the vLLM request queue immediately, giving the scheduler maximum batching flexibility from the first decode step. This is why the README's earlier `fp32opt` snapshot measured gen at just ~0.53s for 48 completions.
 
-3. **update_weights (+1.2s vs TRL) is the structural cost** of verl-GR's Ray-based architecture. TRL's colocated vLLM shares GPU memory with the trainer and needs no weight sync; verl-GR's separate vLLM workers require an RPC after each optimizer step. This is the trade-off for independent scaling.
+3. **gen + ref are the biggest gap to TRL** (+2.0s combined). Both are model-forward-pass operations that regressed 3-4× between the May `fp32opt` snapshot and June `debug_june5`, despite identical vLLM engine config and model checkpoint. This is an environmental regression (GPU clocks, conda env package versions, system load), not a code issue.
 
-4. **verl-GR optimized projects ~4.1s wall time** — beating both TRL (~5.5s) and the ~4s/it golden target — by combining dynamic bsz (already done) with a fix for the environmental gen+ref regression.
+4. **update_weights (+1.2s vs TRL) is the structural cost** of verl-GR's Ray-based architecture. TRL's colocated vLLM shares GPU memory with the trainer and needs no weight sync; verl-GR's separate vLLM workers require an RPC after each optimizer step. This is the trade-off for independent scaling.
+
+5. **verl-GR optimized projects ~4.1s wall time** — beating both TRL (~5.5s) and the ~4s/it golden target — by combining dynamic bsz (already done) with a fix for the environmental gen+ref regression.
 
 ### Comparison: TRL vs verl-GR Step Structure
 
@@ -275,9 +277,10 @@ Trace references:
 | Unique prompts / optimizer step | 6 (derived) | 6 (`TRAIN_BATCH_SIZE=6`) | ✓ | See Note ① |
 | Generations per prompt | `--num_generations 8` | `ROLLOUT_N=8` | ✓ | |
 | Total seqs / optimizer step | 48 | 48 | ✓ | 6 prompts × 8 rollouts |
-| Per-device train batch size | `--per_device_train_batch_size 4` | N/A (verl uses total prompts) | — | Different abstraction |
+| Per-device train batch size | `--per_device_train_batch_size 4` | N/A (verl uses total prompts) | — | TRL counts sequences/GPU/micro-step; verl uses `TRAIN_BATCH_SIZE` (prompts) |
+| Micro-batch size per GPU | `per_device_train_batch_size=4` (4 seqs/GPU fixed) | `ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=32` (ceiling when `use_dynamic_bsz=True`; =`TRAIN_BATCH_SIZE×ROLLOUT_N/N_GPUS` when `False`) | — | TRL fixes 4 seqs/GPU/micro-step. With dynamic bsz, verl sets a high ceiling (32) and splits by token count via `ppo_max_token_len_per_gpu` (~21+3 seqs in practice). Without dynamic bsz, verl matches TRL's 4 seq/GPU exactly. |
 | Gradient accumulation steps | `--gradient_accumulation_steps 6` | `GRADIENT_ACCUMULATION_STEPS=1` | ✗ | See Note ② |
-| Max tokens per GPU | `MAX_TOKENS_PER_GPU=12000` | `MAX_TOKENS_PER_GPU=12000` | ✓ | Controls dynamic-bsz micro-batch split |
+| Max tokens per GPU | `MAX_TOKENS_PER_GPU=12000` | `MAX_TOKENS_PER_GPU=12000` | ✓ | Controls dynamic-bsz micro-batch split; lower = more, smaller micro-batches |
 | **PPO / RL** | | | | |
 | PPO epochs (μ) | `--mu 1` | `PPO_EPOCHS=1` | ✓ | Single pass per generated batch |
 | Clip range | default [0.94, 1.08] | `PPO_CLIP_RATIO=0.06`, `PPO_CLIP_RATIO_HIGH=0.08` | ✓ | ε=0.06, ε_high=0.08 in both |
