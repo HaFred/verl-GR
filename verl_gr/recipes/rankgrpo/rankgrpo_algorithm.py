@@ -6,6 +6,7 @@ from collections import defaultdict
 import os
 from typing import Any
 
+import numpy as np
 import torch
 from verl import DataProto
 
@@ -253,4 +254,6 @@ def compute_rank_grpo_advantage(
     data.batch["returns"] = token_advantages
     data.batch["rank_token_mask"] = rank_token_mask
     data.batch["rank_seg_ids"] = seg_ids
+    data.non_tensor_batch["rank_reward_sum"] = np.array(rank_rewards.sum(dim=1).cpu().tolist())
+    data.non_tensor_batch["rank_reward_mean"] = np.array(rank_rewards.mean(dim=1).cpu().tolist())
     return data

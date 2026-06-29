@@ -23,13 +23,32 @@
 
 set -euo pipefail
 
+# GRPO needs a HuggingFace model dir (config.json + weights), not raw FSDP shards.
+# After SFT, merge once with:
+#   torchrun --standalone --nnodes=1 --nproc_per_node=4 scripts/merge_fsdp_ckpt.py \
+#     --ckpt "${SFT_OUTPUT_DIR}/global_step_<N>" --base_model "${QWEN_BASE}" \
+#     --output "${SFT_OUTPUT_DIR}/global_step_<N>_hf"
+# Which SFT checkpoint to use for RL (override: SFT_STEP=2000 bash ...)
+SFT_STEP="${SFT_STEP:-1500}"
+SFT_HF_CKPT="${SFT_OUTPUT_DIR}/global_step_${SFT_STEP}_hf"
+if [[ ! -f "${SFT_HF_CKPT}/config.json" ]]; then
+  echo "Missing HF SFT checkpoint: ${SFT_HF_CKPT}" >&2
+  echo "Merge FSDP shards first:" >&2
+  echo "  torchrun --standalone --nnodes=1 --nproc_per_node=4 scripts/merge_fsdp_ckpt.py \\" >&2
+  echo "    --ckpt ${SFT_OUTPUT_DIR}/global_step_${SFT_STEP} --base_model ${QWEN_BASE} \\" >&2
+  echo "    --output ${SFT_HF_CKPT}" >&2
+  exit 1
+fi
+export BASE_MODEL="${BASE_MODEL:-${SFT_HF_CKPT}}"
+
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
 MINIONEREC_ROOT="${MINIONEREC_ROOT:-${VERL_GR_ROOT}/../MiniOneRec}"
 CATEGORY="${CATEGORY:-Industrial_and_Scientific}"
 
-# Required: SFT/base checkpoint directory (same as rl.sh --model_path)
+# Required: SFT HF checkpoint directory (same as rl.sh --model_path)
 BASE_MODEL="${BASE_MODEL:-${MINIONEREC_ROOT}/output_dir/xxx/checkpoint-390}"
+BASE_MODEL="${BASE_MODEL%/}"  # verl copy_to_local rejects trailing slashes
 
 TRAIN_FILE="${TRAIN_FILE:-${MINIONEREC_ROOT}/data/Amazon/train/${CATEGORY}_5_2016-10-2018-11.csv}"
 VAL_FILE="${VAL_FILE:-${MINIONEREC_ROOT}/data/Amazon/valid/${CATEGORY}_5_2016-10-2018-11.csv}"
@@ -60,22 +79,22 @@ export ROLLOUT_MODE="${ROLLOUT_MODE:-async}"
 
 export PROJECT_NAME="${PROJECT_NAME:-MiniOneRec_RL}"
 export EXPERIMENT_NAME="${EXPERIMENT_NAME:-minionerec_grpo_rlsh4gpu_$(date +%Y%m%d_%H%M%S)}"
-export WANDB_MODE="${WANDB_MODE:-offline}"
+export WANDB_MODE="${WANDB_MODE:-online}"
 
 # Optional: reduce CUDA memory fragmentation
 # export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 cd "${VERL_GR_ROOT}"
 bash scripts/run_minionerec_grpo.sh \
-  data.shuffle=true \
-  data.seed=42 \
-  trainer.val_before_train=false \
-  trainer.save_freq=50 \
-  trainer.test_freq=50 \
-  actor_rollout_ref.actor.kl_loss_coef=0.001 \
-  actor_rollout_ref.actor.use_dynamic_bsz=true \
-  actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
-  actor_rollout_ref.model.use_remove_padding=true \
-  actor_rollout_ref.actor.entropy_from_logits_with_chunking=true \
-  actor_rollout_ref.actor.entropy_checkpointing=true \
+  ++data.shuffle=true \
+  ++data.seed=42 \
+  ++trainer.val_before_train=false \
+  ++trainer.save_freq=50 \
+  ++trainer.test_freq=50 \
+  ++actor_rollout_ref.actor.kl_loss_coef=0.001 \
+  ++actor_rollout_ref.actor.use_dynamic_bsz=true \
+  ++actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=true \
+  ++actor_rollout_ref.model.use_remove_padding=true \
+  ++actor_rollout_ref.actor.entropy_from_logits_with_chunking=true \
+  ++actor_rollout_ref.actor.entropy_checkpointing=true \
   "$@"

@@ -1,5 +1,6 @@
 # @package _global_
-# Rank-GRPO config — composes from upstream PPO trainer config.
+# Minimal Rank-GRPO config for verl release/v0.7.1.
+# Composes from upstream PPO trainer config and keeps rollout on vanilla vLLM.
 
 hydra:
   searchpath:
@@ -13,21 +14,21 @@ model_engine: dp
 
 task:
   name: rankgrpo
+  trainer_adapter_class: verl_gr.recipes.rankgrpo.rankgrpo_trainer.RankGRPOTrainerAdapter
 
 data:
-  train_batch_size: 6
+  train_batch_size: 1
+  gen_batch_size: 6
   max_prompt_length: 2048
   prompt_key: prompt
-  shuffle: true
-  val_batch_size: 32
+  shuffle: false
+  val_batch_size: 64
   train_max_samples: -1
   val_max_samples: 1600
   max_response_length: 1024
   filter_overlong_prompts: true
   filter_overlong_prompts_workers: 16
   truncation: error
-  seed: 3407
-  validation_shuffle: false
   custom_cls:
     name: RankGRPODataset
   reward_fn_key: source
@@ -49,11 +50,7 @@ actor_rollout_ref:
   hybrid_engine: true
 
   ref:
-    strategy: fsdp
     entropy_from_logits_with_chunking: true
-    log_prob_use_dynamic_bsz: false
-    log_prob_micro_batch_size_per_gpu: 32
-    log_prob_max_token_len_per_gpu: 49152
     fsdp_config:
       wrap_policy:
         transformer_layer_cls_to_wrap:
@@ -65,7 +62,6 @@ actor_rollout_ref:
       ranks: ${oc.select:actor_rollout_ref.actor.profiler.ranks,[]}
 
   actor:
-    strategy: fsdp
     entropy_coeff: 0.0
     entropy_checkpointing: true
     clip_ratio: 0.06
@@ -73,10 +69,10 @@ actor_rollout_ref:
     clip_ratio_high: 0.08
     clip_ratio_c: 1e6
     use_dynamic_bsz: false
-    ppo_mini_batch_size: 8
-    ppo_micro_batch_size_per_gpu: 32
-    ppo_max_token_len_per_gpu: 49152
+    ppo_mini_batch_size: 1
+    ppo_micro_batch_size_per_gpu: 2
     ppo_epochs: 1
+    ppo_max_token_len_per_gpu: 24576
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
@@ -84,7 +80,6 @@ actor_rollout_ref:
     optim:
       lr: 1e-6
       lr_warmup_steps: 0
-      lr_scheduler_type: constant
       weight_decay: 0.0
     fsdp_config:
       wrap_policy:
@@ -105,20 +100,16 @@ actor_rollout_ref:
     top_p: 1.0
     top_k: -1
     do_sample: true
-    gpu_memory_utilization: 0.25
-    max_num_batched_tokens: 49152
+    gpu_memory_utilization: 0.15
+    max_model_len: 3072
+    max_num_batched_tokens: 24576
     max_num_seqs: 512
-    log_prob_use_dynamic_bsz: false
-    log_prob_micro_batch_size_per_gpu: 32
-    log_prob_max_token_len_per_gpu: 49152
+    log_prob_max_token_len_per_gpu: 24576
     enable_chunked_prefill: true
     calculate_log_probs: true
     layered_summon: false
-    enforce_eager: true
-    free_cache_engine: false
-    enable_sleep_mode: false
+    enforce_eager: false
     agent:
-      num_workers: 8
       default_agent_loop: single_turn_agent
       agent_loop_manager_class: verl_gr.recipes.rankgrpo.rankgrpo_agent_loop.RankGRPOAgentLoopManager
     val_kwargs:
@@ -129,7 +120,7 @@ actor_rollout_ref:
       top_k: -1
     engine_kwargs:
       vllm:
-        disable_custom_all_reduce: false
+        disable_custom_all_reduce: true
         max_logprobs: 20
     profiler:
       enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}
@@ -155,13 +146,13 @@ algorithm:
     normalize_by_std: true
     year_tolerance: 2
     exclude_seen: true
+    gt_catalog_path: null
+    importance_sampling_level: item
+    loss_mode: trl_match
     apply_extra_length_shaping: true
     end_of_list_reward: 0.1
     extra_token_penalty: -0.1
     early_stop_penalty: -0.1
-    gt_catalog_path: null
-    importance_sampling_level: item
-    loss_mode: trl_match
     old_log_prob_mode: current
   rollout_correction:
     rollout_is: null
@@ -173,6 +164,7 @@ trainer:
   project_name: RankGRPO
   experiment_name: rankgrpo_vllm
   val_before_train: false
+  val_compute_actor_loss: false
   default_hdfs_dir: null
   logger: [tensorboard]
   remove_previous_ckpt_in_save: false
@@ -184,7 +176,7 @@ trainer:
   best_ckpt_metric: eval/reward_total
   total_epochs: 1
   nnodes: 1
-  n_gpus_per_node: 2
+  n_gpus_per_node: 4
 
 critic:
   enable: false
@@ -216,3 +208,4 @@ global_profiler:
 ray_init:
   num_cpus: null
   timeline_json_file: null
+
