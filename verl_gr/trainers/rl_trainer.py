@@ -6,6 +6,7 @@ import math
 import os
 import shutil
 from contextlib import contextmanager
+from pathlib import Path
 from typing import Any
 import torch
 import time
@@ -25,7 +26,18 @@ from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_maybe_log_val_generations,
     openonerec_validate,
 )
-from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import compute_rank_grpo_advantage, rankgrpo_enabled
+from verl_gr.recipes.rankgrpo.rankgrpo_algorithm import (
+    compute_rank_grpo_advantage,
+    compute_rank_grpo_training_reward_metrics,
+    rankgrpo_enabled,
+)
+from verl_gr.recipes.rankgrpo.rankgrpo_logprob_metrics import (
+    alignment_report_enabled,
+    calculate_rankgrpo_logprob_gate_metrics,
+    maybe_export_rankgrpo_logprobs,
+    record_rankgrpo_alignment_metrics,
+    write_rankgrpo_alignment_report,
+)
 from verl_gr.recipes.rankgrpo.rankgrpo_trainer import RankGRPOTrainerAdapter
 from verl_gr.trainers.task_adapter import TrainerTaskAdapter
 from verl_gr.workers.rollout.beam_config import (
@@ -170,6 +182,21 @@ def compute_advantage(
     return data
 
 
+def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
+    from verl.trainer.ppo.metric_utils import compute_data_metrics as _base_compute_data_metrics
+
+    metrics = _base_compute_data_metrics(batch=batch, use_critic=use_critic)
+    metrics.update(compute_rank_grpo_training_reward_metrics(batch))
+    metrics.update(calculate_rankgrpo_logprob_gate_metrics(batch))
+    step = batch.meta_info.get("global_steps") if isinstance(getattr(batch, "meta_info", None), dict) else None
+    if step is not None:
+        try:
+            maybe_export_rankgrpo_logprobs(batch, step=int(step))
+        except (TypeError, ValueError):
+            pass
+    return metrics
+
+
 # ---------------------------------------------------------------------------
 # Module-level helpers
 # ---------------------------------------------------------------------------
@@ -229,6 +256,7 @@ class RLTrainer(RayPPOTrainerBase):
             import verl.trainer.ppo.ray_trainer as ray_trainer_mod
 
             ray_trainer_mod.compute_advantage = compute_advantage
+            ray_trainer_mod.compute_data_metrics = compute_data_metrics
 
     def init_workers(self):
         super().init_workers()
@@ -251,23 +279,47 @@ class RLTrainer(RayPPOTrainerBase):
 
     def fit(self):
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
-        if logging_steps <= 1:
-            return super().fit()
+        rankgrpo_report = rankgrpo_enabled(self.config.algorithm) and alignment_report_enabled()
 
         from verl.utils.tracking import Tracking
 
         original_log = Tracking.log
 
-        def log_every_n_steps(tracking_self, data, step, backend=None):
+        def _wrapped_log(tracking_self, data, step, backend=None):
+            if rankgrpo_report and isinstance(data, dict):
+                record_rankgrpo_alignment_metrics(int(step), data)
+            if logging_steps <= 1:
+                return original_log(tracking_self, data=data, step=step, backend=backend)
             if step == 0 or step % logging_steps == 0:
                 return original_log(tracking_self, data=data, step=step, backend=backend)
             return None
 
-        Tracking.log = log_every_n_steps
+        Tracking.log = _wrapped_log
         try:
-            return super().fit()
+            super().fit()
         finally:
             Tracking.log = original_log
+            if rankgrpo_report:
+                report_root = os.environ.get("VERL_GR_ALIGN_REPORT_DIR")
+                if not report_root:
+                    output_dir = _cfg_get(self.config.trainer, "default_local_dir", None)
+                    if output_dir:
+                        report_root = str(Path(output_dir).parent)
+                    else:
+                        report_root = os.environ.get("OUTPUT_DIR")
+                result = write_rankgrpo_alignment_report(
+                    output_dir=report_root,
+                    experiment_name=str(_cfg_get(self.config.trainer, "experiment_name", "")),
+                )
+                if result is not None and os.environ.get("VERL_GR_ALIGN_GATE_EXIT", "1").strip().lower() in {
+                    "1",
+                    "true",
+                    "yes",
+                    "on",
+                }:
+                    _, gate = result
+                    if not gate.passed:
+                        raise SystemExit(2)
 
     def _get_task_adapter(self) -> TrainerTaskAdapter:
         if hasattr(self, "_task_adapter"):
