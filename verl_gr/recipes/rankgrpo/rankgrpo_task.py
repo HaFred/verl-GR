@@ -5,11 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from omegaconf import open_dict
-from verl.single_controller.ray import RayWorkerGroup
-from verl.utils.fs import copy_to_local
-from verl.workers.engine_workers import TrainingWorker
 
-from verl_gr.recipes.rankgrpo.rankgrpo_tokenizer import build_rankgrpo_tokenizer_and_processor
 from verl_gr.recipes.rankgrpo.rankgrpo_worker import RankGRPOActorRolloutRefWorker
 from verl_gr.recipes.task_runtime import RecipeTaskRuntime
 
@@ -22,57 +18,7 @@ class RankGRPOTask(RecipeTaskRuntime):
     def prepare(self, config) -> dict[str, Any]:
         with open_dict(config.actor_rollout_ref):
             config.actor_rollout_ref.rank_grpo = config.algorithm.get("rank_grpo", {}) or {}
-
-        self._configure_training_optimizations(config)
-
-        local_path = copy_to_local(
-            config.actor_rollout_ref.model.path,
-            use_shm=config.actor_rollout_ref.model.get("use_shm", False),
-        )
-        rank_cfg = config.data.get("rankgrpo", {}) or {}
-        built = build_rankgrpo_tokenizer_and_processor(
-            local_path,
-            trust_remote_code=config.data.get("trust_remote_code", False),
-            use_processor=rank_cfg.get("use_processor", False),
-            rank_separator=rank_cfg.get("rank_separator", "\n"),
-            force_pad_to_eos=rank_cfg.get("force_pad_to_eos", True),
-        )
-
-        actor_strategy = self._ensure_role_strategy(config, "actor")
-        if actor_strategy in {"fsdp", "fsdp2", "megatron", "ddp"}:
-            if actor_strategy == "ddp":
-                import verl_gr.workers.engine.ddp  # noqa: F401
-            ray_worker_group_cls = RayWorkerGroup
-            actor_rollout_cls = self.get_actor_rollout_ref_worker(config)
-            critic_worker = TrainingWorker
-        else:
-            raise NotImplementedError(f"Unknown strategy: {actor_strategy or '<missing>'}")
-
-        trust_remote_code = config.data.get("trust_remote_code", False)
-        self.configure_fsdp_wrap_policy(config, local_path, trust_remote_code=trust_remote_code)
-
-        return {
-            "tokenizer": built["tokenizer"],
-            "processor": built["processor"],
-            "rank_separator_token_ids": built["rank_separator_token_ids"],
-            "actor_rollout_cls": actor_rollout_cls,
-            "critic_worker": critic_worker,
-            "reward_model_cfg": None,
-            "ray_worker_group_cls": ray_worker_group_cls,
-        }
-
-    def _configure_training_optimizations(self, config) -> None:
-        """TRL-aligned logprob path: completion-only LM head + no fused logprob kernels."""
-        from verl_gr.workers.engine.minionerec_engine_patch import apply_minionerec_engine_patches
-
-        apply_minionerec_engine_patches()
-        actor_rollout_ref = config.actor_rollout_ref
-
-        with open_dict(actor_rollout_ref.model):
-            actor_rollout_ref.model.use_fused_kernels = False
-
-        # completion_only_logprob is applied on TrainingWorker.engine_config after
-        # init_model in rankgrpo_worker (FSDPActorConfig rejects engine_config in yaml).
+        return super().prepare(config)
 
     def get_actor_rollout_ref_worker(self, config):
         return RankGRPOActorRolloutRefWorker

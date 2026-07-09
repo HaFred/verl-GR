@@ -5,11 +5,16 @@
 # Sets val_before_train=true so the trainer validates then exits.
 #
 # Usage:
-#   bash scripts/eval_sft_onerec.sh <sft_ckpt_path>
+#   bash scripts/misc/sft_eval/eval_sft_onerec.sh <sft_ckpt_path>
 
 set -euo pipefail
 
 SFT_CKPT="${1:?Usage: $0 <sft_ckpt_path>}"
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+VERL_GR_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
+cd "${VERL_GR_ROOT}"
+
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 EVAL_OUTPUT="./outputs/eval_sft_onerec_${TIMESTAMP}"
 

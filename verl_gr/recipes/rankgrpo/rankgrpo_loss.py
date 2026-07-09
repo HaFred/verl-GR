@@ -301,7 +301,8 @@ def rankgrpo_ppo_loss(
             kl_coef=kl_coef,
         )
 
-        # -- aggregate (TRL default loss_type=bnpo → global token-mean; grpo → seq-mean-token-mean) --
+        # -- aggregate (TRL: ((loss*mask).sum(-1) / mask.sum(-1).clamp(min=1)).mean() --
+        #    which is seq-mean-token-mean, matching config.loss_agg_mode)
         pg_loss = agg_loss(
             loss_mat=pg_per_token,
             loss_mask=loss_mask,
@@ -330,17 +331,15 @@ def rankgrpo_ppo_loss(
             policy_loss = policy_loss - config.entropy_coeff * entropy_loss
             metrics["actor/entropy_loss"] = Metric(value=entropy_loss, aggregation=metric_aggregation)
 
-        # KL logging (TRL train/kl = global token-mean over item_token_mask, bnpo style)
+        # KL logging (already baked into pg_per_token above, here just for logging)
         if use_kl and kld is not None:
-            kl_agg_mode = "token-mean" if loss_mode == "trl_match" else loss_agg_mode
             kl_loss = agg_loss(
                 loss_mat=kld,
                 loss_mask=loss_mask,
-                loss_agg_mode=kl_agg_mode,
+                loss_agg_mode=loss_agg_mode,
                 **config.global_batch_info,
             )
             metrics["kl_loss"] = Metric(value=kl_loss, aggregation=metric_aggregation)
-            metrics["train/kl"] = Metric(value=kl_loss, aggregation=metric_aggregation)
             metrics["kl_coef"] = kl_coef
 
         # -- debug metrics --

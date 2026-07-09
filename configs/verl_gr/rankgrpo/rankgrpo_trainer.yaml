@@ -1,5 +1,6 @@
 # @package _global_
 # Rank-GRPO config — composes from upstream PPO trainer config.
+# Compute defaults match workingbranch reference; run_rankgrpo.sh overrides paths/runtime.
 
 hydra:
   searchpath:
@@ -19,7 +20,7 @@ data:
   gen_batch_size: 6
   max_prompt_length: 2048
   prompt_key: prompt
-  shuffle: true
+  shuffle: false
   val_batch_size: 32
   train_max_samples: -1
   val_max_samples: 1600
@@ -54,12 +55,12 @@ actor_rollout_ref:
     entropy_from_logits_with_chunking: true
     log_prob_use_dynamic_bsz: false
     log_prob_micro_batch_size_per_gpu: 32
-    log_prob_max_token_len_per_gpu: 49152
+    log_prob_max_token_len_per_gpu: 40960
     fsdp_config:
       wrap_policy:
         transformer_layer_cls_to_wrap:
           - Qwen2DecoderLayer
-      model_dtype: fp32
+      model_dtype: bfloat16
     profiler:
       enable: ${oc.select:actor_rollout_ref.actor.profiler.enable,false}
       all_ranks: ${oc.select:actor_rollout_ref.actor.profiler.all_ranks,false}
@@ -76,12 +77,12 @@ actor_rollout_ref:
     use_dynamic_bsz: false
     ppo_mini_batch_size: 8
     ppo_micro_batch_size_per_gpu: 32
-    ppo_max_token_len_per_gpu: 49152
+    ppo_max_token_len_per_gpu: 40960
     ppo_epochs: 1
     use_kl_loss: true
     kl_loss_coef: 0.001
     kl_loss_type: low_var_kl
-    loss_agg_mode: token-mean  # TRL default loss_type=bnpo (global token-mean); matches train/kl logging
+    loss_agg_mode: seq-mean-token-mean
     optim:
       lr: 1e-6
       lr_warmup_steps: 0
@@ -107,15 +108,15 @@ actor_rollout_ref:
     top_k: -1
     do_sample: true
     gpu_memory_utilization: 0.25
-    max_num_batched_tokens: 49152
+    max_num_batched_tokens: 40960
     max_num_seqs: 512
     log_prob_use_dynamic_bsz: false
     log_prob_micro_batch_size_per_gpu: 32
-    log_prob_max_token_len_per_gpu: 49152
+    log_prob_max_token_len_per_gpu: 40960
     enable_chunked_prefill: true
     calculate_log_probs: true
     layered_summon: false
-    enforce_eager: true
+    enforce_eager: false
     free_cache_engine: false
     enable_sleep_mode: false
     agent:

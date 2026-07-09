@@ -227,7 +227,7 @@ _ALIGNMENT_CHECKS: list[dict[str, Any]] = [
         "trl_tag": "train/dbg/logp_ref_mean",
         "category": "logprob",
         "aligned_if": lambda v, ref: ref is not None and abs(v - ref) < 0.15,
-        "note": "Ref should use fp32 + completion_only_logprob.",
+        "note": "Ref uses fp32 actor master weights; fork should match actor/ref dtype settings.",
     },
 ]
 
@@ -1129,7 +1129,7 @@ def write_rankgrpo_alignment_report(
         lines.append("")
         if any("KL" in m for m in misaligned):
             lines.append(
-                "- **KL low vs TRL**: verify `completion_only_logprob` on actor+ref engines (YAML + task), "
+                "- **KL low vs TRL**: verify `loss_agg_mode: seq-mean-token-mean` and `loss_mode: trl_match` on the fork, "
                 "ref fp32, item_token_mask KL aggregation; TRL TB may start at step 410 (resume offset)."
             )
         if any("reward" in m.lower() for m in misaligned):
@@ -1147,7 +1147,7 @@ def write_rankgrpo_alignment_report(
     lines.append("## Config checklist")
     lines.append("")
     lines.append("- [ ] `loss_mode: trl_match`, `old_log_prob_mode: current`")
-    lines.append("- [ ] `completion_only_logprob: true` on actor + ref")
+    lines.append("- [ ] `loss_mode: trl_match`, `old_log_prob_mode: current`, `loss_agg_mode: seq-mean-token-mean`")
     lines.append("- [ ] `use_fused_kernels: false`, actor/ref `model_dtype: fp32`")
     lines.append("- [ ] `kl_loss_coef: 0.001`, `low_var_kl`, `importance_sampling_level: item`")
     lines.append("- [ ] `bypass_mode: true` → batch `old_log_probs` is rollout")
