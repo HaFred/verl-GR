@@ -6,10 +6,12 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1}"
 export DS_IGNORE_CUDA_DETECTION="${DS_IGNORE_CUDA_DETECTION:-1}"
 export VLLM_USE_FLASHINFER_SAMPLER="${VLLM_USE_FLASHINFER_SAMPLER:-0}"
 export VLLM_WORKER_MULTIPROC_METHOD="${VLLM_WORKER_MULTIPROC_METHOD:-spawn}"
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 N_GPUS="${N_GPUS:-2}"
 
 SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
+export VERL_GR_ROOT
 PROJECT_ROOT="$(dirname "${VERL_GR_ROOT}")"
 WORKSPACE_ROOT="$(dirname "${PROJECT_ROOT}")"
 RANKGRPO_RECIPE_PATH="${VERL_GR_ROOT}/verl_gr/recipes/rankgrpo/rankgrpo_recipe.py"
@@ -168,6 +170,16 @@ LOGGER_BACKENDS="${LOGGER_BACKENDS:-[tensorboard]}"
 REMOVE_PREVIOUS_CKPT_IN_SAVE="${REMOVE_PREVIOUS_CKPT_IN_SAVE:-False}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
 VERL_GR_DEBUG="${VERL_GR_DEBUG:-0}"
+VERL_GR_CONVERGENCE_GATE="${VERL_GR_CONVERGENCE_GATE:-1}"
+VERL_GR_KL_GROWTH_GATE="${VERL_GR_KL_GROWTH_GATE:-0}"
+VERL_GR_TRL_TB_REF="${VERL_GR_TRL_TB_REF:-${TRL_REF:-}}"
+VERL_GR_CONVERGENCE_STEPS="${VERL_GR_CONVERGENCE_STEPS:-}"
+VERL_GR_KL_GROWTH_FLOORS="${VERL_GR_KL_GROWTH_FLOORS:-}"
+VERL_GR_KL_ABS_FLOORS="${VERL_GR_KL_ABS_FLOORS:-}"
+VERL_GR_EVAL_MAX_LAG="${VERL_GR_EVAL_MAX_LAG:-}"
+export VERL_GR_CONVERGENCE_GATE VERL_GR_KL_GROWTH_GATE VERL_GR_TRL_TB_REF
+export VERL_GR_CONVERGENCE_STEPS VERL_GR_KL_GROWTH_FLOORS VERL_GR_KL_ABS_FLOORS VERL_GR_EVAL_MAX_LAG
+export EXPERIMENT_NAME OUTPUT_DIR
 
 mkdir -p "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 mkdir -p "${TVM_FFI_CACHE_DIR}"
@@ -221,6 +233,11 @@ echo "Save/test freq: ${SAVE_FREQ}/${TEST_FREQ}"
 echo "Logging steps: ${LOGGING_STEPS}"
 echo "Validation generations to log: ${VAL_LOG_GENERATIONS}"
 echo "Best checkpoint pruning: enable=${BEST_CKPT_PRUNE_ENABLE}, keep=${BEST_CKPTS_TO_KEEP}, metric=${BEST_CKPT_METRIC}"
+echo "Convergence gate (exit report): ${VERL_GR_CONVERGENCE_GATE}"
+echo "Online KL watchdog: ${VERL_GR_KL_GROWTH_GATE}"
+if [[ -n "${VERL_GR_TRL_TB_REF}" ]]; then
+  echo "TRL TB reference: ${VERL_GR_TRL_TB_REF}"
+fi
 echo "Debug mode: ${VERL_GR_DEBUG}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray temp dir: ${RAY_TMPDIR}"
@@ -339,8 +356,19 @@ done
   trainer.logger="${LOGGER_BACKENDS}" \
   trainer.remove_previous_ckpt_in_save="${REMOVE_PREVIOUS_CKPT_IN_SAVE}" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VLLM_WORKER_MULTIPROC_METHOD="'${VLLM_WORKER_MULTIPROC_METHOD}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_CUDA_ALLOC_CONF="'${PYTORCH_CUDA_ALLOC_CONF}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE="'${NCCL_IB_DISABLE:-1}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_DEBUG="'${VERL_GR_DEBUG}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_CONVERGENCE_GATE="'${VERL_GR_CONVERGENCE_GATE}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_KL_GROWTH_GATE="'${VERL_GR_KL_GROWTH_GATE}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_TRL_TB_REF="'${VERL_GR_TRL_TB_REF}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_CONVERGENCE_STEPS="'${VERL_GR_CONVERGENCE_STEPS}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_KL_GROWTH_FLOORS="'${VERL_GR_KL_GROWTH_FLOORS}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_KL_ABS_FLOORS="'${VERL_GR_KL_ABS_FLOORS}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_EVAL_MAX_LAG="'${VERL_GR_EVAL_MAX_LAG}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.EXPERIMENT_NAME="'${EXPERIMENT_NAME}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.OUTPUT_DIR="'${OUTPUT_DIR}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_ROOT="'${VERL_GR_ROOT}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.TVM_FFI_CACHE_DIR="'${TVM_FFI_CACHE_DIR}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="'${PYTHONPATH:-}'" \
   $(  # Ray cluster-creation args — only when we aren't connecting to a pre-existing cluster

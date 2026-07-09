@@ -5,6 +5,7 @@ import math
 import os
 import shutil
 import time
+from pathlib import Path
 from typing import Any
 
 import torch
@@ -201,33 +202,68 @@ class RLTrainer(RayPPOTrainerBase):
             ray_trainer_mod.compute_advantage = compute_advantage
             ray_trainer_mod.compute_data_metrics = compute_data_metrics
 
+    def _rankgrpo_gates_enabled(self) -> bool:
+        task_name = str(_cfg_get(_cfg_get(self.config, "task", None), "name", "")).lower()
+        return task_name == "rankgrpo"
+
+    def _maybe_rankgrpo_convergence_gate(self, step: int, metrics: Any) -> None:
+        if not self._rankgrpo_gates_enabled() or not isinstance(metrics, dict):
+            return
+        try:
+            from verl_gr.recipes.rankgrpo.alignment.convergence_gate import (
+                maybe_abort_on_kl_growth_failure,
+            )
+
+            maybe_abort_on_kl_growth_failure(int(step), metrics)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+
+    def _write_rankgrpo_convergence_gate_report(self) -> None:
+        if not self._rankgrpo_gates_enabled():
+            return
+        try:
+            from verl_gr.recipes.rankgrpo.alignment.convergence_gate import (
+                write_convergence_gate_report,
+            )
+
+            trainer_cfg = self.config.trainer
+            experiment_name = str(_cfg_get(trainer_cfg, "experiment_name", ""))
+            default_local_dir = _cfg_get(trainer_cfg, "default_local_dir", None)
+            output_dir = Path(default_local_dir).parent if default_local_dir else Path(
+                os.environ.get("OUTPUT_DIR", ".")
+            )
+            write_convergence_gate_report(
+                output_dir=output_dir,
+                experiment_name=experiment_name,
+            )
+        except Exception:
+            pass
+
     def fit(self):
         logging_steps = self._as_int(_cfg_get(self.config.trainer, "logging_steps", 1), default=1)
         ray_trainer_mod, original_tqdm, progress_tqdm_cls = self._install_latency_adjusted_tqdm()
         self._progress_tqdm_cls = progress_tqdm_cls
-        if logging_steps <= 1:
-            try:
-                return super().fit()
-            finally:
-                ray_trainer_mod.tqdm = original_tqdm
-                self._progress_tqdm_cls = None
 
         from verl.utils.tracking import Tracking
 
         original_log = Tracking.log
 
-        def log_every_n_steps(tracking_self, data, step, backend=None):
+        def _wrapped_log(tracking_self, data, step, backend=None):
             if step == 0 or step % logging_steps == 0:
+                self._maybe_rankgrpo_convergence_gate(int(step), data)
                 return original_log(tracking_self, data=data, step=step, backend=backend)
             return None
 
-        Tracking.log = log_every_n_steps
+        Tracking.log = _wrapped_log
         try:
             return super().fit()
         finally:
             Tracking.log = original_log
             ray_trainer_mod.tqdm = original_tqdm
             self._progress_tqdm_cls = None
+            self._write_rankgrpo_convergence_gate_report()
 
     @staticmethod
     def _install_latency_adjusted_tqdm():
