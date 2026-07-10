@@ -17,6 +17,7 @@ from verl_gr.recipes.rankgrpo.alignment.convergence_gate import (
     ConvergenceStepResult,
     evaluate_convergence_gate,
     maybe_abort_on_kl_growth_failure,
+    maybe_abort_on_length_blowout,
 )
 import verl_gr.recipes.rankgrpo.alignment.convergence_gate as cg
 
@@ -148,3 +149,40 @@ def test_online_watchdog_passes_when_ok(monkeypatch, tmp_path):
     )
     _reset_watchdog_state()
     maybe_abort_on_kl_growth_failure(200, {"actor/train/kl": 0.002}, trl_tb_dir=trl)
+
+
+def test_length_watchdog_aborts_on_low_eos_rate(monkeypatch, tmp_path):
+    monkeypatch.setenv("VERL_GR_LENGTH_GATE", "1")
+    monkeypatch.setenv("VERL_GR_LENGTH_GATE_MIN_STEP", "100")
+    monkeypatch.setenv("OUTPUT_DIR", str(tmp_path))
+    _reset_watchdog_state()
+    with pytest.raises(SystemExit) as exc:
+        maybe_abort_on_length_blowout(
+            200,
+            {
+                "train/rankgrpo/items/eos_rate": 0.0,
+                "train/rankgrpo/completions/clipped_ratio": 1.0,
+                "train/rankgrpo/items/overflow_token_ratio": 0.9,
+            },
+        )
+    assert exc.value.code == 3
+    assert (tmp_path / "logs" / "rankgrpo_length_watchdog.md").is_file()
+
+
+def test_length_watchdog_passes_when_healthy(monkeypatch):
+    monkeypatch.setenv("VERL_GR_LENGTH_GATE", "1")
+    monkeypatch.setenv("VERL_GR_LENGTH_GATE_MIN_STEP", "100")
+    maybe_abort_on_length_blowout(
+        200,
+        {
+            "train/rankgrpo/items/eos_rate": 1.0,
+            "train/rankgrpo/completions/clipped_ratio": 0.0,
+            "train/rankgrpo/items/overflow_token_ratio": 0.0,
+        },
+    )
+
+
+def test_length_watchdog_skips_before_min_step(monkeypatch):
+    monkeypatch.setenv("VERL_GR_LENGTH_GATE", "1")
+    monkeypatch.setenv("VERL_GR_LENGTH_GATE_MIN_STEP", "500")
+    maybe_abort_on_length_blowout(200, {"train/rankgrpo/items/eos_rate": 0.0})

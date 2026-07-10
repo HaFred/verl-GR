@@ -20,7 +20,7 @@ data:
   val_batch_size: 32
   train_max_samples: -1
   val_max_samples: 1600
-  max_response_length: 1024
+  max_response_length: 512
   filter_overlong_prompts: true
   filter_overlong_prompts_workers: 16
   truncation: error
@@ -70,7 +70,7 @@ actor_rollout_ref:
     ppo_micro_batch_size_per_gpu: 32  # 4 prompts × 8 rollouts = 32 seq/GPU, matches TRL's per_device_train_batch_size=4
     ppo_max_token_len_per_gpu: 40960
     use_kl_loss: true
-    kl_loss_coef: 0.001
+    kl_loss_coef: 0.003
     kl_loss_type: low_var_kl  # verl's k3 estimator: exp(ref-log) - (ref-log) - 1, same as reference TRL
     loss_agg_mode: seq-mean-token-mean  # match reference: equal weight per sequence, not per token
     optim:
@@ -148,7 +148,7 @@ algorithm:
     exclude_seen: true
     apply_extra_length_shaping: true
     end_of_list_reward: 0.1
-    extra_token_penalty: -0.1
+    extra_token_penalty: -0.3
     early_stop_penalty: -0.1
     gt_catalog_path: null
     importance_sampling_level: item

@@ -212,9 +212,11 @@ class RLTrainer(RayPPOTrainerBase):
         try:
             from verl_gr.recipes.rankgrpo.alignment.convergence_gate import (
                 maybe_abort_on_kl_growth_failure,
+                maybe_abort_on_length_blowout,
             )
 
             maybe_abort_on_kl_growth_failure(int(step), metrics)
+            maybe_abort_on_length_blowout(int(step), metrics)
         except SystemExit:
             raise
         except Exception:

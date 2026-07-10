@@ -89,6 +89,9 @@ def build_trl_completion_mask(response_ids: list[int], eos_token_id: int | list[
     return mask[0].tolist()
 
 
+from verl_gr.recipes.rankgrpo.rankgrpo_rollout_utils import maybe_truncate_rankgrpo_response
+
+
 def _mask_rollout_logprobs(
     response_logprobs: list[float] | None,
     response_mask: list[int],
@@ -205,6 +208,12 @@ class RankGRPOAgentLoopWorker(AgentLoopWorker):
         outputs = []
         for token_output in token_outputs:
             response_ids = token_output.token_ids[: self.rollout_config.response_length]
+            response_ids = maybe_truncate_rankgrpo_response(
+                response_ids,
+                self.tokenizer,
+                eos_token_id=eos_token_id,
+            )
+            response_ids = response_ids[: self.rollout_config.response_length]
             response_mask = build_trl_completion_mask(response_ids, eos_token_id)
             response_logprobs = _mask_rollout_logprobs(
                 (

@@ -7,6 +7,11 @@ Two layers:
 
 2. **KL growth early-stop** (``maybe_abort_on_kl_growth_failure``): during long runs,
    abort if fork KL stays far below TRL (policy not moving) or eval lags TRL badly.
+
+3. **Length blowout early-stop** (``maybe_abort_on_length_blowout``): abort when
+   ``eos_rate`` collapses, ``clip_ratio`` spikes, or ``overflow_token_ratio`` grows.
+   Disable with ``VERL_GR_LENGTH_GATE=0``.
+
    Cost: O(1) dict lookup per logging step; optional TB read of TRL ref once per gate step.
 
 This is **not** the step-30 sidecar / ``VERL_GR_ALIGN_DEBUG`` path (replay, fingerprint,
@@ -58,6 +63,12 @@ _FORK_ROLLOUT_GAP_KEYS = (
     "logprob_gate/actor_minus_rollout/abs_mean",
     "actor/debug/logprob_diff_abs",
 )
+_FORK_EOS_RATE_KEYS = ("train/rankgrpo/items/eos_rate",)
+_FORK_CLIP_RATIO_KEYS = (
+    "response_length/clip_ratio",
+    "train/rankgrpo/completions/clipped_ratio",
+)
+_FORK_OVERFLOW_RATIO_KEYS = ("train/rankgrpo/items/overflow_token_ratio",)
 _TRL_KL_TAG = "train/kl"
 _TRL_EVAL_TAG = "eval/reward_total"
 _TRL_KL_CACHE: dict[int, float] | None = None
@@ -334,6 +345,9 @@ def _write_online_abort_report(
     fork_eval: float | None,
     trl_eval: float | None,
     rollout_gap: float | None,
+    report_name: str = "rankgrpo_online_watchdog.md",
+    title: str = "RankGRPO Online Watchdog — ABORT",
+    disable_note: str = "Disable online abort: `VERL_GR_KL_GROWTH_GATE=0`.",
 ) -> Path | None:
     global _ABORT_REPORT_WRITTEN
     if _ABORT_REPORT_WRITTEN:
@@ -341,9 +355,9 @@ def _write_online_abort_report(
     out_root = Path(os.environ.get("OUTPUT_DIR", "") or ".")
     log_dir = out_root / "logs"
     log_dir.mkdir(parents=True, exist_ok=True)
-    path = log_dir / "rankgrpo_online_watchdog.md"
+    path = log_dir / report_name
     lines = [
-        "# RankGRPO Online Watchdog — ABORT",
+        f"# {title}",
         "",
         f"- generated: {datetime.now(timezone.utc).isoformat()}",
         f"- experiment: {os.environ.get('EXPERIMENT_NAME', 'unknown')}",
@@ -366,7 +380,7 @@ def _write_online_abort_report(
             "",
             "- This is the **online** early-stop path (logging-step O(1) checks).",
             "- Exit-time `rankgrpo_convergence_gate.md` is offline-only and does not abort.",
-            "- Disable online abort: `VERL_GR_KL_GROWTH_GATE=0`.",
+            f"- {disable_note}",
             "",
         ]
     )
@@ -478,6 +492,90 @@ def maybe_abort_on_kl_growth_failure(
         fork_eval=fork_eval,
         trl_eval=trl_eval,
         rollout_gap=rollout_gap,
+    )
+    raise SystemExit(3)
+
+
+def _length_gate_enabled() -> bool:
+    return os.environ.get("VERL_GR_LENGTH_GATE", "1").strip().lower() not in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
+
+
+def _length_gate_min_step() -> int:
+    try:
+        return int(os.environ.get("VERL_GR_LENGTH_GATE_MIN_STEP", "200"))
+    except ValueError:
+        return 200
+
+
+def _length_gate_float(env_name: str, default: float) -> float:
+    raw = os.environ.get(env_name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        return default
+
+
+def maybe_abort_on_length_blowout(step: int, metrics: dict[str, Any]) -> None:
+    """Abort when rollout completions show length blowout (no EOS, max-length clip, overflow).
+
+    Monitors every logging step after ``VERL_GR_LENGTH_GATE_MIN_STEP`` (default 200).
+    Disable with ``VERL_GR_LENGTH_GATE=0``.
+    """
+    if not _length_gate_enabled() or step < _length_gate_min_step():
+        return
+
+    eos_rate = _metric_float(metrics, _FORK_EOS_RATE_KEYS)
+    clip_ratio = _metric_float(metrics, _FORK_CLIP_RATIO_KEYS)
+    overflow_ratio = _metric_float(metrics, _FORK_OVERFLOW_RATIO_KEYS)
+    if eos_rate is None and clip_ratio is None and overflow_ratio is None:
+        return
+
+    min_eos = _length_gate_float("VERL_GR_MIN_EOS_RATE", 0.5)
+    max_clip = _length_gate_float("VERL_GR_MAX_CLIP_RATIO", 0.1)
+    max_overflow = _length_gate_float("VERL_GR_MAX_OVERFLOW_RATIO", 0.2)
+
+    reasons: list[str] = []
+    if eos_rate is not None and eos_rate < min_eos:
+        reasons.append(f"eos_rate too low: {eos_rate:.4f} < {min_eos}")
+    if clip_ratio is not None and clip_ratio > max_clip:
+        reasons.append(f"clip_ratio too high: {clip_ratio:.4f} > {max_clip}")
+    if overflow_ratio is not None and overflow_ratio > max_overflow:
+        reasons.append(f"overflow_token_ratio too high: {overflow_ratio:.4f} > {max_overflow}")
+
+    if not reasons:
+        bits = [f"@step {step}"]
+        if eos_rate is not None:
+            bits.append(f"eos_rate={eos_rate:.4f}")
+        if clip_ratio is not None:
+            bits.append(f"clip_ratio={clip_ratio:.4f}")
+        if overflow_ratio is not None:
+            bits.append(f"overflow_ratio={overflow_ratio:.4f}")
+        print(f"[rankgrpo] length watchdog OK: {', '.join(bits)}", flush=True)
+        return
+
+    msg = (
+        f"[rankgrpo] length watchdog FAILED @step {step}: "
+        + "; ".join(reasons)
+        + ". Aborting to prevent runaway completions. Disable with VERL_GR_LENGTH_GATE=0."
+    )
+    print(msg, flush=True)
+    _write_online_abort_report(
+        trl_step=step,
+        reasons=reasons,
+        fork_kl=_metric_float(metrics, _FORK_KL_KEYS),
+        trl_kl=None,
+        fork_eval=_metric_float(metrics, _FORK_EVAL_KEYS),
+        trl_eval=None,
+        rollout_gap=_metric_float(metrics, _FORK_ROLLOUT_GAP_KEYS),
+        report_name="rankgrpo_length_watchdog.md",
+        title="RankGRPO Length Blowout Watchdog",
     )
     raise SystemExit(3)
 
