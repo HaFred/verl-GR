@@ -34,6 +34,12 @@ if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
 fi
 
+if [[ -n "${VERL_LIB_PATH}" ]]; then
+  export PYTHONPATH="${VERL_GR_ROOT}:${VERL_LIB_PATH}:${PYTHONPATH:-}"
+else
+  export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
+fi
+
 # If the caller set RAY_ADDRESS (for an isolated per-run Ray cluster), keep it.
 # Otherwise clear it so Ray auto-detects or starts a default local cluster.
 if [[ -n "${RAY_ADDRESS:-}" ]]; then
@@ -182,7 +188,8 @@ GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
 VERL_GR_DEBUG="${VERL_GR_DEBUG:-0}"
 
 # ---- Debug alignment gate (RUN_DEBUG_STEP) ----
-_DEFAULT_TRL_TB_REF="/home/dyvm6xra/dyvm6xrauser45/fred/local_backup/Rank-GRPO/logs/debug_precision_verlgr/runs/Jul06_12-05-38_hk01dgx028"
+_DEFAULT_TRL_TB_REF="/home/dyvm6xra/dyvm6xrauser45/fred/local_backup/Rank-GRPO/logs/debug_precision_verlgr/runs/Jul07_03-56-22_hk01dgx028"
+_DEFAULT_TRL_TRAIN_LOG="/home/dyvm6xra/dyvm6xrauser45/fred/local_backup/Rank-GRPO/logs/debug_precision_verlgr/train_20260707_035454_gpus6,7.log"
 _DEBUG_ALIGN=0
 _DEBUG_EXTRA_ARGS=()
 if [[ -n "${RUN_DEBUG_STEP:-}" && "${RUN_DEBUG_STEP}" != "None" && "${RUN_DEBUG_STEP}" =~ ^[0-9]+$ && "${RUN_DEBUG_STEP}" -gt 0 ]]; then
@@ -195,17 +202,22 @@ if [[ -n "${RUN_DEBUG_STEP:-}" && "${RUN_DEBUG_STEP}" != "None" && "${RUN_DEBUG_
   export VERL_GR_TRL_TB_REF="${VERL_GR_TRL_TB_REF:-${TRL_REF}}"
   export VERL_GR_ALIGN_REPORT_DIR="${VERL_GR_ALIGN_REPORT_DIR:-${OUTPUT_DIR}}"
   export VERL_GR_ALIGN_GATE_EXIT="${VERL_GR_ALIGN_GATE_EXIT:-1}"
+  export VERL_GR_ALIGN_LOGGING_STEPS="${VERL_GR_ALIGN_LOGGING_STEPS:-1}"
   export VERL_GR_TRL_RESUME_OFFSET="${VERL_GR_TRL_RESUME_OFFSET:-0}"
   export VERL_GR_TRL_GATE_SIDECAR="${VERL_GR_TRL_GATE_SIDECAR:-${VERL_GR_ALIGN_REPORT_DIR}/rankgrpo_gate_sidecar.json}"
 
   # TRL tqdm s/it benchmark (parsed from train log, not TensorBoard).
   if [[ -z "${VERL_GR_TRL_TRAIN_LOG:-}" ]]; then
-    _trl_debug_root="$(dirname "$(dirname "${VERL_GR_TRL_TB_REF}")")"
-    shopt -s nullglob
-    _trl_logs=( "${_trl_debug_root}"/train_*.log )
-    shopt -u nullglob
-    if (( ${#_trl_logs[@]} > 0 )); then
-      export VERL_GR_TRL_TRAIN_LOG="${_trl_logs[0]}"
+    if [[ -f "${_DEFAULT_TRL_TRAIN_LOG}" ]]; then
+      export VERL_GR_TRL_TRAIN_LOG="${_DEFAULT_TRL_TRAIN_LOG}"
+    else
+      _trl_debug_root="$(dirname "$(dirname "${VERL_GR_TRL_TB_REF}")")"
+      shopt -s nullglob
+      _trl_logs=( "${_trl_debug_root}"/train_*.log )
+      shopt -u nullglob
+      if (( ${#_trl_logs[@]} > 0 )); then
+        export VERL_GR_TRL_TRAIN_LOG="${_trl_logs[0]}"
+      fi
     fi
   else
     export VERL_GR_TRL_TRAIN_LOG
@@ -244,11 +256,6 @@ mkdir -p "${TVM_FFI_CACHE_DIR}"
 
 TENSORBOARD_DIR="${TENSORBOARD_DIR:-${OUTPUT_DIR}/tensorboard}"
 export TENSORBOARD_DIR
-if [[ -n "${VERL_LIB_PATH}" ]]; then
-  export PYTHONPATH="${VERL_GR_ROOT}:${VERL_LIB_PATH}:${PYTHONPATH:-}"
-else
-  export PYTHONPATH="${VERL_GR_ROOT}:${PYTHONPATH:-}"
-fi
 export WANDB_MODE
 export RAY_TMPDIR
 export TVM_FFI_CACHE_DIR
@@ -293,7 +300,7 @@ echo "Logging steps: ${LOGGING_STEPS}"
 echo "Validation generations to log: ${VAL_LOG_GENERATIONS}"
 echo "Best checkpoint pruning: enable=${BEST_CKPT_PRUNE_ENABLE}, keep=${BEST_CKPTS_TO_KEEP}, metric=${BEST_CKPT_METRIC}"
 if (( _DEBUG_ALIGN )); then
-  echo "Alignment gate: RUN_DEBUG_STEP=${RUN_DEBUG_STEP} (logprob + KL per-step, step-time avg vs TRL tqdm)"
+  echo "Alignment gate: RUN_DEBUG_STEP=${RUN_DEBUG_STEP} (logprob + KL per-step, step-time avg vs TRL tqdm, modular timing_s/* report)"
   echo "  TRL TB reference: ${VERL_GR_TRL_TB_REF}"
   echo "  TRL gate sidecar: ${VERL_GR_TRL_GATE_SIDECAR}"
   if [[ -n "${VERL_GR_TRL_TRAIN_LOG:-}" ]]; then
@@ -379,7 +386,7 @@ done
   actor_rollout_ref.rollout.tensor_model_parallel_size="${ROLLOUT_TENSOR_PARALLEL_SIZE}" \
   actor_rollout_ref.rollout.calculate_log_probs="${ROLLOUT_CALCULATE_LOG_PROBS}" \
   actor_rollout_ref.rollout.free_cache_engine="${ROLLOUT_FREE_CACHE_ENGINE}" \
-  +actor_rollout_ref.rollout.enable_sleep_mode="${ROLLOUT_ENABLE_SLEEP_MODE}" \
+  actor_rollout_ref.rollout.enable_sleep_mode="${ROLLOUT_ENABLE_SLEEP_MODE}" \
   actor_rollout_ref.model.path="${BASE_MODEL}" \
   actor_rollout_ref.model.enable_activation_offload="${ENABLE_ACTIVATION_OFFLOAD}" \
   actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING}" \

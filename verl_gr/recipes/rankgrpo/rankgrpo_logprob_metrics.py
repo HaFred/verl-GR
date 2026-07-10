@@ -13,10 +13,10 @@ import numpy as np
 import torch
 from verl import DataProto
 
-# TRL reference: fresh 200-step precision debug (override via VERL_GR_TRL_TB_REF).
+# TRL reference: 30-step precision sidecar (override via TRL_REF / VERL_GR_TRL_TB_REF).
 _DEFAULT_TRL_TB = (
     "/home/dyvm6xra/dyvm6xrauser45/fred/local_backup/Rank-GRPO/"
-    "logs/debug_precision_verlgr/runs/Jul06_12-05-38_hk01dgx028"
+    "logs/debug_precision_verlgr/runs/Jul07_03-56-22_hk01dgx028"
 )
 # Legacy resumed TRL run (step offset ≈ 410); use only when VERL_GR_TRL_TB_REF points there.
 _LEGACY_TRL_TB = (
@@ -62,8 +62,574 @@ _GATE_KL_CHECK: dict[str, Any] = {
     "trl_tags": ["train/kl"],
 }
 
+# Verdict table: pass when pass / (pass + fail) >= this fraction (warmup rows count as skip).
+_GATE_MIN_PASS_FRACTION = 2 / 3
+
 _FORK_STEP_TIME_KEYS = ["timing_s/step", "perf/time_per_step"]
 _TRL_STEP_TIME_TAGS = ["train/train_steps_per_second", "train/step_time", "timing_s/step"]
+
+# Modular step latency (RUN_DEBUG_STEP only): verl `timing_s/*` keys from ray_trainer.
+_STEP_LATENCY_PHASES: tuple[tuple[str, str], ...] = (
+    ("gen (vLLM rollout)", "gen"),
+    ("update_actor (FSDP train step)", "update_actor"),
+    ("update_weights (actor → rollout sync)", "update_weights"),
+    ("old_log_prob", "old_log_prob"),
+    ("ref", "ref"),
+    ("adv", "adv"),
+    ("reward", "reward"),
+)
+_STEP_LATENCY_OTHER_KEYS: frozenset[str] = frozenset(
+    {
+        "start_profile",
+        "stop_profile",
+        "gen_max",
+        "values",
+        "update_critic",
+        "testing",
+        "save_checkpoint",
+        "dump_rollout_generations",
+    }
+)
+
+
+@dataclass
+class ModularStepLatencyRow:
+    phase: str
+    fork_seconds: float | None
+    fork_pct: float | None
+    trl_seconds: float | None
+    trl_estimated: bool
+    delta_seconds: float | None
+
+
+@dataclass
+class ModularStepLatencySummary:
+    rows: list[ModularStepLatencyRow]
+    fork_total_seconds: float | None
+    trl_total_seconds: float | None
+    other_seconds: float | None
+    other_pct: float | None
+    n_steps: int
+    step_range: str
+    trl_step_time_source: str | None = None
+
+
+@dataclass
+class SidecarProbeOverheadRow:
+    component: str
+    mean_seconds: float | None
+    notes: str = ""
+
+
+@dataclass
+class SidecarProbeOverheadSummary:
+    step_distribution: dict[str, float]
+    probe_rows: list[SidecarProbeOverheadRow]
+    measured_probe_total: float | None
+    modular_other_seconds: float | None
+    logging_steps: int
+    prod_logging_steps: int
+    estimated_prod_step_seconds: float | None
+    trl_reference_seconds: float | None
+    n_steps: int
+    step_range: str
+    incomplete_run_note: str | None = None
+
+
+_PROBE_TIMING_KEYS: tuple[tuple[str, str], ...] = (
+    ("logprob gate metrics", "timing_rankgrpo/probe_logprob_gate"),
+    ("alignment accumulator", "timing_rankgrpo/probe_align_accum"),
+    ("TensorBoard flush (logging_steps=1)", "timing_rankgrpo/probe_tb_log"),
+)
+
+
+def modular_step_latency_enabled() -> bool:
+    """True only during RUN_DEBUG_STEP sidecar alignment runs."""
+    return alignment_report_enabled()
+
+
+def _fork_timing_tag(phase_key: str) -> str:
+    return f"timing_s/{phase_key}"
+
+
+def _mean_fork_timing_values(
+    acc: RankGRPOAlignmentAccumulator,
+    timing_tag: str,
+    compare_steps: list[int],
+    *,
+    skip_warmup_steps: int,
+) -> float | None:
+    vals: list[float] = []
+    for step in compare_steps:
+        if step <= skip_warmup_steps:
+            continue
+        raw = acc.metrics_by_step.get(step, {}).get(timing_tag)
+        if raw is not None:
+            vals.append(float(raw))
+    return float(np.mean(vals)) if vals else None
+
+
+def _mean_fork_timing_phase(
+    acc: RankGRPOAlignmentAccumulator,
+    phase_key: str,
+    compare_steps: list[int],
+    *,
+    skip_warmup_steps: int,
+) -> float | None:
+    return _mean_fork_timing_values(
+        acc,
+        _fork_timing_tag(phase_key),
+        compare_steps,
+        skip_warmup_steps=skip_warmup_steps,
+    )
+
+
+def _mean_other_overhead_seconds(
+    acc: RankGRPOAlignmentAccumulator,
+    compare_steps: list[int],
+    *,
+    skip_warmup_steps: int,
+    accounted_phase_keys: tuple[str, ...],
+) -> float | None:
+    vals: list[float] = []
+    for step in compare_steps:
+        if step <= skip_warmup_steps:
+            continue
+        metrics = acc.metrics_by_step.get(step, {})
+        step_total = _pick_metric(metrics, _FORK_STEP_TIME_KEYS)
+        if step_total is None:
+            continue
+        accounted = 0.0
+        for key in accounted_phase_keys:
+            tag = _fork_timing_tag(key)
+            if tag in metrics:
+                accounted += float(metrics[tag])
+        for tag, value in metrics.items():
+            if not tag.startswith("timing_s/"):
+                continue
+            phase = tag.removeprefix("timing_s/")
+            if phase in ("step",) or phase in _STEP_LATENCY_OTHER_KEYS:
+                continue
+            if phase in accounted_phase_keys:
+                continue
+            accounted += float(value)
+        other = max(0.0, float(step_total) - accounted)
+        vals.append(other)
+    return float(np.mean(vals)) if vals else None
+
+
+def compute_modular_step_latency_summary(
+    acc: RankGRPOAlignmentAccumulator,
+    *,
+    trl_tb_dir: str | Path | None = None,
+    compare_steps: list[int] | None = None,
+    skip_warmup_steps: int = 1,
+) -> ModularStepLatencySummary | None:
+    """Mean per-phase `timing_s/*` from fork TB metrics (RUN_DEBUG_STEP runs only)."""
+
+    if not modular_step_latency_enabled():
+        return None
+
+    steps = compare_steps if compare_steps is not None else sorted(acc.steps)
+    if not steps:
+        return None
+
+    trl_dir = _resolve_trl_tb_dir(trl_tb_dir)
+    trl_total, trl_source = _trl_reference_step_time(trl_dir)
+    trl_total_for_steps = _trl_avg_step_time_for_steps(
+        trl_dir,
+        steps,
+        skip_warmup_steps=skip_warmup_steps,
+        fallback=trl_total,
+    )
+    if trl_total_for_steps is not None:
+        trl_total = trl_total_for_steps
+
+    fork_total = _mean_fork_timing_values(
+        acc,
+        "timing_s/step",
+        steps,
+        skip_warmup_steps=skip_warmup_steps,
+    )
+    if fork_total is None:
+        fork_total = _fork_avg_step_time(acc, steps, skip_warmup_steps=skip_warmup_steps)
+
+    phase_keys = tuple(key for _, key in _STEP_LATENCY_PHASES)
+    rows: list[ModularStepLatencyRow] = []
+    accounted_sum = 0.0
+    for label, key in _STEP_LATENCY_PHASES:
+        fork_s = _mean_fork_timing_phase(acc, key, steps, skip_warmup_steps=skip_warmup_steps)
+        fork_pct = (100.0 * fork_s / fork_total) if fork_s is not None and fork_total and fork_total > 0 else None
+        trl_s: float | None = None
+        trl_est = False
+        if fork_s is not None and trl_total is not None and fork_total and fork_total > 0:
+            trl_s = trl_total * (fork_s / fork_total)
+            trl_est = True
+        elif key == "step" and trl_total is not None:
+            trl_s = trl_total
+            trl_est = False
+        delta = (fork_s - trl_s) if fork_s is not None and trl_s is not None else None
+        if fork_s is not None:
+            accounted_sum += fork_s
+        rows.append(
+            ModularStepLatencyRow(
+                phase=label,
+                fork_seconds=fork_s,
+                fork_pct=fork_pct,
+                trl_seconds=trl_s,
+                trl_estimated=trl_est,
+                delta_seconds=delta,
+            )
+        )
+
+    other_s = _mean_other_overhead_seconds(
+        acc,
+        steps,
+        skip_warmup_steps=skip_warmup_steps,
+        accounted_phase_keys=phase_keys,
+    )
+    if other_s is None and fork_total is not None:
+        other_s = max(0.0, fork_total - accounted_sum)
+    other_pct = (100.0 * other_s / fork_total) if other_s is not None and fork_total and fork_total > 0 else None
+    trl_other = (trl_total * (other_s / fork_total)) if other_s is not None and trl_total and fork_total and fork_total > 0 else None
+    rows.append(
+        ModularStepLatencyRow(
+            phase="Other/overhead",
+            fork_seconds=other_s,
+            fork_pct=other_pct,
+            trl_seconds=trl_other,
+            trl_estimated=trl_other is not None,
+            delta_seconds=(other_s - trl_other) if other_s is not None and trl_other is not None else None,
+        )
+    )
+
+    used_steps = [s for s in steps if s > skip_warmup_steps]
+    step_range = f"{used_steps[0]}–{used_steps[-1]}" if used_steps else "—"
+
+    rows.append(
+        ModularStepLatencyRow(
+            phase="**Total logged step**",
+            fork_seconds=fork_total,
+            fork_pct=100.0 if fork_total is not None else None,
+            trl_seconds=trl_total,
+            trl_estimated=False,
+            delta_seconds=(fork_total - trl_total) if fork_total is not None and trl_total is not None else None,
+        )
+    )
+
+    return ModularStepLatencySummary(
+        rows=rows,
+        fork_total_seconds=fork_total,
+        trl_total_seconds=trl_total,
+        other_seconds=other_s,
+        other_pct=other_pct,
+        n_steps=len(used_steps),
+        step_range=step_range,
+        trl_step_time_source=trl_source,
+    )
+
+
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.2f}s"
+
+
+def _format_delta_seconds(value: float | None) -> str:
+    if value is None:
+        return "—"
+    sign = "+" if value >= 0 else ""
+    return f"{sign}{value:.2f}s"
+
+
+def format_modular_step_latency_markdown(summary: ModularStepLatencySummary | None) -> list[str]:
+    if summary is None:
+        return []
+
+    lines: list[str] = []
+    lines.append("## Modular step latency (measured)")
+    lines.append("")
+    lines.append(
+        f"Mean `timing_s/*` over fork steps **{summary.step_range}** "
+        f"(n={summary.n_steps}, warmup skipped). "
+        "Enabled only when `RUN_DEBUG_STEP` is set."
+    )
+    if summary.trl_step_time_source:
+        lines.append(f"TRL total step time: {summary.trl_step_time_source}.")
+    lines.append(
+        "Per-phase TRL times are **pro-rata estimates** "
+        "`TRL_total × (fork_phase / fork_total)` — TRL does not log modular `timing_s/*`."
+    )
+    lines.append("")
+    lines.append("| Phase | verl-gr Time | TRL Time | Delta Step Time |")
+    lines.append("|-------|--------------|----------|-----------------|")
+    for row in summary.rows:
+        fork_cell = _format_seconds(row.fork_seconds)
+        if row.fork_pct is not None and row.phase != "**Total logged step**":
+            fork_cell = f"{fork_cell} ({row.fork_pct:.0f}%)"
+        trl_cell = _format_seconds(row.trl_seconds)
+        if row.trl_estimated and row.trl_seconds is not None:
+            trl_cell += "†"
+        lines.append(
+            f"| {row.phase} | {fork_cell} | {trl_cell} | {_format_delta_seconds(row.delta_seconds)} |"
+        )
+    lines.append("")
+    lines.append("† TRL phase time estimated pro-rata from total step time (tqdm / TB).")
+    lines.append(
+        "Eval (`timing_s/testing`) and checkpoint (`timing_s/save_checkpoint`) are excluded "
+        "from this per-step training breakdown."
+    )
+    lines.append("")
+    return lines
+
+
+def _step_time_distribution(
+    acc: RankGRPOAlignmentAccumulator,
+    compare_steps: list[int],
+    *,
+    skip_warmup_steps: int,
+) -> dict[str, float]:
+    vals: list[float] = []
+    for step in compare_steps:
+        if step <= skip_warmup_steps:
+            continue
+        raw = _pick_metric(acc.metrics_by_step.get(step, {}), _FORK_STEP_TIME_KEYS)
+        if raw is not None:
+            vals.append(float(raw))
+    if not vals:
+        return {}
+    arr = np.asarray(vals, dtype=np.float64)
+    return {
+        "mean": float(np.mean(arr)),
+        "std": float(np.std(arr)),
+        "min": float(np.min(arr)),
+        "p50": float(np.percentile(arr, 50)),
+        "p90": float(np.percentile(arr, 90)),
+        "max": float(np.max(arr)),
+    }
+
+
+def merge_sidecar_probe_timings(step: int, timings: dict[str, float]) -> None:
+    """Merge per-step probe timings into the alignment accumulator (sidecar runs)."""
+    if not alignment_report_enabled():
+        return
+    bucket = _ALIGNMENT_ACCUMULATOR.metrics_by_step.get(step)
+    if bucket is None:
+        return
+    bucket.update(timings)
+
+
+def compute_sidecar_probe_overhead_summary(
+    acc: RankGRPOAlignmentAccumulator,
+    *,
+    compare_steps: list[int] | None = None,
+    latency_summary: ModularStepLatencySummary | None = None,
+    trl_tb_dir: str | Path | None = None,
+    skip_warmup_steps: int = 1,
+    logging_steps: int | None = None,
+    prod_logging_steps: int = 10,
+) -> SidecarProbeOverheadSummary | None:
+    if not modular_step_latency_enabled():
+        return None
+
+    steps = compare_steps if compare_steps is not None else sorted(acc.steps)
+    if not steps:
+        return None
+
+    used_steps = [s for s in steps if s > skip_warmup_steps]
+    step_range = f"{used_steps[0]}–{used_steps[-1]}" if used_steps else "—"
+    dist = _step_time_distribution(acc, steps, skip_warmup_steps=skip_warmup_steps)
+
+    probe_rows: list[SidecarProbeOverheadRow] = []
+    for label, key in _PROBE_TIMING_KEYS:
+        mean_s = _mean_fork_timing_values(acc, key, steps, skip_warmup_steps=skip_warmup_steps)
+        notes = ""
+        if mean_s is None and key == "timing_rankgrpo/probe_tb_log":
+            notes = "not instrumented in this run"
+        probe_rows.append(SidecarProbeOverheadRow(component=label, mean_seconds=mean_s, notes=notes))
+
+    modular_other = latency_summary.other_seconds if latency_summary is not None else None
+    measured_components = [row.mean_seconds for row in probe_rows if row.mean_seconds is not None]
+    measured_any = bool(measured_components)
+    measured_total = float(sum(measured_components)) if measured_any else None
+
+    if measured_total is None and modular_other is not None and modular_other > 0.01:
+        measured_total = modular_other
+        measured_any = True
+
+    sidecar_logging_steps = logging_steps
+    if sidecar_logging_steps is None:
+        try:
+            sidecar_logging_steps = int(os.environ.get("VERL_GR_ALIGN_LOGGING_STEPS", "1") or "1")
+        except ValueError:
+            sidecar_logging_steps = 1
+
+    mean_step = dist.get("mean")
+    estimated_prod: float | None = None
+    if mean_step is not None and measured_any:
+        estimated_prod = max(0.0, mean_step - measured_total)
+        tb_mean = next(
+            (row.mean_seconds for row in probe_rows if row.component.startswith("TensorBoard")),
+            None,
+        )
+        if tb_mean is not None and sidecar_logging_steps == 1 and prod_logging_steps > 1:
+            estimated_prod = max(
+                0.0,
+                mean_step - (measured_total - tb_mean + tb_mean / prod_logging_steps),
+            )
+
+    trl_dir = _resolve_trl_tb_dir(trl_tb_dir)
+    trl_total, _ = _trl_reference_step_time(trl_dir)
+    trl_for_steps = _trl_avg_step_time_for_steps(
+        trl_dir,
+        steps,
+        skip_warmup_steps=skip_warmup_steps,
+        fallback=trl_total,
+    )
+    if trl_for_steps is not None:
+        trl_total = trl_for_steps
+
+    incomplete_note: str | None = None
+    try:
+        expected = int(os.environ.get("RUN_DEBUG_STEP", "0") or "0")
+    except ValueError:
+        expected = 0
+    last_step = acc.last_step()
+    if expected > 0 and last_step is not None and last_step < expected:
+        incomplete_note = (
+            f"Run incomplete: logged through step {last_step}, expected {expected}. "
+            "Gate/latency stats use available steps only."
+        )
+
+    return SidecarProbeOverheadSummary(
+        step_distribution=dist,
+        probe_rows=probe_rows,
+        measured_probe_total=measured_total if measured_any else None,
+        modular_other_seconds=modular_other,
+        logging_steps=sidecar_logging_steps,
+        prod_logging_steps=prod_logging_steps,
+        estimated_prod_step_seconds=estimated_prod,
+        trl_reference_seconds=trl_total,
+        n_steps=len(used_steps),
+        step_range=step_range,
+        incomplete_run_note=incomplete_note,
+    )
+
+
+def format_sidecar_probe_overhead_markdown(summary: SidecarProbeOverheadSummary | None) -> list[str]:
+    if summary is None:
+        return []
+
+    lines: list[str] = []
+    lines.append("## Sidecar probe overhead & step-time distribution")
+    lines.append("")
+    lines.append(
+        "Separates **sidecar-only** work (logprob probes, alignment accumulator, per-step TB) "
+        f"from modular `timing_s/*` training phases. Sidecar uses `logging_steps={summary.logging_steps}`; "
+        f"production long runs typically use `logging_steps={summary.prod_logging_steps}`."
+    )
+    if summary.incomplete_run_note:
+        lines.append(f"- **Note:** {summary.incomplete_run_note}")
+    lines.append("")
+
+    if summary.step_distribution:
+        d = summary.step_distribution
+        lines.append(
+            f"`timing_s/step` distribution over steps **{summary.step_range}** "
+            f"(n={summary.n_steps}, warmup skipped): "
+            f"mean **{d['mean']:.2f}s**, std {d['std']:.2f}s, "
+            f"min {d['min']:.2f}s, p50 {d['p50']:.2f}s, p90 {d['p90']:.2f}s, max {d['max']:.2f}s."
+        )
+        lines.append("")
+
+    lines.append("| Probe component | mean/step | notes |")
+    lines.append("|-----------------|-----------|-------|")
+    for row in summary.probe_rows:
+        mean_cell = f"{row.mean_seconds:.3f}s" if row.mean_seconds is not None else "—"
+        lines.append(f"| {row.component} | {mean_cell} | {row.notes or '—'} |")
+    if summary.modular_other_seconds is not None:
+        lines.append(
+            f"| modular Other/overhead (`timing_s/step` residual) | {summary.modular_other_seconds:.3f}s | "
+            "includes TB + unbucketed trainer time when probes not instrumented |"
+        )
+    lines.append("")
+
+    if summary.measured_probe_total is not None:
+        lines.append(
+            f"- **Estimated sidecar probe overhead:** **{summary.measured_probe_total:.3f}s/step** "
+            "(sum of measured `timing_rankgrpo/probe_*` rows, or modular Other/overhead when >0)."
+        )
+    else:
+        lines.append(
+            "- **Sidecar probe overhead:** not directly measured in this run "
+            "(missing `timing_rankgrpo/probe_*` scalars). "
+            f"With `logging_steps={summary.logging_steps}`, per-step TB flush + logprob gate probes "
+            f"typically add ~0.1–0.3s/step vs production `logging_steps={summary.prod_logging_steps}`. "
+            "Compare `timing_s/step` distribution below to long-run tqdm s/it."
+        )
+    if summary.estimated_prod_step_seconds is not None and summary.measured_probe_total is not None:
+        lines.append(
+            f"- **Estimated production-equivalent step time:** **{summary.estimated_prod_step_seconds:.3f}s/step** "
+            f"(adjusts TB logging for `logging_steps={summary.prod_logging_steps}`)."
+        )
+    if summary.trl_reference_seconds is not None:
+        lines.append(f"- **TRL reference step time:** **{summary.trl_reference_seconds:.3f}s/step** (tqdm train log).")
+    if (
+        summary.estimated_prod_step_seconds is not None
+        and summary.trl_reference_seconds is not None
+    ):
+        delta = summary.estimated_prod_step_seconds - summary.trl_reference_seconds
+        sign = "+" if delta >= 0 else ""
+        lines.append(
+            f"- **Prod-estimate vs TRL:** {sign}{delta:.3f}s/step "
+            "(after removing sidecar probe overhead; training phases only)."
+        )
+    lines.append("")
+    return lines
+
+
+def sidecar_probe_overhead_summary_to_dict(summary: SidecarProbeOverheadSummary | None) -> dict[str, Any] | None:
+    if summary is None:
+        return None
+    return {
+        "step_range": summary.step_range,
+        "n_steps": summary.n_steps,
+        "step_distribution": summary.step_distribution,
+        "probe_rows": [
+            {"component": row.component, "mean_seconds": row.mean_seconds, "notes": row.notes}
+            for row in summary.probe_rows
+        ],
+        "measured_probe_total": summary.measured_probe_total,
+        "modular_other_seconds": summary.modular_other_seconds,
+        "logging_steps": summary.logging_steps,
+        "prod_logging_steps": summary.prod_logging_steps,
+        "estimated_prod_step_seconds": summary.estimated_prod_step_seconds,
+        "trl_reference_seconds": summary.trl_reference_seconds,
+        "incomplete_run_note": summary.incomplete_run_note,
+    }
+
+
+def modular_step_latency_summary_to_dict(summary: ModularStepLatencySummary | None) -> dict[str, Any] | None:
+    if summary is None:
+        return None
+    return {
+        "step_range": summary.step_range,
+        "n_steps": summary.n_steps,
+        "fork_total_seconds": summary.fork_total_seconds,
+        "trl_total_seconds": summary.trl_total_seconds,
+        "trl_step_time_source": summary.trl_step_time_source,
+        "rows": [
+            {
+                "phase": row.phase,
+                "fork_seconds": row.fork_seconds,
+                "fork_pct": row.fork_pct,
+                "trl_seconds": row.trl_seconds,
+                "trl_estimated": row.trl_estimated,
+                "delta_seconds": row.delta_seconds,
+            }
+            for row in summary.rows
+        ],
+    }
 
 
 def _resolve_trl_tb_dir(trl_tb_dir: str | Path | None = None) -> str:
@@ -112,24 +678,49 @@ class StepGateResult:
     step: int
     logprob_ok: bool | None
     logprob_rel_err: float | None
-    kl_ok: bool
+    kl_ok: bool | None
     kl_rel_err: float | None
     fork_kl: float | None
     trl_kl: float | None
     time_ok: bool | None
     fork_step_time: float | None
     trl_step_time: float | None
-    passed: bool
+    passed: bool | None
     notes: list[str] = field(default_factory=list)
+
+
+_GATE_PER_STEP_HEADER = (
+    "| step | logprob gate | KL gate | fork KL | TRL KL | step time gate | fork time | TRL time | gate |"
+)
+_GATE_PER_STEP_SEP = (
+    "|------|--------------|---------|---------|--------|----------------|-----------|----------|------|"
+)
+
+
+def _format_gate_metric_cell(ok: bool | None, rel_err: float | None) -> str:
+    if ok is True:
+        return f"OK ({rel_err:.3f})" if rel_err is not None else "OK"
+    if ok is False:
+        return f"**FAIL** ({rel_err:.3f})" if rel_err is not None else "**FAIL**"
+    return "—"
+
+
+def _format_step_time_gate_cell(ok: bool | None) -> str:
+    if ok is True:
+        return "OK"
+    if ok is False:
+        return "**FAIL**"
+    return "—"
 
 
 @dataclass
 class AlignmentGateSummary:
-    """Combined gate = logprob ∧ KL (per-step) ∧ step_time (fork avg < TRL avg)."""
+    """Combined gate = logprob ∧ KL (per-step, ≥2/3 pass) ∧ step_time (fork avg < TRL avg)."""
 
     passed: bool
     logprob_gate: MetricGateVerdict
     kl_gate: MetricGateVerdict
+    combined_gate: MetricGateVerdict
     time_gate: MetricGateVerdict
     steps: list[StepGateResult]
     trl_tb_dir: str
@@ -642,6 +1233,20 @@ def _load_trl_logprob_by_check(trl_dir: str) -> dict[str, dict[int, float]]:
     return out
 
 
+def _metric_gate_passed(n_pass: int, n_evaluated: int) -> bool:
+    if n_evaluated <= 0:
+        return False
+    return (n_pass / n_evaluated) >= _GATE_MIN_PASS_FRACTION
+
+
+def _format_gate_pass_detail(mg: MetricGateVerdict) -> str:
+    if mg.n_evaluated <= 0:
+        return "no evaluated steps"
+    rate = mg.n_pass / mg.n_evaluated
+    threshold = f"{_GATE_MIN_PASS_FRACTION:.0%}"
+    return f"{mg.n_pass}/{mg.n_evaluated} pass ({rate:.0%}, need ≥{threshold})"
+
+
 def _summarize_metric_gate(
     name: str,
     steps: list[StepGateResult],
@@ -672,7 +1277,7 @@ def _summarize_metric_gate(
     n_evaluated = n_pass + n_fail
     return MetricGateVerdict(
         name=name,
-        passed=n_evaluated > 0 and n_fail == 0,
+        passed=_metric_gate_passed(n_pass, n_evaluated),
         blocked=False,
         n_evaluated=n_evaluated,
         n_pass=n_pass,
@@ -730,17 +1335,50 @@ def evaluate_rankgrpo_alignment_gate(
     for step in compare_steps:
         metrics = acc.metrics_by_step.get(step, {})
         notes: list[str] = []
+        is_warmup = step <= skip_warmup_steps
+
+        fork_time = _fork_step_time(metrics)
+        trl_time = _trl_step_time_at_step(trl_dir, step, fallback=trl_step_time_avg)
+        if fork_time is None:
+            notes.append("missing fork step time")
+        elif trl_time is None:
+            notes.append("missing TRL step time")
+
+        time_ok: bool | None = None
+        if not is_warmup and fork_time is not None and trl_time is not None:
+            time_ok = _step_time_faster_than_trl(fork_time, trl_time)
+
+        if is_warmup:
+            step_results.append(
+                StepGateResult(
+                    step=step,
+                    logprob_ok=None,
+                    logprob_rel_err=None,
+                    kl_ok=None,
+                    kl_rel_err=None,
+                    fork_kl=_pick_metric(metrics, _GATE_KL_CHECK["fork_keys"]),
+                    trl_kl=trl_kl_by_step.get(step),
+                    time_ok=None,
+                    fork_step_time=fork_time,
+                    trl_step_time=trl_time,
+                    passed=None,
+                    notes=["warmup (excluded from logprob/KL/step-time gates)"],
+                )
+            )
+            continue
 
         fork_kl = _pick_metric(metrics, _GATE_KL_CHECK["fork_keys"])
         trl_kl = trl_kl_by_step.get(step)
-        kl_ok = False
+        kl_ok: bool | None = False
         kl_rel_err: float | None = None
         if fork_kl is not None and trl_kl is not None:
             kl_ok = _rel_aligned(fork_kl, trl_kl)
             kl_rel_err = _relative_error(fork_kl, trl_kl)
         elif fork_kl is None:
+            kl_ok = None
             notes.append("missing fork KL")
         elif trl_kl is None:
+            kl_ok = None
             notes.append("missing TRL KL")
 
         logprob_ok: bool | None = None
@@ -766,15 +1404,8 @@ def evaluate_rankgrpo_alignment_gate(
             logprob_ok = lp_ok
             logprob_rel_err = worst_err
 
-        fork_time = _fork_step_time(metrics)
-        trl_time = _trl_step_time_at_step(trl_dir, step, fallback=trl_step_time_avg)
-        if fork_time is None:
-            notes.append("missing fork step time")
-        elif trl_time is None:
-            notes.append("missing TRL step time")
-
         checks: list[bool] = []
-        if trl_kl_by_step:
+        if kl_ok is not None:
             checks.append(kl_ok)
         if logprob_ok is not None:
             checks.append(logprob_ok)
@@ -789,7 +1420,7 @@ def evaluate_rankgrpo_alignment_gate(
                 kl_rel_err=kl_rel_err,
                 fork_kl=fork_kl,
                 trl_kl=trl_kl,
-                time_ok=None,
+                time_ok=time_ok,
                 fork_step_time=fork_time,
                 trl_step_time=trl_time,
                 passed=passed,
@@ -821,6 +1452,7 @@ def evaluate_rankgrpo_alignment_gate(
         blocked=kl_blocked_reason is not None,
         blocked_reason=kl_blocked_reason,
     )
+    combined_gate = _summarize_metric_gate("combined", step_results, "passed")
     time_gate = _build_step_time_avg_gate(
         fork_avg=fork_step_time_avg,
         trl_avg=trl_step_time_gate_avg,
@@ -841,6 +1473,7 @@ def evaluate_rankgrpo_alignment_gate(
         passed=combined_passed,
         logprob_gate=logprob_gate,
         kl_gate=kl_gate,
+        combined_gate=combined_gate,
         time_gate=time_gate,
         steps=step_results,
         trl_tb_dir=trl_dir,
@@ -857,6 +1490,11 @@ def _format_gate_verdicts_summary(gate: AlignmentGateSummary, *, last_step: int)
     lines: list[str] = []
     lines.append("## Gate Verdicts")
     lines.append("")
+    lines.append(
+        f"Per-metric pass rule: **pass / (pass + fail) ≥ {_GATE_MIN_PASS_FRACTION:.0%}** "
+        "(warmup step 1 excluded). **step_time** uses fork vs TRL average s/it."
+    )
+    lines.append("")
     lines.append("| gate | status | pass | fail | skip | detail |")
     lines.append("|------|--------|------|------|------|--------|")
 
@@ -871,11 +1509,11 @@ def _format_gate_verdicts_summary(gate: AlignmentGateSummary, *, last_step: int)
                     else "fork avg faster than TRL avg"
                 )
             elif mg.name == "logprob":
-                detail = "rollout↔ref + actor↔ref vs TRL"
+                detail = f"rollout↔ref + actor↔ref vs TRL; {_format_gate_pass_detail(mg)}"
             elif mg.name == "kl":
-                detail = "actor/kl_loss vs TRL train/kl"
+                detail = f"actor/kl_loss vs TRL train/kl; {_format_gate_pass_detail(mg)}"
             else:
-                detail = f"all {mg.n_evaluated} steps ≤20% rel vs TRL"
+                detail = _format_gate_pass_detail(mg)
         else:
             if mg.name == "step_time":
                 if gate.fork_step_time_avg is not None and gate.trl_step_time_ref is not None:
@@ -885,37 +1523,41 @@ def _format_gate_verdicts_summary(gate: AlignmentGateSummary, *, last_step: int)
                 else:
                     detail = "avg comparison failed"
             else:
-                detail = f"{mg.n_fail} failing step(s)"
+                detail = _format_gate_pass_detail(mg)
         lines.append(
             f"| {mg.name} | **{mg.status_label()}** | {mg.n_pass} | {mg.n_fail} | {mg.n_skip} | {detail} |"
         )
 
-    n_combined_pass = sum(1 for r in gate.steps if r.passed)
-    n_combined_fail = len(gate.steps) - n_combined_pass
-    if any(mg.blocked for mg in (gate.logprob_gate, gate.kl_gate, gate.time_gate)):
+    mg = gate.combined_gate
+    if any(x.blocked for x in (gate.logprob_gate, gate.kl_gate, gate.time_gate)):
         combined_status = "BLOCKED"
         combined_detail = "; ".join(
-            f"{mg.name}: {mg.blocked_reason}"
-            for mg in (gate.logprob_gate, gate.kl_gate, gate.time_gate)
-            if mg.blocked
+            f"{x.name}: {x.blocked_reason}"
+            for x in (gate.logprob_gate, gate.kl_gate, gate.time_gate)
+            if x.blocked
         )
     elif gate.passed:
         combined_status = "PASS"
-        combined_detail = f"logprob ∧ KL (per-step) ∧ step_time avg @ step {last_step}"
+        combined_detail = (
+            f"logprob ∧ KL (per-step) ∧ step_time avg @ step {last_step}; "
+            f"{_format_gate_pass_detail(mg)}"
+        )
     else:
         combined_status = "FAIL"
         fail_parts: list[str] = []
         if not gate.logprob_gate.passed and not gate.logprob_gate.blocked:
-            fail_parts.append(f"logprob ({gate.logprob_gate.n_fail} steps)")
+            fail_parts.append(f"logprob ({_format_gate_pass_detail(gate.logprob_gate)})")
         if not gate.kl_gate.passed and not gate.kl_gate.blocked:
-            fail_parts.append(f"KL ({gate.kl_gate.n_fail} steps)")
+            fail_parts.append(f"KL ({_format_gate_pass_detail(gate.kl_gate)})")
+        if not gate.combined_gate.passed:
+            fail_parts.append(f"per-step ({_format_gate_pass_detail(gate.combined_gate)})")
         if not gate.time_gate.passed and not gate.time_gate.blocked:
             fail_parts.append("step_time avg")
-        combined_detail = "; ".join(fail_parts) or f"{n_combined_fail} step(s) fail logprob or KL"
+        combined_detail = "; ".join(fail_parts) or _format_gate_pass_detail(mg)
 
     lines.append(
-        f"| **combined** | **{combined_status}** | {n_combined_pass} | {n_combined_fail} | "
-        f"{gate.time_gate.n_skip} | {combined_detail} |"
+        f"| **combined** | **{combined_status}** | {mg.n_pass} | {mg.n_fail} | "
+        f"{mg.n_skip} | {combined_detail} |"
     )
     lines.append("")
     lines.append(f"- TRL reference: `{gate.trl_tb_dir}`")
@@ -936,13 +1578,15 @@ def _format_gate_per_step_table(gate: AlignmentGateSummary) -> list[str]:
     lines.append("## Per-step alignment gate")
     lines.append("")
     lines.append(
-        "Criteria (each step): **logprob** rel diff ≤20% vs TRL; **KL** rel diff ≤20%. "
-        "**Step time** gate uses fork vs TRL **average** s/it (excl. warmup step 1)."
+        "Criteria (each step): **logprob gate** and **KL gate** rel diff ≤20% vs TRL; "
+        "**step time gate**: fork s/it < TRL s/it at the same step. "
+        "Header **step time** gate uses fork vs TRL **average** s/it (excl. warmup step 1). "
+        "Logprob/KL/step-time gates skip step 1 (vLLM compile + first-cycle warmup)."
     )
     lines.append("")
 
-    lines.append("| step | logprob | KL | fork KL | TRL KL | fork time | TRL time | gate |")
-    lines.append("|------|---------|-----|---------|--------|-----------|----------|------|")
+    lines.append(_GATE_PER_STEP_HEADER)
+    lines.append(_GATE_PER_STEP_SEP)
 
     show_steps = list(gate.steps)
     if len(show_steps) > 40:
@@ -950,44 +1594,46 @@ def _format_gate_per_step_table(gate: AlignmentGateSummary) -> list[str]:
             step=-1,
             logprob_ok=None,
             logprob_rel_err=None,
-            kl_ok=False,
+            kl_ok=None,
             kl_rel_err=None,
             fork_kl=None,
             trl_kl=None,
             time_ok=None,
             fork_step_time=None,
             trl_step_time=None,
-            passed=False,
+            passed=None,
         )
         show_steps = show_steps[:15] + [ellipsis] + show_steps[-10:]
 
     for row in show_steps:
         if row.step == -1:
-            lines.append("| … | | | | | | | |")
+            lines.append("| … | | | | | | | | |")
             continue
-        if row.logprob_ok is True:
-            lp = f"OK ({row.logprob_rel_err:.3f})" if row.logprob_rel_err is not None else "OK"
-        elif row.logprob_ok is False:
-            lp = f"**FAIL** ({row.logprob_rel_err:.3f})" if row.logprob_rel_err is not None else "**FAIL**"
-        else:
-            lp = "—"
-        kl = f"{'OK' if row.kl_ok else '**FAIL**'} ({row.kl_rel_err:.3f})" if row.kl_rel_err is not None else ("OK" if row.kl_ok else "**FAIL**")
-        fk = f"{row.fork_kl:.4g}" if row.fork_kl is not None else "—"
-        tk = f"{row.trl_kl:.4g}" if row.trl_kl is not None else "—"
-        ft = f"{row.fork_step_time:.3f}s" if row.fork_step_time is not None else "—"
-        tt = f"{row.trl_step_time:.3f}s" if row.trl_step_time is not None else "—"
-        gate_cell = "**PASS**" if row.passed else "**FAIL**"
-        lines.append(f"| {row.step} | {lp} | {kl} | {fk} | {tk} | {ft} | {tt} | {gate_cell} |")
+        lines.append(
+            "| {step} | {logprob} | {kl} | {fork_kl} | {trl_kl} | {time_gate} | {fork_time} | {trl_time} | {combined} |".format(
+                step=row.step,
+                logprob=_format_gate_metric_cell(row.logprob_ok, row.logprob_rel_err),
+                kl=_format_gate_metric_cell(row.kl_ok, row.kl_rel_err),
+                fork_kl=f"{row.fork_kl:.4g}" if row.fork_kl is not None else "—",
+                trl_kl=f"{row.trl_kl:.4g}" if row.trl_kl is not None else "—",
+                time_gate=_format_step_time_gate_cell(row.time_ok),
+                fork_time=f"{row.fork_step_time:.3f}s" if row.fork_step_time is not None else "—",
+                trl_time=f"{row.trl_step_time:.3f}s" if row.trl_step_time is not None else "—",
+                combined=_format_step_time_gate_cell(row.passed),
+            )
+        )
 
     lines.append("")
     if not gate.passed and gate.steps:
         lines.append("First failing steps:")
-        for r in [x for x in gate.steps if not x.passed][:5]:
+        for r in [x for x in gate.steps if x.passed is False][:5]:
             parts = []
             if r.logprob_ok is False:
                 parts.append("logprob")
-            if not r.kl_ok:
+            if r.kl_ok is False:
                 parts.append("KL")
+            if r.time_ok is False:
+                parts.append("step_time")
             lines.append(f"- step {r.step}: {', '.join(parts) or 'unknown'}")
         lines.append("")
     return lines
@@ -1026,6 +1672,19 @@ def write_rankgrpo_alignment_report(
 
     gate = evaluate_rankgrpo_alignment_gate(acc, trl_tb_dir=trl_dir)
 
+    compare_steps = sorted({r.step for r in gate.steps} or set(acc.steps))
+    latency_summary = compute_modular_step_latency_summary(
+        acc,
+        trl_tb_dir=trl_dir,
+        compare_steps=compare_steps,
+    )
+    probe_summary = compute_sidecar_probe_overhead_summary(
+        acc,
+        compare_steps=compare_steps,
+        latency_summary=latency_summary,
+        trl_tb_dir=trl_dir,
+    )
+
     trl_cache: dict[str, list[tuple[int, float]]] = {}
     lines: list[str] = []
     lines.append("# RankGRPO TRL Alignment Report")
@@ -1040,6 +1699,8 @@ def write_rankgrpo_alignment_report(
     lines.append(f"- TRL resume offset (for matched comparison): +{trl_offset} → fork step {last_step} vs TRL ~{last_step + trl_offset}")
     lines.append("")
     lines.extend(_format_gate_markdown(gate, last_step=last_step))
+    lines.extend(format_modular_step_latency_markdown(latency_summary))
+    lines.extend(format_sidecar_probe_overhead_markdown(probe_summary))
 
     aligned: list[str] = []
     misaligned: list[str] = []
@@ -1169,6 +1830,8 @@ def write_rankgrpo_alignment_report(
                 "misaligned": misaligned,
                 "unknown": unknown,
                 "trl_tb_dir": trl_dir,
+                "modular_step_latency": modular_step_latency_summary_to_dict(latency_summary),
+                "sidecar_probe_overhead": sidecar_probe_overhead_summary_to_dict(probe_summary),
                 "gate": {
                     "passed": gate.passed,
                     "logprob_gate": {
@@ -1195,12 +1858,20 @@ def write_rankgrpo_alignment_report(
                         "n_fail": gate.time_gate.n_fail,
                         "n_skip": gate.time_gate.n_skip,
                     },
+                    "combined_gate": {
+                        "passed": gate.combined_gate.passed,
+                        "n_pass": gate.combined_gate.n_pass,
+                        "n_fail": gate.combined_gate.n_fail,
+                        "n_skip": gate.combined_gate.n_skip,
+                    },
+                    "min_pass_fraction": _GATE_MIN_PASS_FRACTION,
                     "blocked_reasons": gate.blocked_reasons,
                     "trl_step_time_ref": gate.trl_step_time_ref,
                     "fork_step_time_avg": gate.fork_step_time_avg,
                     "logprob_trl_available": gate.logprob_trl_available,
-                    "n_pass": sum(1 for r in gate.steps if r.passed),
-                    "n_fail": sum(1 for r in gate.steps if not r.passed),
+                    "n_pass": gate.combined_gate.n_pass,
+                    "n_fail": gate.combined_gate.n_fail,
+                    "n_skip": gate.combined_gate.n_skip,
                     "per_step": [
                         {
                             "step": r.step,

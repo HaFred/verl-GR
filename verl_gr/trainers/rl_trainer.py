@@ -35,6 +35,7 @@ from verl_gr.recipes.rankgrpo.rankgrpo_logprob_metrics import (
     alignment_report_enabled,
     calculate_rankgrpo_logprob_gate_metrics,
     maybe_export_rankgrpo_logprobs,
+    merge_sidecar_probe_timings,
     record_rankgrpo_alignment_metrics,
     write_rankgrpo_alignment_report,
 )
@@ -187,7 +188,10 @@ def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str,
 
     metrics = _base_compute_data_metrics(batch=batch, use_critic=use_critic)
     metrics.update(compute_rank_grpo_training_reward_metrics(batch))
+    probe_t0 = time.perf_counter()
     metrics.update(calculate_rankgrpo_logprob_gate_metrics(batch))
+    if alignment_report_enabled():
+        metrics["timing_rankgrpo/probe_logprob_gate"] = time.perf_counter() - probe_t0
     step = batch.meta_info.get("global_steps") if isinstance(getattr(batch, "meta_info", None), dict) else None
     if step is not None:
         try:
@@ -286,13 +290,25 @@ class RLTrainer(RayPPOTrainerBase):
         original_log = Tracking.log
 
         def _wrapped_log(tracking_self, data, step, backend=None):
+            step_i = int(step)
+            should_log = logging_steps <= 1 or step_i == 0 or step_i % logging_steps == 0
             if rankgrpo_report and isinstance(data, dict):
-                record_rankgrpo_alignment_metrics(int(step), data)
-            if logging_steps <= 1:
-                return original_log(tracking_self, data=data, step=step, backend=backend)
-            if step == 0 or step % logging_steps == 0:
-                return original_log(tracking_self, data=data, step=step, backend=backend)
-            return None
+                accum_t0 = time.perf_counter()
+                record_rankgrpo_alignment_metrics(step_i, data)
+                merge_sidecar_probe_timings(
+                    step_i,
+                    {"timing_rankgrpo/probe_align_accum": time.perf_counter() - accum_t0},
+                )
+            if not should_log:
+                return None
+            tb_t0 = time.perf_counter()
+            result = original_log(tracking_self, data=data, step=step, backend=backend)
+            if rankgrpo_report:
+                merge_sidecar_probe_timings(
+                    step_i,
+                    {"timing_rankgrpo/probe_tb_log": time.perf_counter() - tb_t0},
+                )
+            return result
 
         Tracking.log = _wrapped_log
         try:

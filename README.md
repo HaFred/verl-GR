@@ -30,7 +30,7 @@ MiniOneRec: Prompt ──[trie-guided beam, HF or vLLM]──→ catalog-valid S
 RankGRPO:   Prompt ──[vLLM n=N or concurrent n=1]──→ ranked lists → rank-slot GRPO adv
 ```
 
-## Performance for the Recipes
+## Performance Records for the Recipes
 * [OpenOneRec](verl_gr/recipes/openonerec/README.md)
 * [MiniOneRec](verl_gr/recipes/minionerec/README.md)
 * [RankGRPO](verl_gr/recipes/rankgrpo/README.md)
