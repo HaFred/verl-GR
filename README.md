@@ -7,6 +7,9 @@
 
 ## Key Features over the Upstream VeRL
 
+VeRL-GR offers a **programmable generation runtime** where beam width, trie constraints, two-stage KV reuse, and concurrent/async dispatch are first-class. As the generative recsys works tend to have heterogenous compute backends to accomodate different compute paradigms, we abstract the upstream [VeRL](https://github.com/verl-project/verl)'s `TaskRuntime` into a base `RecipeTaskRuntime` that can customize each recipe's actor/rollout worker strategy, lora, tokenizer/processor, and so on.
+
+
 |  | Upstream VeRL | VeRL-GR |
 |---|---|---|
 | **Task organization** | Single `TaskRunner.run()` + dataset reward fn swap | `TASK_REGISTRY` with `RecipeTaskRuntime` hooks per recipe |
@@ -20,7 +23,6 @@
 | **Agent loops** | Generic single-turn | Recipe-specific: two-stage metadata, constrained beam decode modes, RankGRPO concurrent gather |
 | **Worker customization** | `ActorRolloutRefWorker` + backend strategy | Recipe workers: skip vLLM (MiniOneRec HF path), custom loss registration, ref sync mixin |
 
-VeRL-GR offers a **programmable generation runtime** where beam width, trie constraints, two-stage KV reuse, and concurrent/async dispatch are first-class.
 
 ```
 Upstream:  Prompt ──[vLLM: n=8, temp=1.0]──→ 8 independent samples
@@ -52,7 +54,7 @@ RankGRPO:   Prompt ──[vLLM n=N or concurrent n=1]──→ ranked lists → 
 - `docs/verl_gr/rankgrpo_target.md`: alignment progress tracker by target item (convergence & efficiency).
 - `scripts/README.md`: launcher index for GRPO / SFT / profiling scripts.
 
-## Data preparation
+## Data Preparation
 
 You will need to download `OpenOneRec/OpenOneRec-RecIF` first and then curate the RL data one-stop as follows. The flow is `OpenOneRec-RecIF -> recommendation data preprocessing -> RL data split`. Patch `verl-GR/verl_gr/recipes/openonerec/data/recif_preprocessing.sh` before getting started.
 

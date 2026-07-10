@@ -6,7 +6,7 @@ Technically, their approaches are two-fold: output tokens can be treated either 
  `verl-gr` currently supports three recipes for GRPO training:
 * OpenOneRec
 * MiniOneRec
-* Rank-GRPO
+* [Rank-GRPO](rankgrpo/README.md)
 
 We picked these three works for the initial release as they cover the two major routes of GenRecSys, and their intersection.
 

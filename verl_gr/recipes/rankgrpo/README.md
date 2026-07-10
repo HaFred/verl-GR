@@ -1,4 +1,4 @@
-# rank-grpo
+# Rank-GRPO
 
 ## Sample Input & Results
 
@@ -64,7 +64,7 @@ GRPO consistently improves over SFT across all metrics. Gains increase with K, f
 
 ---
 
-## Rank-GRPO Algorithm
+## Learning Paradigm
 
 The original TRL run uses:
 
@@ -93,7 +93,7 @@ reward_at_rank_i = sum(gains[i:])
 However, the reference run we align against uses `exp_inf`, so verl-gr matches
 that behavior rather than switching to `log_decay`.
 
-### Training Reward Alignment
+### Reward Alignment
 
 TRL computes `rewards_items` from `exp_inf`, normalizes them within each prompt's
 8 generations, and broadcasts each item's advantage to the tokens belonging to
@@ -142,6 +142,8 @@ Do not infer NDCG directly from `eval/reward_total` or `critic/rewards/mean`.
 
 ## Training Convergence
 
+<img width="400" alt="image" src="https://github.com/user-attachments/assets/4e13f3a2-7abd-4aa2-a33f-94dd6e2be92e" />
+
 ### Aligned Trace Comparison
 
 Trace sources:
@@ -174,7 +176,7 @@ The key alignment result is KL behavior. The older verl_gr runs had a flat `acto
 Measured means come from fork TensorBoard `timing_s/*` scalars during the sidecar run only (`RUN_DEBUG_STEP` set in `run_rankgrpo.sh`). Per-phase TRL times are pro-rata estimates from TRL total step time (tqdm train log); TRL does not export the same modular breakdown. Validation (`timing_s/testing`) and checkpoint save are excluded from the training-step table.
 
 Mean `timing_s/*` over fork steps **2–29** (n=28, warmup skipped). Enabled only when `RUN_DEBUG_STEP` is set.
-TRL total step time: avg from train log (/home/dyvm6xra/dyvm6xrauser45/fred/local_backup/Rank-GRPO/logs/debug_precision_verlgr/train_20260707_070257_gpus6,7.log).
+TRL total step time: avg from train log (train_20260707_070257_gpus6,7.log).
 Per-phase TRL times are **pro-rata estimates** `TRL_total × (fork_phase / fork_total)` — TRL does not log modular `timing_s/*`.
 
 | Phase | verl-gr Time | TRL Time | Delta Step Time |
@@ -192,7 +194,7 @@ Per-phase TRL times are **pro-rata estimates** `TRL_total × (fork_phase / fork_
 † TRL phase time estimated pro-rata from total step time (tqdm / TB).
 Eval (`timing_s/testing`) and checkpoint (`timing_s/save_checkpoint`) are excluded from this per-step training breakdown.
 
-**Key finding:** the current `fp32opt` trace is still not vLLM-rollout bound. vLLM rollout is ~10% of logged step time, while actor update plus weight synchronization is ~55%. Compared with the older May 26 run, `update_actor` is much lower and `update_weights` is now a major visible component.
+**Key finding:** the current `fp32opt` trace is still not vLLM-rollout bound. vLLM rollout is ~10% of logged step time, while actor update plus weight synchronization is ~55%.
 
 ### Sidecar Trajectories
 
@@ -232,4 +234,3 @@ Criteria (each step): **logprob gate** and **KL gate** rel diff ≤20% vs TRL; *
 | 28 | **FAIL** (7.979) | **FAIL** (6.085) | 0.000677 | 9.555e-05 | OK | 5.192s | 5.950s |
 | 29 | **FAIL** (1.454) | **FAIL** (4.134) | 0.0005013 | 9.763e-05 | OK | 5.226s | 5.840s |
 | Avg Time (Except for 1st step) | | | | | | 4.548s | 5.534s |
-
