@@ -8,8 +8,7 @@ SCRIPT_DIR="$(dirname "$(realpath "${BASH_SOURCE[0]}")")"
 VERL_GR_ROOT="$(dirname "${SCRIPT_DIR}")"
 # shellcheck source=lora_env.sh
 source "${SCRIPT_DIR}/lora_env.sh"
-PROJECT_ROOT="$(dirname "${VERL_GR_ROOT}")"
-OPENONEREC_RECIPE_PATH="${PROJECT_ROOT}/verl-GR/verl_gr/recipes/openonerec/onerec_recipe.py"
+OPENONEREC_RECIPE_PATH="${OPENONEREC_RECIPE_PATH:-${VERL_GR_ROOT}/verl_gr/recipes/openonerec/onerec_recipe.py}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
   PYTHON_BIN="python"
@@ -90,6 +89,8 @@ if (( ${#RAY_TMPDIR} > RAY_TMPDIR_MAX_LEN )); then
 fi
 RAY_SPILL_DIR="${RAY_SPILL_DIR:-${RAY_TMPDIR}/spill}"
 VERL_ZMQ_SOCKET_PREFIX="${VERL_ZMQ_SOCKET_PREFIX:-verl-gr-openonerec-${LAUNCH_TIMESTAMP}-$$}"
+VERL_ROLLOUT_ZMQ_NAMESPACE="${VERL_ROLLOUT_ZMQ_NAMESPACE:-openonerec}"
+RAY_NAMESPACE="${RAY_NAMESPACE:-openonerec_${LAUNCH_TIMESTAMP}_$$}"
 
 mkdir -p "${VERL_GR_ROOT}/logs" "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 if [[ "${VAL_DUMP_GENERATIONS}" == "True" ]]; then
@@ -108,6 +109,7 @@ export WANDB_MODE
 export RAY_TMPDIR
 export TMPDIR="${RAY_TMPDIR}"
 export VERL_ZMQ_SOCKET_PREFIX
+export VERL_ROLLOUT_ZMQ_NAMESPACE
 
 echo "==================================="
 echo "OpenOneRec GRPO (verl-GR runtime)"
@@ -136,6 +138,8 @@ echo "Output: ${OUTPUT_DIR}"
 echo "Ray temp dir: ${RAY_TMPDIR}"
 echo "Ray spill dir: ${RAY_SPILL_DIR}"
 echo "ZMQ socket prefix: ${VERL_ZMQ_SOCKET_PREFIX}"
+echo "ZMQ rollout namespace: ${VERL_ROLLOUT_ZMQ_NAMESPACE}"
+echo "Ray namespace: ${RAY_NAMESPACE}"
 echo "==================================="
 
 # Guardrail: block accidental fallback to legacy OpenOneRec recipe imports.
@@ -211,6 +215,10 @@ done
   trainer.remove_previous_ckpt_in_save=False \
   +ray_kwargs.ray_init._temp_dir="${RAY_TMPDIR}" \
   +ray_kwargs.ray_init.object_spilling_directory="${RAY_SPILL_DIR}" \
+  +ray_kwargs.ray_init.namespace="${RAY_NAMESPACE}" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_ZMQ_SOCKET_PREFIX="'${VERL_ZMQ_SOCKET_PREFIX}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_ROLLOUT_ZMQ_NAMESPACE="'${VERL_ROLLOUT_ZMQ_NAMESPACE}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="'${PYTHONPATH:-}'" \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \
   actor_rollout_ref.ref.strategy="${FSDP_STRATEGY}" \
   actor_rollout_ref.actor.strategy="${FSDP_STRATEGY}" \

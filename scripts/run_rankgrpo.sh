@@ -156,6 +156,9 @@ fi
 WANDB_MODE="${WANDB_MODE:-offline}"
 DEFAULT_RAY_JOB_TAG="$(printf '%s_%s' "${EXPERIMENT_NAME}" "${CUDA_VISIBLE_DEVICES}" | tr -c 'A-Za-z0-9_.-' '_' | cut -c1-16)"
 RAY_JOB_TAG="${RAY_JOB_TAG:-${DEFAULT_RAY_JOB_TAG}}"
+RAY_NAMESPACE="${RAY_NAMESPACE:-${RAY_JOB_TAG}}"
+VERL_ZMQ_SOCKET_PREFIX="${VERL_ZMQ_SOCKET_PREFIX:-verl-gr-rankgrpo-${LAUNCH_TIMESTAMP}-$$}"
+VERL_ROLLOUT_ZMQ_NAMESPACE="${VERL_ROLLOUT_ZMQ_NAMESPACE:-rankgrpo}"
 RAY_TMPDIR="${RAY_TMPDIR:-${TMPDIR:-/tmp}/vr_${USER:-u}_${RAY_JOB_TAG}}"
 RAY_TMPDIR_FALLBACK_ROOT="${RAY_TMPDIR_FALLBACK_ROOT:-${TMPDIR:-/tmp}}"
 RAY_TMPDIR_MAX_LEN="${RAY_TMPDIR_MAX_LEN:-60}"
@@ -270,6 +273,7 @@ fi
 
 export EXPERIMENT_NAME OUTPUT_DIR
 export VERL_GR_TRL_TB_REF="${VERL_GR_TRL_TB_REF:-${TRL_REF:-}}"
+export VERL_ZMQ_SOCKET_PREFIX VERL_ROLLOUT_ZMQ_NAMESPACE RAY_NAMESPACE
 
 mkdir -p "${OUTPUT_DIR}" "${RAY_TMPDIR}" "${RAY_SPILL_DIR}"
 mkdir -p "${TVM_FFI_CACHE_DIR}"
@@ -342,6 +346,9 @@ fi
 echo "Debug mode: ${VERL_GR_DEBUG}"
 echo "Output: ${OUTPUT_DIR}"
 echo "Ray temp dir: ${RAY_TMPDIR}"
+echo "Ray namespace: ${RAY_NAMESPACE}"
+echo "ZMQ socket prefix: ${VERL_ZMQ_SOCKET_PREFIX}"
+echo "ZMQ rollout namespace: ${VERL_ROLLOUT_ZMQ_NAMESPACE}"
 echo "TVM FFI cache dir: ${TVM_FFI_CACHE_DIR}"
 echo "Ray CPUs/object store/dashboard: ${RAY_NUM_CPUS}/${RAY_OBJECT_STORE_MEMORY}/${RAY_INCLUDE_DASHBOARD}"
 echo "Resume mode: ${RESUME_MODE}"
@@ -429,6 +436,8 @@ done
   actor_rollout_ref.actor.loss_agg_mode="${LOSS_AGG_MODE}" \
   actor_rollout_ref.rollout.agent.agent_loop_manager_class=verl_gr.recipes.rankgrpo.rankgrpo_agent_loop.RankGRPOAgentLoopManager \
   actor_rollout_ref.rollout.agent.default_agent_loop=single_turn_agent \
+  ++actor_rollout_ref.rollout.name=rankgrpo \
+  ++actor_rollout_ref.rollout.mode=async \
   algorithm.rollout_correction.bypass_mode="${RANKGRPO_BYPASS_OLD_LOG_PROB}" \
   algorithm.rollout_correction.rollout_is=null \
   algorithm.rollout_correction.rollout_rs=null \
@@ -479,6 +488,8 @@ done
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_ROOT="'${VERL_GR_ROOT}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.TVM_FFI_CACHE_DIR="'${TVM_FFI_CACHE_DIR}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.PYTHONPATH="'${PYTHONPATH:-}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_ZMQ_SOCKET_PREFIX="'${VERL_ZMQ_SOCKET_PREFIX}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_ROLLOUT_ZMQ_NAMESPACE="'${VERL_ROLLOUT_ZMQ_NAMESPACE}'" \
   $(  # Propagate alignment-gate env to Ray workers when RUN_DEBUG_STEP is set
     if (( _DEBUG_ALIGN )); then
       echo "+ray_kwargs.ray_init.runtime_env.env_vars.RUN_DEBUG_STEP='${RUN_DEBUG_STEP}'"
@@ -501,6 +512,7 @@ done
       echo "+ray_kwargs.ray_init.include_dashboard=${RAY_INCLUDE_DASHBOARD}"
       echo "+ray_kwargs.ray_init._temp_dir=${RAY_TMPDIR}"
       echo "+ray_kwargs.ray_init.object_spilling_directory=${RAY_SPILL_DIR}"
+      echo "+ray_kwargs.ray_init.namespace=${RAY_NAMESPACE}"
     fi
   ) \
   global_profiler.save_path="${GLOBAL_PROFILER_SAVE_PATH:-${OUTPUT_DIR}/profiles}" \

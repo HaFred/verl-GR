@@ -30,7 +30,7 @@ from verl.utils.ray_utils import auto_await
 from verl.utils.tokenizer import normalize_token_ids
 from verl.utils.torch_functional import get_response_mask
 from verl.workers.rollout.replica import TokenOutput
-from verl.workers.rollout.vllm_rollout.vllm_async_server import vLLMReplica
+from verl_gr.workers.rollout.rankgrpo_vllm_async import RankGRPOvLLMReplica
 
 
 def _cfg_get(config: Any, key: str, default=None):
@@ -252,7 +252,7 @@ class RankGRPOAgentLoopManager(AgentLoopManager):
     """AgentLoopManager that keeps repeated Rank-GRPO rollout groups colocated."""
 
     def __init__(self, *args, **kwargs):
-        self.rollout_replica_class = vLLMReplica
+        self.rollout_replica_class = RankGRPOvLLMReplica
         self.agent_loop_workers_class = ray.remote(RankGRPOAgentLoopWorker)
         super().__init__(*args, **kwargs)
 

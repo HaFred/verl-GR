@@ -99,7 +99,7 @@ actor_rollout_ref:
       ranks: [0]
 
   rollout:
-    name: vllm
+    name: rankgrpo
     n: 8
     dtype: bfloat16
     tensor_model_parallel_size: 2
