@@ -111,7 +111,8 @@ ENABLE_ACTIVATION_OFFLOAD="${ENABLE_ACTIVATION_OFFLOAD:-False}"
 # stack. Keep rollout memory resident by default; override both to True if needed.
 ROLLOUT_FREE_CACHE_ENGINE="${ROLLOUT_FREE_CACHE_ENGINE:-False}"
 ROLLOUT_ENABLE_SLEEP_MODE="${ROLLOUT_ENABLE_SLEEP_MODE:-${ROLLOUT_FREE_CACHE_ENGINE}}"
-KL_LOSS_COEF="${KL_LOSS_COEF:-0.001}"
+MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-512}"
+KL_LOSS_COEF="${KL_LOSS_COEF:-0.003}"
 # verl's low_var_kl = k3 estimator = exp(ref-log)- (ref-log) - 1.
 # This matches the reference Rank-GRPO trainer's KL computation exactly.
 KL_LOSS_TYPE="${KL_LOSS_TYPE:-low_var_kl}"
@@ -120,7 +121,7 @@ KL_LOSS_TYPE="${KL_LOSS_TYPE:-low_var_kl}"
 LOSS_AGG_MODE="${LOSS_AGG_MODE:-seq-mean-token-mean}"
 APPLY_EXTRA_LENGTH_SHAPING="${APPLY_EXTRA_LENGTH_SHAPING:-True}"
 END_OF_LIST_REWARD="${END_OF_LIST_REWARD:-0.1}"
-EXTRA_TOKEN_PENALTY="${EXTRA_TOKEN_PENALTY:--0.1}"
+EXTRA_TOKEN_PENALTY="${EXTRA_TOKEN_PENALTY:--0.3}"
 EARLY_STOP_PENALTY="${EARLY_STOP_PENALTY:--0.1}"
 LEARNING_RATE="${LEARNING_RATE:-1e-6}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-0}"
@@ -186,6 +187,25 @@ LOGGER_BACKENDS="${LOGGER_BACKENDS:-[tensorboard]}"
 REMOVE_PREVIOUS_CKPT_IN_SAVE="${REMOVE_PREVIOUS_CKPT_IN_SAVE:-False}"
 GRADIENT_CHECKPOINTING="${GRADIENT_CHECKPOINTING:-True}"
 VERL_GR_DEBUG="${VERL_GR_DEBUG:-0}"
+VERL_GR_CONVERGENCE_GATE="${VERL_GR_CONVERGENCE_GATE:-1}"
+VERL_GR_KL_GROWTH_GATE="${VERL_GR_KL_GROWTH_GATE:-0}"
+VERL_GR_TRL_TB_REF="${VERL_GR_TRL_TB_REF:-${TRL_REF:-}}"
+VERL_GR_CONVERGENCE_STEPS="${VERL_GR_CONVERGENCE_STEPS:-}"
+VERL_GR_KL_GROWTH_FLOORS="${VERL_GR_KL_GROWTH_FLOORS:-}"
+VERL_GR_KL_ABS_FLOORS="${VERL_GR_KL_ABS_FLOORS:-}"
+VERL_GR_EVAL_MAX_LAG="${VERL_GR_EVAL_MAX_LAG:-}"
+# Length-blowout watchdog (eos_rate / clip_ratio / overflow). Disable with =0.
+VERL_GR_LENGTH_GATE="${VERL_GR_LENGTH_GATE:-1}"
+VERL_GR_LENGTH_GATE_MIN_STEP="${VERL_GR_LENGTH_GATE_MIN_STEP:-200}"
+VERL_GR_MIN_EOS_RATE="${VERL_GR_MIN_EOS_RATE:-0.5}"
+VERL_GR_MAX_CLIP_RATIO="${VERL_GR_MAX_CLIP_RATIO:-0.1}"
+VERL_GR_MAX_OVERFLOW_RATIO="${VERL_GR_MAX_OVERFLOW_RATIO:-0.2}"
+VERL_GR_TRUNCATE_AFTER_REC_NUM="${VERL_GR_TRUNCATE_AFTER_REC_NUM:-1}"
+export VERL_GR_CONVERGENCE_GATE VERL_GR_KL_GROWTH_GATE VERL_GR_TRL_TB_REF
+export VERL_GR_CONVERGENCE_STEPS VERL_GR_KL_GROWTH_FLOORS VERL_GR_KL_ABS_FLOORS VERL_GR_EVAL_MAX_LAG
+export VERL_GR_LENGTH_GATE VERL_GR_LENGTH_GATE_MIN_STEP VERL_GR_MIN_EOS_RATE
+export VERL_GR_MAX_CLIP_RATIO VERL_GR_MAX_OVERFLOW_RATIO VERL_GR_TRUNCATE_AFTER_REC_NUM
+export REC_NUM
 
 # ---- Debug alignment gate (RUN_DEBUG_STEP) ----
 _DEFAULT_TRL_TB_REF="/home/dyvm6xra/dyvm6xrauser45/fred/local_backup/Rank-GRPO/logs/debug_precision_verlgr/runs/Jul07_03-56-22_hk01dgx028"
@@ -294,7 +314,12 @@ echo "Dynamic bsz/micro_batch_per_gpu/remove padding/fused kernels/activation of
 echo "Training data parallel size: ${N_GPUS}"
 echo "Learning rate: ${LEARNING_RATE}"
 echo "KL loss: coef=${KL_LOSS_COEF} type=${KL_LOSS_TYPE} agg=${LOSS_AGG_MODE}"
+echo "Max response length: ${MAX_RESPONSE_LENGTH}"
 echo "Length shaping (apply/end/overflow/early): ${APPLY_EXTRA_LENGTH_SHAPING}/${END_OF_LIST_REWARD}/${EXTRA_TOKEN_PENALTY}/${EARLY_STOP_PENALTY}"
+echo "Rollout truncate after rec_num: ${VERL_GR_TRUNCATE_AFTER_REC_NUM}"
+echo "Length blowout watchdog: ${VERL_GR_LENGTH_GATE} (min_step=${VERL_GR_LENGTH_GATE_MIN_STEP})"
+echo "Convergence gate (exit report): ${VERL_GR_CONVERGENCE_GATE}"
+echo "Online KL watchdog: ${VERL_GR_KL_GROWTH_GATE}"
 echo "Save/test freq: ${SAVE_FREQ}/${TEST_FREQ}"
 echo "Logging steps: ${LOGGING_STEPS}"
 echo "Validation generations to log: ${VAL_LOG_GENERATIONS}"
@@ -348,7 +373,7 @@ done
   ++data.validation_shuffle="${VALIDATION_SHUFFLE}" \
   data.seed="${SEED}" \
   data.max_prompt_length=2048 \
-  data.max_response_length=1024 \
+  data.max_response_length="${MAX_RESPONSE_LENGTH}" \
   data.train_max_samples="${TRAIN_MAX_SAMPLES}" \
   data.val_max_samples="${VAL_MAX_SAMPLES}" \
   data.custom_cls.path="${RANKGRPO_RECIPE_PATH}" \
@@ -435,6 +460,20 @@ done
   +ray_kwargs.ray_init.runtime_env.env_vars.PYTORCH_CUDA_ALLOC_CONF="'${PYTORCH_CUDA_ALLOC_CONF}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.NCCL_IB_DISABLE="'${NCCL_IB_DISABLE:-1}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_DEBUG="'${VERL_GR_DEBUG}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_CONVERGENCE_GATE="'${VERL_GR_CONVERGENCE_GATE}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_KL_GROWTH_GATE="'${VERL_GR_KL_GROWTH_GATE}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_TRL_TB_REF="'${VERL_GR_TRL_TB_REF}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_CONVERGENCE_STEPS="'${VERL_GR_CONVERGENCE_STEPS}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_KL_GROWTH_FLOORS="'${VERL_GR_KL_GROWTH_FLOORS}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_KL_ABS_FLOORS="'${VERL_GR_KL_ABS_FLOORS}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_EVAL_MAX_LAG="'${VERL_GR_EVAL_MAX_LAG}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_LENGTH_GATE="'${VERL_GR_LENGTH_GATE}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_LENGTH_GATE_MIN_STEP="'${VERL_GR_LENGTH_GATE_MIN_STEP}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_MIN_EOS_RATE="'${VERL_GR_MIN_EOS_RATE}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_MAX_CLIP_RATIO="'${VERL_GR_MAX_CLIP_RATIO}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_MAX_OVERFLOW_RATIO="'${VERL_GR_MAX_OVERFLOW_RATIO}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_TRUNCATE_AFTER_REC_NUM="'${VERL_GR_TRUNCATE_AFTER_REC_NUM}'" \
+  +ray_kwargs.ray_init.runtime_env.env_vars.REC_NUM="'${REC_NUM}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.EXPERIMENT_NAME="'${EXPERIMENT_NAME}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.OUTPUT_DIR="'${OUTPUT_DIR}'" \
   +ray_kwargs.ray_init.runtime_env.env_vars.VERL_GR_ROOT="'${VERL_GR_ROOT}'" \

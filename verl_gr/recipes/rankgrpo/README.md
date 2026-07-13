@@ -142,7 +142,7 @@ Do not infer NDCG directly from `eval/reward_total` or `critic/rewards/mean`.
 
 ## Training Convergence
 
-<img width="400" alt="image" src="https://github.com/user-attachments/assets/4e13f3a2-7abd-4aa2-a33f-94dd6e2be92e" />
+<img width="400" alt="image" src="https://github.com/user-attachments/assets/b6b51358-c040-48c1-88a0-59c3b5523ddf" />
 
 ### Aligned Trace Comparison
 

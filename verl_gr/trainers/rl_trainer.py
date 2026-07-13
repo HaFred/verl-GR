@@ -272,6 +272,47 @@ class RLTrainer(RayPPOTrainerBase):
         if self._get_task_adapter_is_minionerec():
             self.use_rm = True
 
+    def _rankgrpo_gates_enabled(self) -> bool:
+        task_name = str(_cfg_get(_cfg_get(self.config, "task", None), "name", "")).lower()
+        return task_name == "rankgrpo"
+
+    def _maybe_rankgrpo_convergence_gate(self, step: int, metrics: Any) -> None:
+        if not self._rankgrpo_gates_enabled() or not isinstance(metrics, dict):
+            return
+        try:
+            from verl_gr.recipes.rankgrpo.alignment.convergence_gate import (
+                maybe_abort_on_kl_growth_failure,
+                maybe_abort_on_length_blowout,
+            )
+
+            maybe_abort_on_kl_growth_failure(int(step), metrics)
+            maybe_abort_on_length_blowout(int(step), metrics)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+
+    def _write_rankgrpo_convergence_gate_report(self) -> None:
+        if not self._rankgrpo_gates_enabled():
+            return
+        try:
+            from verl_gr.recipes.rankgrpo.alignment.convergence_gate import (
+                write_convergence_gate_report,
+            )
+
+            trainer_cfg = self.config.trainer
+            experiment_name = str(_cfg_get(trainer_cfg, "experiment_name", ""))
+            default_local_dir = _cfg_get(trainer_cfg, "default_local_dir", None)
+            output_dir = Path(default_local_dir).parent if default_local_dir else Path(
+                os.environ.get("OUTPUT_DIR", ".")
+            )
+            write_convergence_gate_report(
+                output_dir=output_dir,
+                experiment_name=experiment_name,
+            )
+        except Exception:
+            pass
+
     def _get_task_adapter_is_minionerec(self) -> bool:
         rollout = str(self.config.actor_rollout_ref.rollout.get("name", ""))
         if rollout == "constrained_beam":
@@ -301,6 +342,7 @@ class RLTrainer(RayPPOTrainerBase):
                 )
             if not should_log:
                 return None
+            self._maybe_rankgrpo_convergence_gate(step_i, data)
             tb_t0 = time.perf_counter()
             result = original_log(tracking_self, data=data, step=step, backend=backend)
             if rankgrpo_report:
@@ -315,6 +357,7 @@ class RLTrainer(RayPPOTrainerBase):
             super().fit()
         finally:
             Tracking.log = original_log
+            self._write_rankgrpo_convergence_gate_report()
             if rankgrpo_report:
                 report_root = os.environ.get("VERL_GR_ALIGN_REPORT_DIR")
                 if not report_root:
