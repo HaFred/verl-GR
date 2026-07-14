@@ -169,7 +169,8 @@ class OneRecDataset(Dataset):
             else:
                 indices = np.arange(self.max_samples)
             self.dataframe = self.dataframe.select(indices.tolist())
-            print(f"selected {self.max_samples} random samples out of {len(self.dataframe)}")
+            mode = "shuffled" if self.shuffle else "first-N"
+            print(f"selected {len(self.dataframe)} {mode} samples (max_samples={self.max_samples})")
 
         extract_fn = functools.partial(
             extract_prompt_fields,

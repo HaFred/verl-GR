@@ -20,6 +20,7 @@ from verl.utils.torch_functional import masked_mean
 from verl.workers.utils.padding import left_right_2_no_padding
 
 from verl_gr.recipes.task_factory import load_object
+from verl_gr.recipes.openonerec.onerec_profile_metrics import compute_openonerec_data_metrics
 from verl_gr.recipes.openonerec.onerec_trainer import (
     openonerec_evaluate_and_prune_checkpoint,
     openonerec_dump_generations,
@@ -183,6 +184,11 @@ def compute_advantage(
     return data
 
 
+def _openonerec_enabled(config) -> bool:
+    task_name = str(_cfg_get(_cfg_get(config, "task", None), "name", "")).lower()
+    return task_name == "openonerec"
+
+
 def compute_data_metrics(batch: DataProto, use_critic: bool = True) -> dict[str, Any]:
     from verl.trainer.ppo.metric_utils import compute_data_metrics as _base_compute_data_metrics
 
@@ -261,6 +267,10 @@ class RLTrainer(RayPPOTrainerBase):
 
             ray_trainer_mod.compute_advantage = compute_advantage
             ray_trainer_mod.compute_data_metrics = compute_data_metrics
+        elif _openonerec_enabled(self.config):
+            import verl.trainer.ppo.ray_trainer as ray_trainer_mod
+
+            ray_trainer_mod.compute_data_metrics = compute_openonerec_data_metrics
 
     def init_workers(self):
         super().init_workers()

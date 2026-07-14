@@ -74,7 +74,7 @@ You will get the RL training data:
 - `verl-GR/verl_gr/recipes/openonerec/output/rl_data/train.parquet` - Training set (remaining data after merging all tasks)
 - `verl-GR/verl_gr/recipes/openonerec/output/rl_data/test.parquet` - Test set (1000 samples randomly sampled from merged data)
 
-For Rank-GRPO data, you need to download the Reddit-V2 dataset. Or simply download the preprocessed version [here](https://drive.google.com/file/d/11tOfUMlVOylkkcnwPqGM_0IuiIeHjLle/view)
+For Rank-GRPO data, you need to download the Reddit-V2 dataset. Or simply download the preprocessed version [here](https://drive.google.com/file/d/11tOfUMlVOylkkcnwPqGM_0IuiIeHjLle/view).
 
 ## Launching Guide
 
