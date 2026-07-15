@@ -194,48 +194,13 @@ def test_main_ppo_no_longer_rewrites_ddp_config_at_runtime():
     assert "_ensure_config_defaults" not in source
     assert "_normalize_strategy_targets" not in source
     assert "_merge_missing" not in source
-    assert "_ensure_runtime_root_blocks(config)" in source
-    assert "def merge_missing(base_path: str, value) -> None:" in source
-    assert 'merge_missing(sub_path, sub_value)' in source
-    assert 'merge_missing(key, value)' in source
-    assert "def _strategy_debug_snapshot(config, role_name: str) -> dict:" in source
-    assert 'print(f"[verl-gr] strategy-signals[{stage}] {snapshot}")' in source
-    assert "def _model_debug_snapshot(config) -> dict:" in source
-    assert 'print(f"[verl-gr] model-signals[{stage}] {snapshot}")' in source
-    assert "Missing backend strategy for" in source
-    assert "transfer_queue" in source
-    assert "ray_kwargs" in source
-    assert "global_profiler" in source
-    assert '"actor_rollout_ref",' in source
-    assert '"hybrid_engine": True' in source
-    assert '"nccl_timeout": 600' in source
-    assert '"model": {' in source
-    assert '"_target_": "verl.workers.config.HFModelConfig"' in source
-    assert '"rollout": {' in source
-    assert '"_target_": "verl.workers.config.RolloutConfig"' in source
-    assert '"actor": {' in source
-    assert '"loss_agg_mode": "token-mean"' in source
-    assert '"ppo_epochs": 1' in source
-    assert '"data_loader_seed": 42' in source
-    assert '"checkpoint": {' in source
-    assert '"ref": {' in source
-    assert '"log_prob_max_token_len_per_gpu": 16384' in source
-    assert '"val_kwargs": {' in source
-    assert '"checkpoint_engine": {' in source
-    assert '"update_weights_bucket_megabytes": 2048' in source
-    assert '"skip": {' in source
-    assert '"data",' in source
-    assert '"dataloader_num_workers": 8' in source
-    assert '"validation_shuffle": False' in source
-    assert '"filter_overlong_prompts_workers": 1' in source
-    assert '"algorithm",' in source
-    assert '"trainer",' in source
-    assert '"reward",' in source
-    assert '"reward_manager": {' in source
-    assert '"distillation",' in source
-    assert '"enabled": False' in source
-    assert '"teacher_models"' in source
-    assert '"distillation_loss"' in source
+    assert "_ensure_runtime_root_blocks" not in source
+    assert "def merge_missing(base_path: str, value) -> None:" not in source
+    assert "_strategy_debug_snapshot" not in source
+    assert "_model_debug_snapshot" not in source
+    assert "_validate_strategy_signals" not in source
+    assert "_validate_model_signal" not in source
+    assert "_inject_legacy_reward_placeholders(config)" in source
 
 
 def test_run_script_explicitly_pins_ddp_backend_fields():

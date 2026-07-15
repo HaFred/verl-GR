@@ -52,3 +52,12 @@ def test_openonerec_trainer_adapter_keeps_legacy_validate_and_checkpoint_helpers
     method_names = {node.name for node in adapter_cls.body if isinstance(node, ast.FunctionDef)}
     assert "validate" in method_names
     assert "evaluate_and_prune_checkpoint" in method_names
+
+
+def test_openonerec_validate_does_not_double_multiply_beam_width():
+    """expand_rollout_counts already sets val_kwargs.n = base_n * beam; validate must not × beam again."""
+    source = Path("verl_gr/recipes/openonerec/onerec_trainer.py").read_text()
+    assert "val_n already includes beam" in source
+    assert "int(val_kwargs.n) * beam_width" not in source
+    assert 'non_tensor_batch_keys_to_pop.append(key)' in source
+    assert '"index"' in source
