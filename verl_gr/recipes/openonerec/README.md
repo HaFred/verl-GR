@@ -64,7 +64,7 @@ With one SID per beam, `hit_reward` and `pass_at_1` coincide (both `|pred ∩ GT
 
 ## Overfitting Evaluation & Performance
 
-We took 100 samples from [`sft_product_rec.parquet`](data/prepare_rl.sh) for overfitting. Training on 4 devices with 50 epochs in total, the eval response size is `4 x 32 beams = 128`. Following the [vanilla](https://github.com/Kuaishou-OneRec/OpenOneRec/blob/a969edcadd579a06c1966ae1db5984e02f48beff/verl_rl/recipe/onerec/onerec_recipe.py#L560), we use pass@1 (first_sid_hit_reward) as the sampling reward.
+We took 100 samples from [`sft_product_rec.parquet`](data/prepare_rl.sh) for overfitting. Training on 4 devices with 50 epochs in total, the train-batch response size is `4 x 32 beams = 128`. Following the [vanilla](https://github.com/Kuaishou-OneRec/OpenOneRec/blob/a969edcadd579a06c1966ae1db5984e02f48beff/verl_rl/recipe/onerec/onerec_recipe.py#L560), we use pass@1 (first_sid_hit_reward) as the sampling reward.
 
 <img height="800" alt="image" src="https://github.com/user-attachments/assets/775237f6-fc94-481c-882f-87c84881f1aa" />
 
