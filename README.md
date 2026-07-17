@@ -7,7 +7,7 @@
 
 ## Key Features over the Upstream VeRL
 
-VeRL-GR offers a **programmable generation runtime** where beam width, trie constraints, two-stage KV reuse, and concurrent/async dispatch are first-class. As the generative recsys works tend to have heterogenous compute backends to accomodate different compute paradigms, we abstract the upstream [VeRL](https://github.com/verl-project/verl)'s `TaskRuntime` into a base `RecipeTaskRuntime` that can customize each recipe's actor/rollout worker strategy, lora, tokenizer/processor, and so on.
+VeRL-GR offers a **programmable generation runtime** where beam width, trie constraints, two-stage KV reuse, and concurrent/async dispatch are first-class. As the generative recsys works tend to have heterogenous compute backends to accomodate different compute paradigms, out of the monolithic upstream [VeRL](https://github.com/verl-project/verl)'s `TaskRunner.run()`, we introduce a `RecipeTaskRuntime` base class to factor recipe-specific concerns — actor/rollout worker class, training strategy (FSDP/FSDP2/DDP/Megatron), LoRA configuration, tokenizer/processor setup, and FSDP wrap policy. Each recipe (OpenOneRec, MiniOneRec, Rank-GRPO) subclasses `RecipeTaskRuntime` and plugs into a shared `TASK_REGISTRY`, avoiding the code duplication that upstream recipes incur by copy-pasting the entire orchestration.
 
 
 |  | Upstream VeRL | VeRL-GR |
@@ -20,7 +20,7 @@ VeRL-GR offers a **programmable generation runtime** where beam width, trie cons
 | **Advantage computation** | Token/sequence-level GAE/GRPO/PPO | + `compute_rank_grpo_advantage` — rank-slot-level GRPO |
 | **Reference policy** | Frozen or hard copy | `RefSyncMixin` EMA with configurable α |
 | **Trainer extensibility** | Fixed `RayPPOTrainer` lifecycle | `RLTrainer` + `TrainerTaskAdapter` delegate methods |
-| **Agent loops** | Generic single-turn | Recipe-specific: two-stage metadata, constrained beam decode modes, RankGRPO concurrent gather |
+| **Agent loops** | Generic single-turn | Recipe-specific: two-stage metadata, constrained beam decode modes, Rank-GRPO concurrent gather |
 | **Worker customization** | `ActorRolloutRefWorker` + backend strategy | Recipe workers: skip vLLM (MiniOneRec HF path), custom loss registration, ref sync mixin |
 
 
@@ -29,13 +29,13 @@ Upstream:  Prompt ──[vLLM: n=8, temp=1.0]──→ 8 independent samples
 
 OpenOneRec: Prompt ──[Stage-1 reasoning]──→ prefix ──[beam × 32, async]──→ 32 SID candidates
 MiniOneRec: Prompt ──[trie-guided beam, HF or vLLM]──→ catalog-valid SIDs
-RankGRPO:   Prompt ──[vLLM n=N or concurrent n=1]──→ ranked lists → rank-slot GRPO adv
+Rank-GRPO:   Prompt ──[vLLM n=N or concurrent n=1]──→ ranked lists → rank-slot GRPO adv
 ```
 
 ## Performance Records for the Recipes
 * [OpenOneRec](verl_gr/recipes/openonerec/README.md)
 * [MiniOneRec](verl_gr/recipes/minionerec/README.md)
-* [RankGRPO](verl_gr/recipes/rankgrpo/README.md)
+* [Rank-GRPO](verl_gr/recipes/rankgrpo/README.md)
 
 ## Source Code Overview
 
@@ -50,7 +50,7 @@ RankGRPO:   Prompt ──[vLLM n=N or concurrent n=1]──→ ranked lists → 
 - `docs/verl_gr/openonerec_parity_plan.md`: tracks the current Phase B parity/smoke checklist after the cleanup refactor.
 - `docs/verl_gr/minionerec_mapping.md`: MiniOneRec dataset / reward / beam contract.
 - `docs/verl_gr/minionerec_pr_changes.md`: workingbranch vs `main` (MiniOneRec + performance).
-- `docs/verl_gr/rankgrpo_mapping.md`: RankGRPO vs TRL root-cause comparison and analysis.
+- `docs/verl_gr/rankgrpo_mapping.md`: Rank-GRPO vs TRL root-cause comparison and analysis.
 - `docs/verl_gr/rankgrpo_target.md`: alignment progress tracker by target item (convergence & efficiency).
 - `scripts/README.md`: launcher index for GRPO / SFT / profiling scripts.
 
